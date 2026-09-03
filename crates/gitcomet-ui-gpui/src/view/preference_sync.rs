@@ -542,6 +542,26 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_auto_save_file_edits(next, cx));
     }
 
+    /// Mirrors the settings window's remote-image toggle into the pane that
+    /// renders markdown previews. The main window never writes this back (the
+    /// settings window is the only writer), so there is no persist call here.
+    pub(in crate::view) fn set_markdown_preview_load_remote_images(
+        &mut self,
+        next: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.markdown_preview_load_remote_images == next {
+            return;
+        }
+        self.markdown_preview_load_remote_images = next;
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.privacy.load_remote_markdown_images = next;
+        });
+        self.main_pane.update(cx, |pane, cx| {
+            pane.set_markdown_preview_load_remote_images(next, cx)
+        });
+    }
+
     pub(in crate::view) fn set_history_column_preferences(
         &mut self,
         show_graph: bool,

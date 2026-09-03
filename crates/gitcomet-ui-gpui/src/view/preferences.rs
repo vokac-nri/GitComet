@@ -122,6 +122,16 @@ pub(super) struct FileEditingPreferences {
     pub(super) auto_save: bool,
 }
 
+/// What the app is allowed to disclose about the user, and to whom.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct PrivacyPreferences {
+    /// Whether a markdown preview may fetch the `http(s)` image sources a
+    /// document names. Off by default: the URL is chosen by repository
+    /// content, so fetching one tells a server that the document's author
+    /// picked who opened which file, and when.
+    pub(super) load_remote_markdown_images: bool,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct RepositoryPreferences {
     pub(super) commit_push_after_enabled: bool,
@@ -142,6 +152,7 @@ pub(super) struct UiPreferences {
     pub(super) merge_tool: MergeToolPreferences,
     pub(super) history: HistoryPreferences,
     pub(super) file_editing: FileEditingPreferences,
+    pub(super) privacy: PrivacyPreferences,
     pub(super) repository: RepositoryPreferences,
     pub(super) terminal: TerminalPreferences,
 }
@@ -231,6 +242,11 @@ impl UiPreferences {
             file_editing: FileEditingPreferences {
                 auto_save: session.auto_save_file_edits.unwrap_or(false),
             },
+            privacy: PrivacyPreferences {
+                load_remote_markdown_images: session
+                    .markdown_preview_load_remote_images
+                    .unwrap_or(false),
+            },
             repository: RepositoryPreferences {
                 commit_push_after_enabled: session.commit_push_after_enabled.unwrap_or(false),
                 default_tag_type: session.default_tag_type.unwrap_or_default(),
@@ -252,5 +268,7 @@ mod tests {
         assert!(preferences.diff.show_line_numbers);
         assert!(preferences.history.show_graph);
         assert!(preferences.merge_tool.view_three_way);
+        // Repository content chooses these URLs, so the default has to be off.
+        assert!(!preferences.privacy.load_remote_markdown_images);
     }
 }

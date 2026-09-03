@@ -831,6 +831,8 @@ impl GitCometView {
         let diff_word_wrap = ui_preferences.diff.word_wrap;
         let diff_show_line_numbers = ui_preferences.diff.show_line_numbers;
         let auto_save_file_edits = ui_preferences.file_editing.auto_save;
+        let markdown_preview_load_remote_images =
+            ui_preferences.privacy.load_remote_markdown_images;
         let commit_push_after_enabled = ui_preferences.repository.commit_push_after_enabled;
         let history_show_tags = ui_preferences.history.show_tags;
         let history_tag_fetch_mode = ui_preferences.history.tag_fetch_mode;
@@ -1327,6 +1329,7 @@ impl GitCometView {
             diff_word_wrap,
             diff_show_line_numbers,
             auto_save_file_edits,
+            markdown_preview_load_remote_images,
             ui_scale_percent: ui_scale.percent,
             open_repo_panel: false,
             open_repo_input,

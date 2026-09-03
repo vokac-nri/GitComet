@@ -105,7 +105,10 @@ pub(super) fn measure_markdown_preview_pictures(
         // would have to be fetched, which is the expensive half anyway, and
         // `gpui` is already fetching it.
         let Some(rows::MarkdownPreviewImageSource::File(path)) =
-            rows::markdown_preview_image_source(image_base_dir, source.as_ref())
+            rows::markdown_preview_image_source(
+                rows::MarkdownPreviewImagePolicy::local_only(image_base_dir),
+                source.as_ref(),
+            )
         else {
             return;
         };

@@ -838,6 +838,7 @@ pub struct GitCometView {
     pub(super) diff_word_wrap: bool,
     pub(super) diff_show_line_numbers: bool,
     pub(super) auto_save_file_edits: bool,
+    pub(super) markdown_preview_load_remote_images: bool,
     pub(super) ui_scale_percent: u32,
 
     pub(super) open_repo_panel: bool,

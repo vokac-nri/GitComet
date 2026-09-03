@@ -323,6 +323,7 @@ fn persist_ui_settings_to_path_updates_optional_fields_and_requires_both_window_
             terminal_action_bar_target: Some("external".to_string()),
             history_show_tags: Some(false),
             history_tag_fetch_mode: Some(gitcomet_state::model::GitLogTagFetchMode::Disabled),
+            markdown_preview_load_remote_images: Some(true),
             git_executable_path: None,
             ..UiSettings::default()
         },
@@ -380,6 +381,7 @@ fn persist_ui_settings_to_path_updates_optional_fields_and_requires_both_window_
         loaded.history_tag_fetch_mode,
         Some(gitcomet_state::model::GitLogTagFetchMode::Disabled)
     );
+    assert_eq!(loaded.markdown_preview_load_remote_images, Some(true));
 
     session::persist_ui_settings_to_path(
         UiSettings {
@@ -394,6 +396,9 @@ fn persist_ui_settings_to_path_updates_optional_fields_and_requires_both_window_
     let loaded = session::load_from_path(&session_file);
     assert_eq!(loaded.window_width, Some(640));
     assert_eq!(loaded.window_height, Some(480));
+    // A patch that says nothing about remote images must not reset the stored
+    // choice -- that is the `None`-never-overwrites contract.
+    assert_eq!(loaded.markdown_preview_load_remote_images, Some(true));
 }
 
 #[test]

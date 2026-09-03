@@ -3440,6 +3440,9 @@ pub(crate) struct MainPaneView {
     pub(in crate::view) file_editor_provider_theme_epoch: u64,
     /// Mirrors the settings window's toggle; the pane never writes it back.
     pub(in crate::view) auto_save_file_edits: bool,
+    /// Whether a markdown preview may fetch the `http(s)` images a document
+    /// names. Mirrors the settings window's toggle; never written back here.
+    pub(in crate::view) markdown_preview_load_remote_images: bool,
 
     pub(in crate::view) conflict_resolver_input: Entity<components::TextInput>,
     pub(super) _conflict_resolver_input_subscription: gpui::Subscription,

@@ -298,7 +298,8 @@ impl SettingsCategory {
             Self::ChangeTracking => "change tracking untracked files",
             Self::Diff => {
                 "diff mode scroll sync show whitespace changes reveal whitespace characters \
-                 word wrap show line numbers unified split"
+                 word wrap show line numbers unified split markdown preview remote images \
+                 privacy tracking pixel network badge"
             }
             Self::FileEditing => {
                 "file editing edit file auto save autosave save automatically editor"
@@ -383,6 +384,7 @@ pub(crate) struct SettingsWindowView {
     diff_word_wrap: bool,
     diff_show_line_numbers: bool,
     auto_save_file_edits: bool,
+    markdown_preview_load_remote_images: bool,
     diff_scroll_sync: DiffScrollSync,
     history_show_graph: bool,
     history_show_author: bool,
@@ -771,6 +773,8 @@ impl SettingsWindowView {
         let diff_word_wrap = ui_preferences.diff.word_wrap;
         let diff_show_line_numbers = ui_preferences.diff.show_line_numbers;
         let auto_save_file_edits = ui_preferences.file_editing.auto_save;
+        let markdown_preview_load_remote_images =
+            ui_preferences.privacy.load_remote_markdown_images;
         let history_show_graph = ui_preferences.history.show_graph;
         let history_show_author = ui_preferences.history.show_author;
         let history_show_date = ui_preferences.history.show_date;
@@ -1004,6 +1008,7 @@ impl SettingsWindowView {
             diff_word_wrap,
             diff_show_line_numbers,
             auto_save_file_edits,
+            markdown_preview_load_remote_images,
             diff_scroll_sync,
             history_show_graph,
             history_show_author,

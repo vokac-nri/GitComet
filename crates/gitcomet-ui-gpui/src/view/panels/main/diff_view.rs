@@ -2993,6 +2993,8 @@ impl MainPaneView {
                                             ui_scale_percent,
                                             editor_font_family: editor_font_family.clone().into(),
                                             image_base_dir,
+                                            load_remote_images: self
+                                                .markdown_preview_load_remote_images,
                                             picture_sizes: std::sync::Arc::clone(
                                                 &self.worktree_markdown_preview_picture_sizes,
                                             ),

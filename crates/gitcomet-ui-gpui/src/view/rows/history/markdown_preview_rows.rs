@@ -90,8 +90,16 @@ pub(in crate::view) struct MarkdownPreviewRenderContext<'a> {
     pub(in crate::view) wrap_plan: Option<&'a MarkdownPreviewWrapPlan>,
     /// Directory relative image paths resolve against.
     pub(in crate::view) image_base_dir: Option<Arc<std::path::Path>>,
+    /// Whether an `http(s)` image source may be fetched.
+    pub(in crate::view) load_remote_images: bool,
     /// Quick-search state, when the search box is open over this preview.
     pub(in crate::view) query: Option<MarkdownPreviewQuery>,
+}
+
+impl MarkdownPreviewRenderContext<'_> {
+    pub(in crate::view) fn image_policy(&self) -> MarkdownPreviewImagePolicy<'_> {
+        MarkdownPreviewImagePolicy::new(self.image_base_dir.as_deref(), self.load_remote_images)
+    }
 }
 
 pub(in crate::view) fn render_markdown_preview_document_rows(
@@ -662,7 +670,7 @@ pub(in crate::view) fn markdown_preview_row_element(
                                 inline,
                                 theme,
                                 ui_scale_percent,
-                                context.image_base_dir.as_deref(),
+                                context.image_policy(),
                                 markdown_preview_no_picture_sizes(),
                             )),
                     );
@@ -1102,22 +1110,59 @@ impl MarkdownPreviewImageSource {
     }
 }
 
+/// How the image sources a document names are allowed to resolve: where a
+/// relative path resolves against, and whether an `http(s)` source may be
+/// fetched at all.
+///
+/// [`Default`] is local-only. A remote URL is chosen by repository content, so
+/// a call site that forgets to fill this in has to fail closed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(in crate::view) struct MarkdownPreviewImagePolicy<'a> {
+    /// Directory relative paths resolve against.
+    pub(in crate::view) base_dir: Option<&'a std::path::Path>,
+    /// Whether an `http(s)` source may be fetched.
+    pub(in crate::view) load_remote: bool,
+}
+
+impl<'a> MarkdownPreviewImagePolicy<'a> {
+    pub(in crate::view) fn new(base_dir: Option<&'a std::path::Path>, load_remote: bool) -> Self {
+        Self {
+            base_dir,
+            load_remote,
+        }
+    }
+
+    /// Resolves only files inside the document's own tree; a remote source
+    /// resolves to nothing.
+    pub(in crate::view) fn local_only(base_dir: Option<&'a std::path::Path>) -> Self {
+        Self::new(base_dir, false)
+    }
+}
+
 /// Resolve a markdown image source to something the preview can draw.
 ///
 /// A local path must stay inside the previewed document's own directory tree,
 /// so document content cannot aim the preview at arbitrary files on disk.
 /// Anything else — `data:` payloads, other schemes, paths that climb out of
 /// the tree — resolves to nothing and falls back to the alt text.
+///
+/// An `http(s)` source resolves only when `images` allows it. The URL is
+/// chosen by repository content, so fetching one tells a server the document's
+/// author picked that the reader opened this file, and when.
 pub(in crate::view) fn markdown_preview_image_source(
-    base_dir: Option<&std::path::Path>,
+    images: MarkdownPreviewImagePolicy<'_>,
     source: &str,
 ) -> Option<MarkdownPreviewImageSource> {
     let source = source.trim();
     if source.is_empty() {
         return None;
     }
+    // Returns either way, so a blocked URL can never fall through into the
+    // relative-path branch below.
     if let Some(remote) = markdown_preview_remote_image_url(source) {
-        return Some(MarkdownPreviewImageSource::Remote(remote));
+        return images
+            .load_remote
+            .then_some(MarkdownPreviewImageSource::Remote(remote));
     }
     if source.contains("://") || source.starts_with("data:") {
         return None;
@@ -1130,7 +1175,7 @@ pub(in crate::view) fn markdown_preview_image_source(
     if relative.is_absolute() {
         return None;
     }
-    let mut resolved = base_dir?.to_path_buf();
+    let mut resolved = images.base_dir?.to_path_buf();
     for component in relative.components() {
         match component {
             std::path::Component::Normal(part) => resolved.push(part),
@@ -1154,6 +1199,21 @@ pub(in crate::view) fn markdown_preview_remote_image_url(source: &str) -> Option
     let scheme = &source[..scheme_end];
     (scheme.eq_ignore_ascii_case("http") || scheme.eq_ignore_ascii_case("https"))
         .then(|| SharedString::from(source.to_owned()))
+}
+
+/// Why a source did not resolve, for the stand-in's label.
+///
+/// A picture the setting withheld is not a broken document, and saying
+/// "unavailable" would blame the repository for a choice made here.
+pub(in crate::view) fn markdown_preview_image_unavailable_reason(
+    images: MarkdownPreviewImagePolicy<'_>,
+    source: &str,
+) -> &'static str {
+    if !images.load_remote && markdown_preview_remote_image_url(source.trim()).is_some() {
+        "Remote image blocked"
+    } else {
+        "Image unavailable"
+    }
 }
 
 /// The quick-search state a markdown preview renders under.
@@ -1323,7 +1383,7 @@ pub(in crate::view) fn markdown_preview_flow_image(
     row_ix: usize,
     theme: AppTheme,
     ui_scale_percent: u32,
-    image_base_dir: Option<&std::path::Path>,
+    images: MarkdownPreviewImagePolicy<'_>,
     picture_sizes: &MarkdownPreviewPictureSizes,
 ) -> AnyElement {
     let label_color = theme.colors.foreground.secondary;
@@ -1333,12 +1393,17 @@ pub(in crate::view) fn markdown_preview_flow_image(
         markdown_preview_resolved_picture(
             image.source.as_ref(),
             ("markdown_preview_block_image", row_ix).into(),
-            image_base_dir,
+            images,
         )
     });
     let Some(image) = picture else {
+        let reason = row
+            .image
+            .as_ref()
+            .map(|image| markdown_preview_image_unavailable_reason(images, image.source.as_ref()))
+            .unwrap_or("Image unavailable");
         return markdown_preview_image_placeholder_element(
-            markdown_preview_image_label(row, "Image unavailable"),
+            markdown_preview_image_label(row, reason),
             font_size,
             label_color,
         )
@@ -1468,7 +1533,7 @@ pub(in crate::view) fn markdown_preview_inline_image(
     inline: &MarkdownInlineImage,
     theme: AppTheme,
     ui_scale_percent: u32,
-    image_base_dir: Option<&std::path::Path>,
+    images: MarkdownPreviewImagePolicy<'_>,
     picture_sizes: &MarkdownPreviewPictureSizes,
 ) -> AnyElement {
     let source_byte = inline.source_byte;
@@ -1487,11 +1552,13 @@ pub(in crate::view) fn markdown_preview_inline_image(
     let picture = markdown_preview_resolved_picture(
         inline.image.source.as_ref(),
         ("markdown_preview_inline_image", source_byte).into(),
-        image_base_dir,
+        images,
     );
     let Some(image) = picture else {
+        let reason =
+            markdown_preview_image_unavailable_reason(images, inline.image.source.as_ref());
         return markdown_preview_inline_image_placeholder(
-            markdown_preview_image_reason("Image unavailable", &described),
+            markdown_preview_image_reason(reason, &described),
             source_byte,
             font_size,
             label_color,
@@ -1625,9 +1692,9 @@ pub(in crate::view) fn markdown_preview_image_reason(
 pub(in crate::view) fn markdown_preview_resolved_picture(
     source: &str,
     id: gpui::ElementId,
-    image_base_dir: Option<&std::path::Path>,
+    images: MarkdownPreviewImagePolicy<'_>,
 ) -> Option<gpui::Stateful<gpui::Img>> {
-    markdown_preview_image_source(image_base_dir, source)
+    markdown_preview_image_source(images, source)
         .map(|source| markdown_preview_image_element(source, id))
 }
 
@@ -1677,7 +1744,7 @@ pub(in crate::view) fn markdown_preview_image_row(
         markdown_preview_resolved_picture(
             image.source.as_ref(),
             ("markdown_preview_image_band", row_ix).into(),
-            context.image_base_dir.as_deref(),
+            context.image_policy(),
         )
     });
     // A declared width is the size the document asked for; without one the
