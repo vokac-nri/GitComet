@@ -216,6 +216,10 @@ impl GitCometView {
                             // window; the main window mirrors it to drive the
                             // editor, so None keeps the stored value.
                             auto_save_file_edits: None,
+                            // Same for remote markdown images: the settings
+                            // window owns the toggle, so None keeps the stored
+                            // value.
+                            markdown_preview_load_remote_images: None,
                             mergetool_auto_advance: Some(mergetool_auto_advance),
                             mergetool_collapse_unchanged: Some(mergetool_collapse_unchanged),
                             mergetool_output_scroll_sync: Some(mergetool_output_scroll_sync),

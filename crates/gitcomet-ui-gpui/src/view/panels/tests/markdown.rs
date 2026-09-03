@@ -6017,3 +6017,58 @@ fn a_markdown_preview_without_a_document_reports_no_matches(cx: &mut gpui::TestA
 
     std::fs::remove_dir_all(&workdir).expect("cleanup pending markdown fixture");
 }
+
+/// The whole point of the setting: repository content must not be able to make
+/// the app talk to a server the reader did not choose.
+///
+/// Asserts on the requests the app issues rather than on pixels — a placeholder
+/// deliberately reuses the picture's debug selector, so no bounds check can
+/// tell a drawn picture from its stand-in.
+#[gpui::test]
+fn a_remote_badge_is_not_fetched_until_the_setting_allows_it(cx: &mut gpui::TestAppContext) {
+    const BADGE: &str = "https://example.invalid/badge.svg";
+
+    let _visual_guard = lock_visual_test();
+    let http_client = crate::view::test_support::RecordingHttpClient::new();
+    let installed = http_client.clone();
+    cx.update(|app| app.set_http_client(Arc::new(installed)));
+
+    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+
+    let _fixture = RenderedPreviewFixture::open(
+        cx,
+        &view,
+        gitcomet_state::model::RepoId(98),
+        "markdown_remote_badge",
+        &format!("![build]({BADGE})\n\nAfter.\n"),
+    );
+    for _ in 0..3 {
+        crate::view::test_support::redraw(cx);
+        cx.run_until_parked();
+    }
+
+    assert_eq!(
+        http_client.requests(),
+        Vec::<String>::new(),
+        "a remote image named by repository content must not be fetched by default"
+    );
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.set_markdown_preview_load_remote_images(true, cx);
+        });
+    });
+    for _ in 0..3 {
+        crate::view::test_support::redraw(cx);
+        cx.run_until_parked();
+    }
+
+    assert_eq!(
+        http_client.requests(),
+        vec![BADGE.to_string()],
+        "turning the setting on must let the open preview fetch it, exactly once"
+    );
+}

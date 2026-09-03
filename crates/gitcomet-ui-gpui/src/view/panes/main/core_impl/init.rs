@@ -40,6 +40,7 @@ impl MainPaneView {
         let diff_word_wrap = preferences.diff.word_wrap;
         let diff_show_line_numbers = preferences.diff.show_line_numbers;
         let auto_save_file_edits = preferences.file_editing.auto_save;
+        let markdown_preview_load_remote_images = preferences.privacy.load_remote_markdown_images;
         let history_show_graph = preferences.history.show_graph;
         let history_show_author = preferences.history.show_author;
         let history_show_date = preferences.history.show_date;
@@ -544,6 +545,7 @@ impl MainPaneView {
             file_editor_blame_width: px(0.0),
             file_editor_wrap_row_starts: Vec::new(),
             auto_save_file_edits,
+            markdown_preview_load_remote_images,
             conflict_resolver_input,
             _conflict_resolver_input_subscription: conflict_resolver_subscription,
             conflict_resolver: ConflictResolverUiState::default(),

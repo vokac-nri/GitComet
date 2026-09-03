@@ -221,13 +221,7 @@ impl Render for GitCometView {
             && self.view_mode == GitCometViewMode::Normal
         {
             let summary = report.summary.clone();
-
-            let report_button =
-                components::Button::new("startup_crash_report_open", "Report Issue")
-                    .style(components::ButtonStyle::Filled)
-                    .on_click(theme, cx, |this, _e, _w, cx| {
-                        this.report_startup_crash_report(cx);
-                    });
+            let crash_log_path = report.crash_log_path.display().to_string();
 
             let ignore_button =
                 components::Button::new("startup_crash_report_ignore", "Ignore Crash")
@@ -279,17 +273,15 @@ impl Render for GitCometView {
                             )
                             .child(
                                 div()
-                                    .text_sm()
+                                    .text_xs()
                                     .text_color(theme.colors.foreground.secondary)
-                                    .child(
-                                        "Would you like to contribute by reporting issue to GitComet GitHub repository?",
-                                    ),
+                                    .child(format!("Summary: {summary}")),
                             )
                             .child(
                                 div()
                                     .text_xs()
                                     .text_color(theme.colors.foreground.secondary)
-                                    .child(format!("Summary: {summary}")),
+                                    .child(format!("Crash log: {crash_log_path}")),
                             )
                             .child(
                                 div()
@@ -297,7 +289,6 @@ impl Render for GitCometView {
                                     .flex()
                                     .items_center()
                                     .gap_1()
-                                    .child(report_button)
                                     .child(ignore_button),
                             ),
                     ),

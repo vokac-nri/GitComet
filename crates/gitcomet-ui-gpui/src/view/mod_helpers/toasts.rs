@@ -13,10 +13,6 @@ pub(crate) struct ToastState {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ToastAction {
-    OpenUrl {
-        url: String,
-        label: String,
-    },
     OpenSurvey {
         survey_id: String,
         survey_name: String,

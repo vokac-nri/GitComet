@@ -243,38 +243,6 @@ impl ToastHost {
         );
     }
 
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) fn push_toast_with_link(
-        &mut self,
-        kind: components::ToastKind,
-        message: String,
-        link_url: String,
-        link_label: String,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if matches!(kind, components::ToastKind::Error)
-            && self.route_error_to_banner(message.clone(), cx)
-        {
-            return;
-        }
-        let ttl = match kind {
-            components::ToastKind::Error => Duration::from_secs(15),
-            components::ToastKind::Warning => Duration::from_secs(10),
-            components::ToastKind::Success => Duration::from_secs(6),
-        };
-        let _ = self.push_toast_inner(
-            kind,
-            message,
-            vec![ToastAction::OpenUrl {
-                url: link_url,
-                label: link_label,
-            }],
-            ToastDismissBehavior::Remove,
-            Some(ttl),
-            cx,
-        );
-    }
-
     pub(super) fn push_hook_activity_toast(
         &mut self,
         kind: components::ToastKind,
@@ -485,25 +453,6 @@ impl ToastHost {
         cx: &mut gpui::Context<Self>,
     ) {
         match action {
-            ToastAction::OpenUrl { url, .. } => {
-                // Keep the toast until the open succeeds: it carries the URL and
-                // its button, so dismissing it up front would leave a user whose
-                // browser failed to launch with no way to read or retry the link.
-                // Ids are monotonic, so this deferred removal cannot hit a
-                // different toast.
-                super::platform_open::spawn_launch(
-                    cx,
-                    move || super::platform_open::open_url_blocking(&url),
-                    move |this, result, cx| match result {
-                        Ok(()) => this.remove_toast(id, cx),
-                        Err(err) => this.push_toast(
-                            components::ToastKind::Error,
-                            format!("Failed to open link: {err}"),
-                            cx,
-                        ),
-                    },
-                );
-            }
             ToastAction::OpenSurvey {
                 survey_id,
                 survey_name,
@@ -1029,8 +978,7 @@ impl Render for ToastHost {
                         .gap_2()
                         .children(t.actions.iter().enumerate().map(|(ix, action)| {
                             let label = match action {
-                                ToastAction::OpenUrl { label, .. }
-                                | ToastAction::OpenSurvey { label, .. }
+                                ToastAction::OpenSurvey { label, .. }
                                 | ToastAction::PostponeSurvey { label, .. }
                                 | ToastAction::OpenHookActivity { label, .. } => label.clone(),
                             };
@@ -1038,8 +986,7 @@ impl Render for ToastHost {
                                 ToastAction::PostponeSurvey { .. } => {
                                     components::ButtonStyle::Transparent
                                 }
-                                ToastAction::OpenUrl { .. }
-                                | ToastAction::OpenSurvey { .. }
+                                ToastAction::OpenSurvey { .. }
                                 | ToastAction::OpenHookActivity { .. } => {
                                     components::ButtonStyle::Outlined
                                 }

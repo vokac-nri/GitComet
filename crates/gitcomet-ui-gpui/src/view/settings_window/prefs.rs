@@ -41,6 +41,7 @@ impl SettingsWindowView {
             diff_word_wrap: Some(self.diff_word_wrap),
             diff_show_line_numbers: Some(self.diff_show_line_numbers),
             auto_save_file_edits: Some(self.auto_save_file_edits),
+            markdown_preview_load_remote_images: Some(self.markdown_preview_load_remote_images),
             // Merge tool settings are managed from the resolver's cog menu;
             // None never overwrites the stored values.
             mergetool_auto_advance: None,
@@ -765,6 +766,23 @@ impl SettingsWindowView {
         self.persist_preferences(cx);
         self.update_main_windows(cx, move |view, _window, cx| {
             view.set_auto_save_file_edits(next, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_markdown_preview_load_remote_images(
+        &mut self,
+        next: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.markdown_preview_load_remote_images == next {
+            return;
+        }
+
+        self.markdown_preview_load_remote_images = next;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_markdown_preview_load_remote_images(next, cx);
         });
         cx.notify();
     }

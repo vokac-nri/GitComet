@@ -831,6 +831,8 @@ impl GitCometView {
         let diff_word_wrap = ui_preferences.diff.word_wrap;
         let diff_show_line_numbers = ui_preferences.diff.show_line_numbers;
         let auto_save_file_edits = ui_preferences.file_editing.auto_save;
+        let markdown_preview_load_remote_images =
+            ui_preferences.privacy.load_remote_markdown_images;
         let commit_push_after_enabled = ui_preferences.repository.commit_push_after_enabled;
         let history_show_tags = ui_preferences.history.show_tags;
         let history_tag_fetch_mode = ui_preferences.history.tag_fetch_mode;
@@ -1327,6 +1329,7 @@ impl GitCometView {
             diff_word_wrap,
             diff_show_line_numbers,
             auto_save_file_edits,
+            markdown_preview_load_remote_images,
             ui_scale_percent: ui_scale.percent,
             open_repo_panel: false,
             open_repo_input,
@@ -1386,7 +1389,6 @@ impl GitCometView {
         view.drive_focused_mergetool_bootstrap();
         view.drive_submodule_diff_bootstrap();
         view.maybe_show_user_survey_on_startup(cx);
-        view.maybe_check_for_updates_on_startup(cx);
 
         crate::app::sync_gitcomet_window_state(
             cx,
@@ -2221,24 +2223,6 @@ impl GitCometView {
             .update(cx, |host, cx| host.push_toast(kind, message, cx));
     }
 
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) fn push_toast_with_link(
-        &mut self,
-        kind: components::ToastKind,
-        message: String,
-        link_url: String,
-        link_label: String,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if matches!(kind, components::ToastKind::Error) {
-            self.show_error_banner(self.active_repo_id(), message);
-            return;
-        }
-        self.toast_host.update(cx, |host, cx| {
-            host.push_toast_with_link(kind, message, link_url, link_label, cx)
-        });
-    }
-
     pub(super) fn active_repo_workdir(&self) -> Option<std::path::PathBuf> {
         let repo_id = self.active_repo_id()?;
         self.state
@@ -2300,51 +2284,6 @@ impl GitCometView {
                         cx,
                     );
                 }
-            },
-        );
-    }
-
-    pub(in crate::view) fn startup_crash_report_issue_url(&self) -> Option<String> {
-        self.startup_crash_report
-            .as_ref()
-            .map(|report| report.issue_url.clone())
-    }
-
-    /// The "Report Issue" button's whole body, so the button stays a one-liner
-    /// and tests can drive the real sequence through
-    /// [`Self::report_startup_crash_report_with`].
-    pub(super) fn report_startup_crash_report(&mut self, cx: &mut gpui::Context<Self>) {
-        self.report_startup_crash_report_with(cx, |url| platform_open::open_url_blocking(&url));
-    }
-
-    pub(super) fn report_startup_crash_report_with(
-        &mut self,
-        cx: &mut gpui::Context<Self>,
-        open_url: impl FnOnce(String) -> Result<(), std::io::Error> + Send + 'static,
-    ) {
-        let Some(url) = self.startup_crash_report_issue_url() else {
-            return;
-        };
-        platform_open::spawn_launch(
-            cx,
-            move || open_url(url),
-            |this, result, cx| {
-                match result {
-                    Ok(()) => this.push_toast(
-                        components::ToastKind::Success,
-                        "Opened crash report page in your browser.".to_string(),
-                        cx,
-                    ),
-                    Err(err) => this.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to open browser: {err}"),
-                        cx,
-                    ),
-                }
-                // `push_toast` sends an Error straight to `show_error_banner`,
-                // which never touches `cx`, so without this the error path would
-                // depend entirely on a store round-trip to repaint.
-                cx.notify();
             },
         );
     }

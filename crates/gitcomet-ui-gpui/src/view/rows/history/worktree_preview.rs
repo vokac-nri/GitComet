@@ -322,6 +322,7 @@ impl MainPaneView {
                 text_region: region,
                 wrap_plan: this.markdown_preview_wrap_plan(MarkdownPreviewList::Old),
                 image_base_dir: image_base_dir.clone(),
+                load_remote_images: this.markdown_preview_load_remote_images,
                 query: this.markdown_preview_search_query(),
             },
         )
@@ -374,6 +375,7 @@ impl MainPaneView {
                 text_region: DiffTextRegion::Inline,
                 wrap_plan: this.markdown_preview_wrap_plan(MarkdownPreviewList::Inline),
                 image_base_dir: image_base_dir.clone(),
+                load_remote_images: this.markdown_preview_load_remote_images,
                 query: this.markdown_preview_search_query(),
             },
         )
@@ -426,6 +428,7 @@ impl MainPaneView {
                 text_region: DiffTextRegion::SplitRight,
                 wrap_plan: this.markdown_preview_wrap_plan(MarkdownPreviewList::New),
                 image_base_dir: image_base_dir.clone(),
+                load_remote_images: this.markdown_preview_load_remote_images,
                 query: this.markdown_preview_search_query(),
             },
         )

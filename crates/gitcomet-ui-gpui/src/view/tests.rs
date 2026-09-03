@@ -500,13 +500,40 @@ fn repository_bar_ignores_files_multiple_paths_and_drops_outside_the_bar(
     });
 }
 
+/// Launching must not talk to the network.
+///
+/// Asserts on *any* URL rather than a particular host: the point is that a
+/// Git GUI has nothing to say to anyone at startup, so a future ping is caught
+/// here too and has to justify itself.
+#[gpui::test]
+fn launching_the_main_view_issues_no_http_requests(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let http_client = test_support::RecordingHttpClient::new();
+    let installed = http_client.clone();
+    cx.update(|app| app.set_http_client(Arc::new(installed)));
+
+    let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
+    let (store, events) = AppStore::new(backend);
+    let (_view, cx) = cx.add_window_view(|window, cx| {
+        GitCometView::new_with_config(store, events, GitCometViewConfig::normal(None), window, cx)
+    });
+
+    test_support::redraw(cx);
+    cx.run_until_parked();
+
+    assert_eq!(
+        http_client.requests(),
+        Vec::<String>::new(),
+        "launching must not reach the network"
+    );
+}
+
 #[gpui::test]
 fn startup_crash_report_is_visible_after_relaunch(cx: &mut gpui::TestAppContext) {
     let _visual_guard = crate::test_support::lock_visual_test();
     let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
     let (store, events) = AppStore::new(backend);
     let config = GitCometViewConfig::normal(Some(StartupCrashReport {
-        issue_url: "https://example.invalid/crash-report".to_string(),
         summary: "WSLg clipboard copy terminated unexpectedly".to_string(),
         crash_log_path: PathBuf::from("/tmp/gitcomet-crash.log"),
     }));
@@ -538,7 +565,6 @@ fn ignoring_startup_crash_report_deletes_it_and_hides_notification(cx: &mut gpui
     let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
     let (store, events) = AppStore::new(backend);
     let config = GitCometViewConfig::normal(Some(StartupCrashReport {
-        issue_url: "https://example.invalid/crash-report".to_string(),
         summary: "WSLg clipboard copy terminated unexpectedly".to_string(),
         crash_log_path: crash_log_path.clone(),
     }));
@@ -561,62 +587,6 @@ fn ignoring_startup_crash_report_deletes_it_and_hides_notification(cx: &mut gpui
         assert!(
             view.read(app).startup_crash_report.is_none(),
             "ignoring the crash must hide its notification"
-        );
-    });
-}
-
-#[gpui::test]
-fn reporting_startup_crash_keeps_report_and_notification(cx: &mut gpui::TestAppContext) {
-    let _visual_guard = crate::test_support::lock_visual_test();
-    let report_dir = tempfile::tempdir().expect("create report directory");
-    let crash_log_path = report_dir.path().join("pending-startup-report.log");
-    std::fs::write(&crash_log_path, "message=previous crash\n").expect("write crash report");
-
-    let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
-    let (store, events) = AppStore::new(backend);
-    let config = GitCometViewConfig::normal(Some(StartupCrashReport {
-        issue_url: "https://example.invalid/crash-report".to_string(),
-        summary: "previous crash".to_string(),
-        crash_log_path: crash_log_path.clone(),
-    }));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        GitCometView::new_with_config(store, events, config, window, cx)
-    });
-
-    // Drive the button's real handler with a stub launcher standing in for the
-    // browser, so the assertions below describe a report page that was actually
-    // opened rather than a getter that was read.
-    let opened = Arc::new(std::sync::Mutex::new(None::<String>));
-    let opened_in_launch = Arc::clone(&opened);
-    cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            this.report_startup_crash_report_with(cx, move |url| {
-                *opened_in_launch
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(url);
-                Ok(())
-            });
-        });
-    });
-    cx.run_until_parked();
-
-    assert_eq!(
-        opened
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .as_deref(),
-        Some("https://example.invalid/crash-report"),
-        "the button must open the URL recorded for the crash"
-    );
-
-    assert!(
-        crash_log_path.exists(),
-        "opening the report page must retain the persisted crash report"
-    );
-    cx.update(|_window, app| {
-        assert!(
-            view.read(app).startup_crash_report.is_some(),
-            "opening the report page must keep the notification visible"
         );
     });
 }

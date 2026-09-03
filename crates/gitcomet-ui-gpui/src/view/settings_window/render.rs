@@ -373,9 +373,23 @@ impl Render for SettingsWindowView {
                             self.expanded_section == Some(SettingsSection::Diff),
                             theme,
                         )
-                        .border_color(no_separator)
                         .on_click(cx.listener(|this, _e: &ClickEvent, _window, cx| {
                             this.toggle_section(SettingsSection::Diff, cx);
+                        }));
+
+                    let markdown_preview_load_remote_images_row = self
+                        .toggle_row(
+                            "settings_window_markdown_preview_load_remote_images",
+                            "Load remote images in markdown previews",
+                            self.markdown_preview_load_remote_images,
+                            theme,
+                        )
+                        .border_color(no_separator)
+                        .on_click(cx.listener(|this, _e: &ClickEvent, _window, cx| {
+                            this.set_markdown_preview_load_remote_images(
+                                !this.markdown_preview_load_remote_images,
+                                cx,
+                            );
                         }));
 
                     let diff_content_mode_row = self
@@ -1352,6 +1366,14 @@ impl Render for SettingsWindowView {
                             theme,
                         ));
                     }
+
+                    diff_card = diff_card
+                        .child(self.subsection_heading(
+                            "settings_window_markdown_preview_heading",
+                            "Markdown preview",
+                            theme,
+                        ))
+                        .child(markdown_preview_load_remote_images_row);
 
                     let file_editing_card = self
                         .card(

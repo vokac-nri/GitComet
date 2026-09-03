@@ -205,3 +205,42 @@ impl gitcomet_core::services::GitBackend for NoopBackend {
         ))
     }
 }
+
+/// An [`gpui::http_client::HttpClient`] that records every URL it is asked for
+/// and answers nothing.
+///
+/// Installed so a test can assert on the requests the app *would* have made.
+/// Every request fails, which is the point: a test that cares whether a request
+/// happened should not also depend on a server answering it.
+#[derive(Clone, Default)]
+pub(in crate::view) struct RecordingHttpClient {
+    requests: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl RecordingHttpClient {
+    pub(in crate::view) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every URL requested so far, in order.
+    pub(in crate::view) fn requests(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone()
+    }
+}
+
+impl gpui::http_client::HttpClient for RecordingHttpClient {
+    fn get(
+        &self,
+        url: &str,
+        _follow_redirects: bool,
+    ) -> futures::future::BoxFuture<'static, anyhow::Result<gpui::http_client::HttpResponse>> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .push(url.to_owned());
+        Box::pin(async { anyhow::bail!("RecordingHttpClient answers nothing") })
+    }
+}

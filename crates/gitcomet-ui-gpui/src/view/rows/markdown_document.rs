@@ -39,6 +39,8 @@ pub(in crate::view) struct MarkdownDocumentContext {
     pub(in crate::view) editor_font_family: SharedString,
     /// Directory relative image sources resolve against.
     pub(in crate::view) image_base_dir: Option<Arc<std::path::Path>>,
+    /// Whether an `http(s)` image source may be fetched.
+    pub(in crate::view) load_remote_images: bool,
     /// Sizes read from picture headers, so a picture that has not decoded yet
     /// still holds the box it is going to fill.
     pub(in crate::view) picture_sizes: crate::view::rows::MarkdownPreviewPictureSizes,
@@ -60,6 +62,17 @@ pub(in crate::view) struct MarkdownDocumentContext {
     pub(in crate::view) reveal: crate::view::rows::MarkdownPreviewRevealRequest,
     /// The container the document scrolls in, which the reveal moves.
     pub(in crate::view) scroll: Option<gpui::ScrollHandle>,
+}
+
+impl MarkdownDocumentContext {
+    pub(in crate::view) fn image_policy(
+        &self,
+    ) -> crate::view::rows::MarkdownPreviewImagePolicy<'_> {
+        crate::view::rows::MarkdownPreviewImagePolicy::new(
+            self.image_base_dir.as_deref(),
+            self.load_remote_images,
+        )
+    }
 }
 
 /// Gap between two blocks, and the extra break a heading opens above itself.
@@ -537,7 +550,7 @@ fn render_inline_image(
             inline,
             context.theme,
             context.ui_scale_percent,
-            context.image_base_dir.as_deref(),
+            context.image_policy(),
             &context.picture_sizes,
         ));
 
@@ -1003,7 +1016,7 @@ fn render_image(
         row_ix,
         context.theme,
         context.ui_scale_percent,
-        context.image_base_dir.as_deref(),
+        context.image_policy(),
         &context.picture_sizes,
     )
 }

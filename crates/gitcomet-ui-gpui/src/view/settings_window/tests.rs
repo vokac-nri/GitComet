@@ -767,6 +767,65 @@ fn expanded_auto_fetch_tags_section_renders_detail_container(cx: &mut gpui::Test
 }
 
 #[gpui::test]
+fn diff_page_renders_the_markdown_preview_remote_images_row(cx: &mut gpui::TestAppContext) {
+    // A privacy setting nobody can find is not a setting, and the row's own id
+    // is the only handle a test has on it.
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(std::sync::Arc::new(TestBackend));
+    let (_main_view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        open_settings_window(app);
+    });
+    cx.run_until_parked();
+
+    let settings_window = cx.update(|_window, app| {
+        app.windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<SettingsWindowView>())
+            .expect("settings window should be open")
+    });
+
+    let mut settings_cx = gpui::VisualTestContext::from_window(*settings_window.deref(), cx);
+    settings_cx.run_until_parked();
+    settings_cx.simulate_resize(size(px(SETTINGS_WINDOW_DEFAULT_WIDTH_PX), px(1200.0)));
+    settings_cx.run_until_parked();
+
+    let _ = settings_window.update(&mut settings_cx, |settings, _window, cx| {
+        settings.select_category(SettingsCategory::Diff, cx);
+        cx.notify();
+    });
+    settings_cx.run_until_parked();
+    settings_cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+
+    assert!(
+        settings_cx
+            .debug_bounds("settings_window_markdown_preview_heading")
+            .is_some(),
+        "the Diff page should render the Markdown preview heading"
+    );
+    assert!(
+        settings_cx
+            .debug_bounds("settings_window_markdown_preview_load_remote_images")
+            .is_some(),
+        "the Diff page should render the remote images toggle"
+    );
+
+    // The settings search is the other way in, so the Diff category has to
+    // answer to the words someone worried about this would type.
+    for query in ["remote images", "privacy", "tracking pixel"] {
+        assert!(
+            SettingsCategory::Diff.search_haystack().contains(query),
+            "the Diff category should be findable by {query:?}"
+        );
+    }
+}
+
+#[gpui::test]
 fn custom_git_executable_mode_renders_detail_container(cx: &mut gpui::TestAppContext) {
     let _visual_guard = lock_visual_test();
     let (store, events) = AppStore::new(std::sync::Arc::new(TestBackend));
@@ -2150,6 +2209,73 @@ fn diff_whitespace_mode_setting_defers_main_window_update(cx: &mut gpui::TestApp
                 .read_with(app, |settings, _cx| settings.diff_whitespace_mode)
                 .expect("settings window should remain readable"),
             next_mode
+        );
+    });
+}
+
+#[gpui::test]
+fn markdown_preview_remote_images_toggle_reaches_the_main_window(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new(std::sync::Arc::new(TestBackend));
+    let (main_view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        open_settings_window(app);
+    });
+    cx.run_until_parked();
+
+    let settings_window = cx.update(|_window, app| {
+        app.windows()
+            .into_iter()
+            .find_map(|window| window.downcast::<SettingsWindowView>())
+            .expect("settings window should be open")
+    });
+
+    cx.update(|_window, app| {
+        assert!(
+            !main_view
+                .read(app)
+                .main_pane
+                .read(app)
+                .markdown_preview_load_remote_images,
+            "remote images are blocked until they are turned on"
+        );
+    });
+
+    // Nested inside a `GitCometView` update, as the deferral regression tests
+    // do: the settings window must not re-enter the main view.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cx.update(|_window, app| {
+            main_view.update(app, |_view, cx| {
+                let _ = settings_window.update(cx, |settings, _window, cx| {
+                    settings.set_markdown_preview_load_remote_images(true, cx);
+                });
+            });
+        });
+    }));
+    assert!(
+        result.is_ok(),
+        "the remote images toggle should not re-enter GitCometView updates"
+    );
+
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        assert!(
+            main_view
+                .read(app)
+                .main_pane
+                .read(app)
+                .markdown_preview_load_remote_images,
+            "the pane that renders previews must see the new value"
+        );
+        assert!(
+            settings_window
+                .read_with(app, |settings, _cx| settings
+                    .markdown_preview_load_remote_images)
+                .expect("settings window should remain readable")
         );
     });
 }

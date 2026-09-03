@@ -427,8 +427,9 @@ fn run_windowed_app(
     on_shutdown: Option<ShutdownCallback>,
 ) {
     let quit_when_all_windows_closed = should_quit_when_all_windows_closed(&launch);
-    // Without this, `gpui` keeps its null client and every request — the
-    // update check, and images a markdown preview points at — fails silently.
+    // Without this, `gpui` keeps its null client and the one kind of request
+    // the app makes — images a markdown preview points at, when the user has
+    // allowed remote ones — fails silently.
     let application = application()
         .with_assets(GitCometAssets)
         .with_http_client(crate::http::client());

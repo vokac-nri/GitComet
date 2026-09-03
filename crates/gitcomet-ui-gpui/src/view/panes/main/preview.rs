@@ -1057,9 +1057,13 @@ impl MainPaneView {
 
         let mut resources = Vec::new();
         let mut push = |source: &str| {
-            if let Some(resolved) =
-                crate::view::rows::markdown_preview_image_source(base_dir.as_deref(), source)
-            {
+            if let Some(resolved) = crate::view::rows::markdown_preview_image_source(
+                crate::view::rows::MarkdownPreviewImagePolicy::new(
+                    base_dir.as_deref(),
+                    self.markdown_preview_load_remote_images,
+                ),
+                source,
+            ) {
                 resources.push(resolved.to_resource());
             }
         };
@@ -1129,6 +1133,24 @@ impl MainPaneView {
     /// Images are read from the working tree even when the preview shows an
     /// older revision of the document: the historical blob is not on disk, and
     /// showing the current picture beats showing nothing.
+    /// Mirrors the settings window's remote-image toggle.
+    ///
+    /// Both previews resolve their image sources during `render`, and the
+    /// decode watcher runs from inside render too, so a repaint is all it takes
+    /// for an open document to re-resolve its pictures. Nothing is cached on
+    /// the resolved source, so there is no derived state to invalidate here.
+    pub(in crate::view) fn set_markdown_preview_load_remote_images(
+        &mut self,
+        next: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.markdown_preview_load_remote_images == next {
+            return;
+        }
+        self.markdown_preview_load_remote_images = next;
+        cx.notify();
+    }
+
     pub(in crate::view) fn markdown_preview_image_base_dir(&self) -> Option<std::path::PathBuf> {
         let repo = self.active_repo()?;
         let workdir = repo.spec.workdir.clone();

@@ -1,15 +1,15 @@
 use super::{
-    DiffSearchMatchEmphasis, MarkdownChangeHint, MarkdownInlineStyle, MarkdownPreviewImageSource,
-    MarkdownPreviewPictureSizes, MarkdownPreviewRow, MarkdownPreviewRowKind,
-    build_cached_diff_styled_text, history_message_text_left_px,
+    DiffSearchMatchEmphasis, MarkdownChangeHint, MarkdownInlineStyle, MarkdownPreviewImagePolicy,
+    MarkdownPreviewImageSource, MarkdownPreviewPictureSizes, MarkdownPreviewRow,
+    MarkdownPreviewRowKind, build_cached_diff_styled_text, history_message_text_left_px,
     history_scope_shows_graph_color_marker, history_worktree_node_color_ix,
     markdown_preview_alert_title_label, markdown_preview_expanded_slice_range,
-    markdown_preview_image_source, markdown_preview_inline_highlight,
-    markdown_preview_no_picture_sizes, markdown_preview_picture_skeleton,
-    markdown_preview_row_background, markdown_preview_row_height,
-    markdown_preview_row_horizontal_padding, markdown_preview_row_layout,
-    markdown_preview_row_marker, markdown_preview_row_styled_text, markdown_preview_row_typography,
-    worktree_preview_apply_query_overlay,
+    markdown_preview_image_source, markdown_preview_image_unavailable_reason,
+    markdown_preview_inline_highlight, markdown_preview_no_picture_sizes,
+    markdown_preview_picture_skeleton, markdown_preview_row_background,
+    markdown_preview_row_height, markdown_preview_row_horizontal_padding,
+    markdown_preview_row_layout, markdown_preview_row_marker, markdown_preview_row_styled_text,
+    markdown_preview_row_typography, worktree_preview_apply_query_overlay,
 };
 use crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY;
 use crate::view::markdown_preview::MarkdownInlineSpan;
@@ -678,7 +678,20 @@ fn image_paths_resolve_only_inside_the_documents_own_directory() {
     let outside = dir.parent().expect("temp dir parent").join("outside.png");
     std::fs::write(&outside, b"not really a png").expect("write outside fixture");
 
-    let resolve = |source: &str| markdown_preview_image_source(Some(dir.as_path()), source);
+    // The default policy is local-only, which is what the app runs with
+    // unless the user has turned remote images on.
+    let resolve = |source: &str| {
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::local_only(Some(dir.as_path())),
+            source,
+        )
+    };
+    let resolve_with_remote = |source: &str| {
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::new(Some(dir.as_path()), true),
+            source,
+        )
+    };
     let file = |path: &std::path::Path| Some(MarkdownPreviewImageSource::File(path.to_owned()));
     let remote = |url: &str| {
         Some(MarkdownPreviewImageSource::Remote(SharedString::from(
@@ -693,22 +706,38 @@ fn image_paths_resolve_only_inside_the_documents_own_directory() {
     assert_eq!(resolve("assets/shot.png?v=2"), file(&image));
     assert_eq!(resolve("assets/shot.png#frag"), file(&image));
 
-    // Badges and hosted screenshots resolve to the URL, query string and
-    // all — that is what identifies the image.
+    // Once allowed, badges and hosted screenshots resolve to the URL, query
+    // string and all — that is what identifies the image.
     assert_eq!(
-        resolve("https://img.shields.io/badge/a-b.svg?logo=x"),
+        resolve_with_remote("https://img.shields.io/badge/a-b.svg?logo=x"),
         remote("https://img.shields.io/badge/a-b.svg?logo=x")
     );
     assert_eq!(
-        resolve("http://example.com/a.png"),
+        resolve_with_remote("http://example.com/a.png"),
         remote("http://example.com/a.png")
     );
     // Remote sources resolve without a base directory, since nothing is
-    // resolved against the document's location.
+    // resolved against the document's location. Asserted in both directions:
+    // the gate must not be "simplified" into the relative-path branch, which
+    // would need a base dir and so would block these by accident.
     assert_eq!(
-        markdown_preview_image_source(None, "https://example.com/a.png"),
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::new(None, true),
+            "https://example.com/a.png"
+        ),
         remote("https://example.com/a.png")
     );
+    assert_eq!(
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::local_only(None),
+            "https://example.com/a.png"
+        ),
+        None
+    );
+
+    // Blocked by default: the URL is chosen by repository content.
+    assert_eq!(resolve("https://img.shields.io/badge/a-b.svg?logo=x"), None);
+    assert_eq!(resolve("http://example.com/a.png"), None);
 
     // A file that exists but sits outside the document's tree is refused,
     // so document content cannot aim the preview at arbitrary files.
@@ -721,10 +750,61 @@ fn image_paths_resolve_only_inside_the_documents_own_directory() {
     // to nothing.
     assert_eq!(resolve("assets/absent.png"), None);
     assert_eq!(resolve("   "), None);
-    assert_eq!(markdown_preview_image_source(None, "assets/shot.png"), None);
+    assert_eq!(
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::local_only(None),
+            "assets/shot.png"
+        ),
+        None
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
     let _ = std::fs::remove_file(&outside);
+}
+
+#[test]
+fn a_forgotten_image_policy_blocks_remote_sources() {
+    // The policy is threaded through every renderer, so a call site that
+    // builds one without thinking about remote images has to fail closed --
+    // the URL is chosen by repository content.
+    let badge = "https://img.shields.io/badge/build-passing.svg";
+    assert_eq!(
+        markdown_preview_image_source(MarkdownPreviewImagePolicy::default(), badge),
+        None
+    );
+    assert_eq!(
+        markdown_preview_image_source(
+            MarkdownPreviewImagePolicy::local_only(Some(std::path::Path::new("/tmp"))),
+            badge
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_blocked_remote_image_says_it_was_blocked() {
+    let badge = "https://img.shields.io/badge/build-passing.svg";
+    let local_only = MarkdownPreviewImagePolicy::local_only(None);
+
+    // Saying "unavailable" would blame the document for a choice made here.
+    assert_eq!(
+        markdown_preview_image_unavailable_reason(local_only, badge),
+        "Remote image blocked"
+    );
+    // A source that would not have resolved anyway keeps the generic reason,
+    // including the same URL once remote images are allowed and the fetch is
+    // what failed.
+    assert_eq!(
+        markdown_preview_image_unavailable_reason(
+            MarkdownPreviewImagePolicy::new(None, true),
+            badge
+        ),
+        "Image unavailable"
+    );
+    assert_eq!(
+        markdown_preview_image_unavailable_reason(local_only, "assets/absent.png"),
+        "Image unavailable"
+    );
 }
 
 /// A picture row carrying `source`, and whatever size the document declared.

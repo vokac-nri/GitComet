@@ -230,7 +230,6 @@ fn main() {
                 let backend = build_backend();
                 let startup_report =
                     startup_crash_report.map(|report| gitcomet_ui_gpui::StartupCrashReport {
-                        issue_url: report.issue_url,
                         summary: report.summary,
                         crash_log_path: report.crash_log_path,
                     });
@@ -554,10 +553,6 @@ fn ensure_macos_dev_app_bundle(
 #[cfg(feature = "ui-gpui-runtime")]
 fn print_startup_crash_report_hint(report: &crashlog::StartupCrashReport) {
     eprintln!("GitComet detected a crash from a previous run.");
-    eprintln!(
-        "Open this URL to file a prefilled crash report:\n{}",
-        report.issue_url
-    );
     eprintln!("Crash log: {}", report.crash_log_path.display());
 }
 
