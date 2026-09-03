@@ -11,21 +11,16 @@ static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static SESSION_LIFECYCLE: Mutex<()> = Mutex::new(());
 static WRITING_RUNTIME_ERROR_LOG: Mutex<()> = Mutex::new(());
 static CRASH_LOGGER: CrashLogger = CrashLogger;
-const CRASH_ISSUE_URL: &str = concat!(env!("CARGO_PKG_REPOSITORY"), "/issues/new");
-const CRASH_ISSUE_TEMPLATE: &str = "crash_report.md";
 const PENDING_REPORT_FILE: &str = "pending-report-path.txt";
 const STARTUP_REPORT_FILE: &str = "pending-startup-report.log";
 const SESSION_MARKER_FILE_PREFIX: &str = "session-in-progress";
 const LAST_OPERATION_FILE_PREFIX: &str = "last-operation";
 const RUNTIME_ERROR_FILE_PREFIX: &str = "last-runtime-error";
-const MAX_TITLE_CHARS: usize = 96;
-const MAX_BACKTRACE_CHARS: usize = 2_400;
 #[cfg(windows)]
 const PENDING_REPORT_PATH_WIDE_PREFIX: &str = "gitcomet-crashlog-utf16le:";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupCrashReport {
-    pub issue_url: String,
     pub summary: String,
     pub crash_log_path: PathBuf,
 }
@@ -964,8 +959,6 @@ fn unix_time_ms() -> u128 {
 
 fn build_startup_report(crash_log_path: PathBuf, crash_log: &str) -> StartupCrashReport {
     let parsed = parse_crash_log(crash_log);
-    let issue_title = build_issue_title(&parsed);
-    let issue_body = build_issue_body(&parsed, &crash_log_path);
     let summary_message = parsed
         .message
         .as_deref()
@@ -980,7 +973,6 @@ fn build_startup_report(crash_log_path: PathBuf, crash_log: &str) -> StartupCras
         .unwrap_or_else(|| "unknown location".to_string());
 
     StartupCrashReport {
-        issue_url: build_issue_url(&issue_title, &issue_body),
         summary: format!(
             "{} at {}",
             truncate_chars(&summary_message, 160),
@@ -990,20 +982,16 @@ fn build_startup_report(crash_log_path: PathBuf, crash_log: &str) -> StartupCras
     }
 }
 
+/// The two fields the recovered-crash card needs.
+///
+/// The crash log carries much more — a timestamp, the crate and its version,
+/// the thread, the failure context, the backtrace — but that detail is for
+/// reading in the file itself, so only what the summary line renders is parsed
+/// back out of it.
 #[derive(Default)]
 struct ParsedCrashLog {
-    failure_kind: Option<String>,
-    timestamp_unix_ms: Option<String>,
-    crate_name: Option<String>,
-    crate_version: Option<String>,
-    thread: Option<String>,
     location: Option<String>,
     message: Option<String>,
-    info: Option<String>,
-    failure_context: Option<String>,
-    copy_source: Option<String>,
-    clipboard_backend: Option<String>,
-    backtrace: String,
 }
 
 fn parse_crash_log(crash_log: &str) -> ParsedCrashLog {
@@ -1018,64 +1006,21 @@ fn parse_crash_log(crash_log: &str) -> ParsedCrashLog {
             continue;
         }
 
+        // A newer failure block supersedes whatever an older one left behind.
         if line.starts_with("=== GitComet ") && line.ends_with(" ===") {
-            reset_parsed_failure(&mut parsed);
-            parsed.failure_kind = if line.contains("panic") {
-                Some("panic".to_string())
-            } else if line.contains("runtime error") {
-                Some("runtime-error".to_string())
-            } else if line.contains("abnormal exit") {
-                Some("abnormal-exit".to_string())
-            } else {
-                None
-            };
+            parsed = ParsedCrashLog::default();
             in_backtrace = false;
             continue;
         }
 
+        // A stack frame can look like anything, so nothing inside a backtrace
+        // is read as a field.
         if in_backtrace {
-            parsed.backtrace.push_str(line);
-            parsed.backtrace.push('\n');
             continue;
         }
 
-        if line == "backtrace:" {
+        if line.starts_with("backtrace:") {
             in_backtrace = true;
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("backtrace:") {
-            in_backtrace = true;
-            let rest = rest.trim_start();
-            if !rest.is_empty() {
-                parsed.backtrace.push_str(rest);
-                parsed.backtrace.push('\n');
-            }
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("timestamp_unix_ms=") {
-            parsed.timestamp_unix_ms = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("failure_kind=") {
-            parsed.failure_kind = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("crate=") {
-            if let Some((name, version)) = rest.split_once(" version=") {
-                parsed.crate_name = Some(name.trim().to_string());
-                parsed.crate_version = Some(version.trim().to_string());
-            } else {
-                parsed.crate_name = Some(rest.trim().to_string());
-            }
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("thread=") {
-            parsed.thread = Some(rest.trim().to_string());
             continue;
         }
 
@@ -1086,193 +1031,10 @@ fn parse_crash_log(crash_log: &str) -> ParsedCrashLog {
 
         if let Some(rest) = line.strip_prefix("message=") {
             parsed.message = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("info=") {
-            parsed.info = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("failure_context=") {
-            parsed.failure_context = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("copy_source=") {
-            parsed.copy_source = Some(rest.trim().to_string());
-            continue;
-        }
-
-        if let Some(rest) = line.strip_prefix("clipboard_backend=") {
-            parsed.clipboard_backend = Some(rest.trim().to_string());
         }
     }
 
     parsed
-}
-
-fn reset_parsed_failure(parsed: &mut ParsedCrashLog) {
-    parsed.failure_kind = None;
-    parsed.timestamp_unix_ms = None;
-    parsed.crate_name = None;
-    parsed.crate_version = None;
-    parsed.thread = None;
-    parsed.location = None;
-    parsed.message = None;
-    parsed.info = None;
-    parsed.backtrace.clear();
-}
-
-fn build_issue_url(title: &str, body: &str) -> String {
-    format!(
-        "{CRASH_ISSUE_URL}?template={}&title={}&body={}",
-        percent_encode(CRASH_ISSUE_TEMPLATE),
-        percent_encode(title),
-        percent_encode(body)
-    )
-}
-
-fn build_issue_title(parsed: &ParsedCrashLog) -> String {
-    let failure_message = parsed
-        .message
-        .as_deref()
-        .map(single_line_text)
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "unknown failure".to_string());
-    format!(
-        "Crash: {}",
-        truncate_chars(&failure_message, MAX_TITLE_CHARS)
-    )
-}
-
-fn build_issue_body(parsed: &ParsedCrashLog, crash_log_path: &Path) -> String {
-    let crate_name = parsed
-        .crate_name
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(env!("CARGO_PKG_NAME"));
-    let crate_version = parsed
-        .crate_version
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or(env!("CARGO_PKG_VERSION"));
-    let timestamp = parsed
-        .timestamp_unix_ms
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown>");
-    let thread = parsed
-        .thread
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown>");
-    let failure_kind = parsed
-        .failure_kind
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown>");
-    let location = parsed
-        .location
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown>");
-    let message = parsed
-        .message
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown failure message>");
-    let info = parsed
-        .info
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown failure info>");
-    let copy_source = parsed
-        .copy_source
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<no UI operation recorded>");
-    let failure_context = parsed
-        .failure_context
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .unwrap_or("<unknown>");
-
-    let backtrace = {
-        let trimmed = parsed.backtrace.trim();
-        if trimmed.is_empty() {
-            "<no backtrace captured>".to_string()
-        } else {
-            truncate_chars(trimmed, MAX_BACKTRACE_CHARS)
-        }
-    };
-
-    let mut body = String::new();
-    let _ = writeln!(body, "## Crash Summary");
-    let _ = writeln!(body);
-    let _ = writeln!(
-        body,
-        "<!-- Please describe what you were doing right before the crash. -->"
-    );
-    let _ = writeln!(body, "GitComet ended unexpectedly.");
-    let _ = writeln!(body);
-
-    let _ = writeln!(body, "## Environment");
-    let _ = writeln!(body);
-    let _ = writeln!(body, "- GitComet crate: `{crate_name}`");
-    let _ = writeln!(body, "- GitComet version: `{crate_version}`");
-    let _ = writeln!(body, "- OS: `{}`", std::env::consts::OS);
-    let _ = writeln!(body, "- Arch: `{}`", std::env::consts::ARCH);
-    let _ = writeln!(body, "- Crash timestamp (unix ms): `{timestamp}`");
-    let _ = writeln!(body, "- Thread: `{thread}`");
-    let _ = writeln!(body, "- Failure kind: `{failure_kind}`");
-    let _ = writeln!(body, "- Failure location: `{location}`");
-    let _ = writeln!(body, "- Failure context: `{failure_context}`");
-    let _ = writeln!(body, "- Last UI operation: `{copy_source}`");
-    if let Some(clipboard_backend) = parsed
-        .clipboard_backend
-        .as_deref()
-        .filter(|backend| !backend.is_empty())
-    {
-        let _ = writeln!(body, "- Clipboard backend: `{clipboard_backend}`");
-    }
-    let _ = writeln!(body, "- Crash log path: `{}`", crash_log_path.display());
-    let _ = writeln!(body);
-
-    let _ = writeln!(body, "## Failure Message");
-    let _ = writeln!(body);
-    let _ = writeln!(body, "```text");
-    let _ = writeln!(body, "{message}");
-    let _ = writeln!(body, "```");
-    let _ = writeln!(body);
-
-    let _ = writeln!(body, "## Failure Info");
-    let _ = writeln!(body);
-    let _ = writeln!(body, "```text");
-    let _ = writeln!(body, "{info}");
-    let _ = writeln!(body, "```");
-    let _ = writeln!(body);
-
-    let _ = writeln!(body, "## Backtrace (trimmed)");
-    let _ = writeln!(body);
-    let _ = writeln!(body, "```text");
-    let _ = writeln!(body, "{backtrace}");
-    let _ = writeln!(body, "```");
-    body
-}
-
-fn percent_encode(input: &str) -> String {
-    let mut encoded = String::with_capacity(input.len());
-    for byte in input.bytes() {
-        let is_unreserved =
-            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
-        if is_unreserved {
-            encoded.push(char::from(byte));
-        } else {
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    encoded
 }
 
 fn single_line_text(input: &str) -> String {
@@ -1345,19 +1107,7 @@ mod tests {
     }
 
     #[test]
-    fn percent_encode_encodes_reserved_characters() {
-        assert_eq!(percent_encode("a b&c/d"), "a%20b%26c%2Fd");
-    }
-
-    #[test]
-    fn build_issue_url_uses_package_repository_issue_endpoint() {
-        let url = build_issue_url("Crash: boom", "details");
-        let expected_prefix = format!("{}/issues/new?", env!("CARGO_PKG_REPOSITORY"));
-        assert!(url.starts_with(&expected_prefix));
-    }
-
-    #[test]
-    fn parse_crash_log_extracts_fields() {
+    fn parse_crash_log_extracts_the_summary_fields() {
         let log = r#"=== GitComet crash (panic) ===
 timestamp_unix_ms=123
 crate=gitcomet version=0.1.0
@@ -1374,35 +1124,21 @@ frame 2
 "#;
 
         let parsed = parse_crash_log(log);
-        assert_eq!(parsed.failure_kind.as_deref(), Some("panic"));
-        assert_eq!(parsed.timestamp_unix_ms.as_deref(), Some("123"));
-        assert_eq!(parsed.crate_name.as_deref(), Some("gitcomet"));
-        assert_eq!(parsed.crate_version.as_deref(), Some("0.1.0"));
-        assert_eq!(parsed.thread.as_deref(), Some("main"));
         assert_eq!(parsed.location.as_deref(), Some("src/main.rs#L42"));
         assert_eq!(parsed.message.as_deref(), Some("boom happened"));
-        assert_eq!(parsed.info.as_deref(), Some("panic info"));
-        assert_eq!(
-            parsed.failure_context.as_deref(),
-            Some("main GPUI window launch")
-        );
-        assert_eq!(parsed.copy_source.as_deref(), Some("commit-details-diff"));
-        assert_eq!(parsed.clipboard_backend.as_deref(), Some("x11"));
-        assert!(parsed.backtrace.contains("frame 1"));
-        assert!(parsed.backtrace.contains("frame 2"));
     }
 
     #[test]
     fn parse_crash_log_supports_inline_backtrace_header() {
-        let log = "message=boom\nbacktrace:frame 1\nframe 2\n";
+        // Everything past the header is a frame, including a line that happens
+        // to be shaped like a field.
+        let log = "message=boom\nbacktrace:frame 1\nmessage=a frame\n";
         let parsed = parse_crash_log(log);
         assert_eq!(parsed.message.as_deref(), Some("boom"));
-        assert!(parsed.backtrace.contains("frame 1"));
-        assert!(parsed.backtrace.contains("frame 2"));
     }
 
     #[test]
-    fn build_startup_report_populates_issue_url_and_summary() {
+    fn build_startup_report_populates_summary() {
         let log = r#"timestamp_unix_ms=123
 crate=gitcomet version=0.1.0
 thread=main
@@ -1414,12 +1150,6 @@ frame 1
 frame 2
 "#;
         let report = build_startup_report(PathBuf::from("/tmp/panic.log"), log);
-        assert!(report.issue_url.contains("template=crash_report.md"));
-        assert!(
-            report
-                .issue_url
-                .contains("title=Crash%3A%20boom%20happened")
-        );
         assert!(report.summary.contains("boom happened"));
         assert!(report.summary.contains("src/main.rs#L42"));
     }
@@ -1451,7 +1181,6 @@ frame 2
         let report = take_startup_report_from_crash_dir(dir.path())
             .expect("startup report should be available");
         assert_eq!(report.crash_log_path, startup_report_path(dir.path()));
-        assert!(report.issue_url.contains("template=crash_report.md"));
         assert!(report.summary.contains("boom happened"));
         assert!(
             !pending_report_path(dir.path()).exists(),
@@ -1505,7 +1234,6 @@ frame 2
 
         assert_eq!(report.crash_log_path, startup_report_path(dir.path()));
         assert!(report.summary.contains("did not exit cleanly"));
-        assert!(report.issue_url.contains("commit-details-diff"));
         assert!(
             !marker.exists(),
             "session marker should be removed after its report is persisted"
@@ -1547,11 +1275,10 @@ frame 2
 
         let report = take_startup_report_from_crash_dir(dir.path())
             .expect("runtime error should produce a startup report");
-        let parsed = parse_crash_log(
-            &std::fs::read_to_string(&report.crash_log_path).expect("read startup report"),
-        );
+        let crash_log =
+            std::fs::read_to_string(&report.crash_log_path).expect("read startup report");
+        let parsed = parse_crash_log(&crash_log);
 
-        assert_eq!(parsed.failure_kind.as_deref(), Some("runtime-error"));
         assert_eq!(
             parsed.location.as_deref(),
             Some("crates/gpui_linux/src/linux/wayland/client.rs#L993")
@@ -1560,20 +1287,15 @@ frame 2
             parsed.message.as_deref(),
             Some("Io error: Connection reset by peer (os error 104)")
         );
-        assert_eq!(
-            parsed.failure_context.as_deref(),
-            Some("main GPUI event loop")
-        );
-        assert_eq!(parsed.copy_source.as_deref(), Some("diff-context-menu"));
-        assert_eq!(parsed.clipboard_backend.as_deref(), Some("x11"));
-        assert!(parsed.backtrace.contains("runtime frame 1"));
         assert!(report.summary.contains("Connection reset by peer"));
-        assert!(report.issue_url.contains("wayland%2Fclient.rs%23L993"));
-        assert!(
-            report
-                .issue_url
-                .contains("Clipboard%20backend%3A%20%60x11%60")
-        );
+
+        // The detail the card's summary does not carry has to survive in the
+        // log file, which is the thing a user is asked for.
+        assert!(crash_log.contains("failure_kind=runtime-error"));
+        assert!(crash_log.contains("failure_context=main GPUI event loop"));
+        assert!(crash_log.contains("copy_source=diff-context-menu"));
+        assert!(crash_log.contains("clipboard_backend=x11"));
+        assert!(crash_log.contains("runtime frame 1"));
         assert!(!runtime_error_path(dir.path()).exists());
     }
 
@@ -1601,7 +1323,6 @@ new frame
 "#;
 
         let parsed = parse_crash_log(log);
-        assert_eq!(parsed.failure_kind.as_deref(), Some("runtime-error"));
         assert_eq!(
             parsed.location.as_deref(),
             Some("crates/gpui_linux/src/linux/wayland/client.rs#L993")
@@ -1610,13 +1331,14 @@ new frame
             parsed.message.as_deref(),
             Some("Io error: Connection reset by peer")
         );
-        assert_eq!(parsed.copy_source.as_deref(), Some("diff-context-menu"));
-        assert_eq!(
-            parsed.failure_context.as_deref(),
-            Some("main GPUI event loop")
+        // Nothing from an earlier block may leak into the newest one, whether
+        // it was separated by a backtrace or by a block that set no location.
+        assert_ne!(parsed.location.as_deref(), Some("src/old.rs#L1"));
+        assert_ne!(parsed.message.as_deref(), Some("old panic"));
+        assert_ne!(
+            parsed.message.as_deref(),
+            Some("generic event-loop failure")
         );
-        assert!(parsed.backtrace.contains("new frame"));
-        assert!(!parsed.backtrace.contains("old frame"));
     }
 
     #[test]
@@ -1641,7 +1363,12 @@ new frame
             .expect("handled launch failure should produce a startup report");
 
         assert!(report.summary.contains("no compatible graphics device"));
-        assert!(report.issue_url.contains("main%20GPUI%20window%20launch"));
+        assert!(
+            std::fs::read_to_string(startup_report_path(dir.path()))
+                .expect("read startup report")
+                .contains("failure_context=main GPUI window launch"),
+            "the log must record which operation failed"
+        );
         assert!(
             !marker.exists(),
             "session marker should be removed after its report is persisted"
@@ -1678,13 +1405,13 @@ new frame
 
         let report = take_startup_report_from_crash_dir(dir.path())
             .expect("handled failure should produce a startup report");
-        let parsed = parse_crash_log(
-            &std::fs::read_to_string(&report.crash_log_path).expect("read startup report"),
-        );
-        assert_eq!(parsed.failure_kind.as_deref(), Some("returned-error"));
+        let crash_log =
+            std::fs::read_to_string(&report.crash_log_path).expect("read startup report");
+        let parsed = parse_crash_log(&crash_log);
         assert_eq!(parsed.location.as_deref(), Some("src/main.rs#L275"));
-        assert_eq!(parsed.copy_source.as_deref(), Some("diff-context-menu"));
-        assert!(parsed.backtrace.contains("observation frame 1"));
+        assert!(crash_log.contains("failure_kind=returned-error"));
+        assert!(crash_log.contains("copy_source=diff-context-menu"));
+        assert!(crash_log.contains("observation frame 1"));
     }
 
     #[test]
@@ -2079,26 +1806,6 @@ new frame
         assert!(!marker.exists());
         assert!(!last_operation_path_for_pid(&dir, child_pid).exists());
         assert!(!runtime_error_path_for_pid(&dir, child_pid).exists());
-    }
-
-    #[test]
-    fn build_issue_body_trims_very_long_backtrace() {
-        let parsed = ParsedCrashLog {
-            backtrace: "x".repeat(MAX_BACKTRACE_CHARS + 128),
-            ..Default::default()
-        };
-
-        let body = build_issue_body(&parsed, Path::new("/tmp/panic.log"));
-        let marker = "## Backtrace (trimmed)\n\n```text\n";
-        let start = body.find(marker).expect("backtrace section should exist") + marker.len();
-        let end = start
-            + body[start..]
-                .find("\n```")
-                .expect("backtrace code block should close");
-        let backtrace_text = &body[start..end];
-
-        assert_eq!(backtrace_text.chars().count(), MAX_BACKTRACE_CHARS);
-        assert!(backtrace_text.ends_with("..."));
     }
 
     #[test]

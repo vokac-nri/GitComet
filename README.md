@@ -245,14 +245,14 @@ so fatal errors logged and consumed by the UI runtime remain reportable.
 Recovery ignores markers owned by still-running GitComet processes, so one open
 instance cannot consume another's crash state.
 On the next launch, GitComet snapshots recovered data as
-`pending-startup-report.log` and retains it until the user reports or dismisses
-the notification, so a failed subsequent launch cannot discard the report before
+`pending-startup-report.log` and retains it until the user dismisses the
+notification, so a failed subsequent launch cannot discard the report before
 its notification is visible.
 
-GitComet presents the report in the next UI launch and also prints its
-prefilled GitHub issue URL and log path to the launching terminal. The report
-includes app version, platform, structured failure details, and a trimmed
-backtrace.
+GitComet presents the report in the next UI launch and also prints its log path
+to the launching terminal. The log includes app version, platform, structured
+failure details, and a trimmed backtrace. Nothing is sent anywhere: the file
+stays on the machine, for the user to read or attach to a report themselves.
 
 ### Prior work and ideas inspired by:
 

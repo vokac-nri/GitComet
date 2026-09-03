@@ -2285,51 +2285,6 @@ impl GitCometView {
         );
     }
 
-    pub(in crate::view) fn startup_crash_report_issue_url(&self) -> Option<String> {
-        self.startup_crash_report
-            .as_ref()
-            .map(|report| report.issue_url.clone())
-    }
-
-    /// The "Report Issue" button's whole body, so the button stays a one-liner
-    /// and tests can drive the real sequence through
-    /// [`Self::report_startup_crash_report_with`].
-    pub(super) fn report_startup_crash_report(&mut self, cx: &mut gpui::Context<Self>) {
-        self.report_startup_crash_report_with(cx, |url| platform_open::open_url_blocking(&url));
-    }
-
-    pub(super) fn report_startup_crash_report_with(
-        &mut self,
-        cx: &mut gpui::Context<Self>,
-        open_url: impl FnOnce(String) -> Result<(), std::io::Error> + Send + 'static,
-    ) {
-        let Some(url) = self.startup_crash_report_issue_url() else {
-            return;
-        };
-        platform_open::spawn_launch(
-            cx,
-            move || open_url(url),
-            |this, result, cx| {
-                match result {
-                    Ok(()) => this.push_toast(
-                        components::ToastKind::Success,
-                        "Opened crash report page in your browser.".to_string(),
-                        cx,
-                    ),
-                    Err(err) => this.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to open browser: {err}"),
-                        cx,
-                    ),
-                }
-                // `push_toast` sends an Error straight to `show_error_banner`,
-                // which never touches `cx`, so without this the error path would
-                // depend entirely on a store round-trip to repaint.
-                cx.notify();
-            },
-        );
-    }
-
     pub(super) fn ignore_startup_crash_report(&mut self) -> Result<(), std::io::Error> {
         let Some(report) = self.startup_crash_report.as_ref() else {
             return Ok(());

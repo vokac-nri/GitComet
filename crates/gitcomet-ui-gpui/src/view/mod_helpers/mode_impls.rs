@@ -571,7 +571,6 @@ impl GitCometViewConfig {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupCrashReport {
-    pub issue_url: String,
     pub summary: String,
     pub crash_log_path: std::path::PathBuf,
 }
