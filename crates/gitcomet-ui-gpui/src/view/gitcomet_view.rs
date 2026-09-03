@@ -1386,7 +1386,6 @@ impl GitCometView {
         view.drive_focused_mergetool_bootstrap();
         view.drive_submodule_diff_bootstrap();
         view.maybe_show_user_survey_on_startup(cx);
-        view.maybe_check_for_updates_on_startup(cx);
 
         crate::app::sync_gitcomet_window_state(
             cx,
@@ -2219,24 +2218,6 @@ impl GitCometView {
         }
         self.toast_host
             .update(cx, |host, cx| host.push_toast(kind, message, cx));
-    }
-
-    #[cfg_attr(test, allow(dead_code))]
-    pub(super) fn push_toast_with_link(
-        &mut self,
-        kind: components::ToastKind,
-        message: String,
-        link_url: String,
-        link_label: String,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if matches!(kind, components::ToastKind::Error) {
-            self.show_error_banner(self.active_repo_id(), message);
-            return;
-        }
-        self.toast_host.update(cx, |host, cx| {
-            host.push_toast_with_link(kind, message, link_url, link_label, cx)
-        });
     }
 
     pub(super) fn active_repo_workdir(&self) -> Option<std::path::PathBuf> {

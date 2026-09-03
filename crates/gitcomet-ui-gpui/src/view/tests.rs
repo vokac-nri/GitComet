@@ -500,6 +500,40 @@ fn repository_bar_ignores_files_multiple_paths_and_drops_outside_the_bar(
     });
 }
 
+/// Launching must not talk to the network.
+///
+/// Asserts on *any* URL rather than a particular host: the point is that a
+/// Git GUI has nothing to say to anyone at startup, so a future ping is caught
+/// here too and has to justify itself.
+#[gpui::test]
+fn launching_the_main_view_issues_no_http_requests(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let http_client = test_support::RecordingHttpClient::new();
+    let installed = http_client.clone();
+    cx.update(|app| app.set_http_client(Arc::new(installed)));
+
+    let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
+    let (store, events) = AppStore::new(backend);
+    let (_view, cx) = cx.add_window_view(|window, cx| {
+        GitCometView::new_with_config(
+            store,
+            events,
+            GitCometViewConfig::normal(None),
+            window,
+            cx,
+        )
+    });
+
+    test_support::redraw(cx);
+    cx.run_until_parked();
+
+    assert_eq!(
+        http_client.requests(),
+        Vec::<String>::new(),
+        "launching must not reach the network"
+    );
+}
+
 #[gpui::test]
 fn startup_crash_report_is_visible_after_relaunch(cx: &mut gpui::TestAppContext) {
     let _visual_guard = crate::test_support::lock_visual_test();

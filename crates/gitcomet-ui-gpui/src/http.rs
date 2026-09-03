@@ -1,9 +1,9 @@
 //! The application's HTTP client.
 //!
 //! `gpui` defaults to [`gpui::http_client::NullHttpClient`], which fails every
-//! request, so anything that reaches the network — the startup update check,
-//! and images a markdown preview points at — silently does nothing until a
-//! real client is installed. This is that client.
+//! request, so the one thing that reaches the network — images a markdown
+//! preview points at, when the user has allowed remote ones — silently does
+//! nothing until a real client is installed. This is that client.
 //!
 //! Requests are issued with a blocking client on the background thread pool
 //! rather than an async HTTP stack, because a Git GUI makes very few of them
