@@ -233,14 +233,7 @@ impl ToastHost {
             components::ToastKind::Warning => Duration::from_secs(10),
             components::ToastKind::Success => Duration::from_secs(6),
         };
-        let _ = self.push_toast_inner(
-            kind,
-            message,
-            Vec::new(),
-            ToastDismissBehavior::Remove,
-            Some(ttl),
-            cx,
-        );
+        let _ = self.push_toast_inner(kind, message, Vec::new(), Some(ttl), cx);
     }
 
     pub(super) fn push_hook_activity_toast(
@@ -264,7 +257,6 @@ impl ToastHost {
                 operation_id,
                 label: "View output".to_string(),
             }],
-            ToastDismissBehavior::Remove,
             Some(ttl),
             cx,
         );
@@ -288,50 +280,11 @@ impl ToastHost {
             .count()
     }
 
-    pub(super) fn push_survey_toast(
-        &mut self,
-        survey_id: &str,
-        survey_name: &str,
-        message: &str,
-        url: &str,
-        open_label: &str,
-        postpone_label: &str,
-        postpone_seconds: u64,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        let _ = self.push_toast_inner(
-            components::ToastKind::Warning,
-            message.to_string(),
-            vec![
-                ToastAction::OpenSurvey {
-                    survey_id: survey_id.to_string(),
-                    survey_name: survey_name.to_string(),
-                    url: url.to_string(),
-                    label: open_label.to_string(),
-                },
-                ToastAction::PostponeSurvey {
-                    survey_id: survey_id.to_string(),
-                    survey_name: survey_name.to_string(),
-                    postpone_seconds,
-                    label: postpone_label.to_string(),
-                },
-            ],
-            ToastDismissBehavior::PostponeSurvey {
-                survey_id: survey_id.to_string(),
-                survey_name: survey_name.to_string(),
-                postpone_seconds,
-            },
-            None,
-            cx,
-        );
-    }
-
     fn push_toast_inner(
         &mut self,
         kind: components::ToastKind,
         message: String,
         actions: Vec<ToastAction>,
-        dismiss_behavior: ToastDismissBehavior,
         ttl: Option<Duration>,
         cx: &mut gpui::Context<Self>,
     ) -> u64 {
@@ -374,7 +327,6 @@ impl ToastHost {
             input,
             is_code_message,
             actions,
-            dismiss_behavior,
             ttl,
         });
         cx.notify();
@@ -417,34 +369,6 @@ impl ToastHost {
         }
     }
 
-    fn dismiss_toast(
-        &mut self,
-        id: u64,
-        behavior: ToastDismissBehavior,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        match behavior {
-            ToastDismissBehavior::Remove => {}
-            ToastDismissBehavior::PostponeSurvey {
-                survey_id,
-                survey_name,
-                postpone_seconds,
-            } => {
-                if let Err(err) = gitcomet_state::session::persist_survey_prompt_postponed(
-                    &survey_id,
-                    postpone_seconds,
-                ) {
-                    self.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to save {survey_name} reminder preference: {err}"),
-                        cx,
-                    );
-                }
-            }
-        }
-        self.remove_toast(id, cx);
-    }
-
     fn handle_toast_action(
         &mut self,
         id: u64,
@@ -452,76 +376,28 @@ impl ToastHost {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        match action {
-            ToastAction::OpenSurvey {
-                survey_id,
-                survey_name,
-                url,
-                ..
-            } => {
-                if let Err(err) = gitcomet_state::session::persist_survey_prompt_opened(&survey_id)
-                {
-                    self.push_toast(
-                        components::ToastKind::Error,
-                        format!("Failed to save {survey_name} preference: {err}"),
+        let ToastAction::OpenHookActivity {
+            repo_id,
+            operation_id,
+            ..
+        } = action;
+        let root_view = self.root_view.clone();
+        let window_handle = window.window_handle();
+        cx.defer(move |cx| {
+            let _ = window_handle.update(cx, |_, window, cx| {
+                let _ = root_view.update(cx, |root, cx| {
+                    root.open_popover_centered(
+                        PopoverKind::HookActivity {
+                            repo_id,
+                            operation_id: Some(operation_id),
+                        },
+                        window,
                         cx,
                     );
-                }
-                self.remove_toast(id, cx);
-                super::platform_open::spawn_launch(
-                    cx,
-                    move || super::platform_open::open_url_blocking(&url),
-                    move |this, result, cx| {
-                        if let Err(err) = result {
-                            this.push_toast(
-                                components::ToastKind::Error,
-                                format!("Failed to open {survey_name}: {err}"),
-                                cx,
-                            );
-                        }
-                    },
-                );
-            }
-            ToastAction::PostponeSurvey {
-                survey_id,
-                survey_name,
-                postpone_seconds,
-                ..
-            } => {
-                self.dismiss_toast(
-                    id,
-                    ToastDismissBehavior::PostponeSurvey {
-                        survey_id,
-                        survey_name,
-                        postpone_seconds,
-                    },
-                    cx,
-                );
-            }
-            ToastAction::OpenHookActivity {
-                repo_id,
-                operation_id,
-                ..
-            } => {
-                let root_view = self.root_view.clone();
-                let window_handle = window.window_handle();
-                cx.defer(move |cx| {
-                    let _ = window_handle.update(cx, |_, window, cx| {
-                        let _ = root_view.update(cx, |root, cx| {
-                            root.open_popover_centered(
-                                PopoverKind::HookActivity {
-                                    repo_id,
-                                    operation_id: Some(operation_id),
-                                },
-                                window,
-                                cx,
-                            );
-                        });
-                    });
                 });
-                self.remove_toast(id, cx);
-            }
-        }
+            });
+        });
+        self.remove_toast(id, cx);
     }
 
     pub(super) fn sync_clone_progress(
@@ -936,7 +812,6 @@ impl Render for ToastHost {
                 };
 
                 let toast_id = t.id;
-                let dismiss_behavior = t.dismiss_behavior.clone();
                 let close = components::Button::new(format!("toast_close_{}", t.id), "")
                     .start_slot(svg_icon(
                         "icons/generic_close.svg",
@@ -947,7 +822,7 @@ impl Render for ToastHost {
                     .render(theme, ui_scale_percent)
                     .gitcomet_tooltip(theme, "Dismiss notification".into())
                     .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
-                        this.dismiss_toast(toast_id, dismiss_behavior.clone(), cx);
+                        this.remove_toast(toast_id, cx);
                     }));
 
                 let message_scroll = div()
@@ -977,20 +852,9 @@ impl Render for ToastHost {
                         .items_center()
                         .gap_2()
                         .children(t.actions.iter().enumerate().map(|(ix, action)| {
-                            let label = match action {
-                                ToastAction::OpenSurvey { label, .. }
-                                | ToastAction::PostponeSurvey { label, .. }
-                                | ToastAction::OpenHookActivity { label, .. } => label.clone(),
-                            };
-                            let style = match action {
-                                ToastAction::PostponeSurvey { .. } => {
-                                    components::ButtonStyle::Transparent
-                                }
-                                ToastAction::OpenSurvey { .. }
-                                | ToastAction::OpenHookActivity { .. } => {
-                                    components::ButtonStyle::Outlined
-                                }
-                            };
+                            let ToastAction::OpenHookActivity { label, .. } = action;
+                            let label = label.clone();
+                            let style = components::ButtonStyle::Outlined;
                             let action = action.clone();
                             components::Button::new(
                                 format!("toast_action_{}_{}", toast_id, ix),
@@ -1406,14 +1270,9 @@ mod tests {
         let host = cx.update(|app| {
             app.new(|cx| {
                 let mut host = ToastHost::new(light, gpui::WeakEntity::new_invalid());
-                host.push_survey_toast(
-                    "survey-id",
-                    "Survey",
-                    "Help shape GitComet by taking a short user survey.",
-                    "https://example.com",
-                    "Open Survey",
-                    "Later",
-                    60,
+                host.push_toast(
+                    components::ToastKind::Warning,
+                    "Something worth reading twice.".to_string(),
                     cx,
                 );
                 host

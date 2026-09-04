@@ -201,7 +201,6 @@ pub(crate) mod test_support;
 mod toast_host;
 mod tooltip;
 mod tooltip_host;
-mod user_survey;
 mod word_diff;
 
 use app_model::AppUiModel;

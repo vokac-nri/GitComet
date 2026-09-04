@@ -1388,7 +1388,6 @@ impl GitCometView {
 
         view.drive_focused_mergetool_bootstrap();
         view.drive_submodule_diff_bootstrap();
-        view.maybe_show_user_survey_on_startup(cx);
 
         crate::app::sync_gitcomet_window_state(
             cx,
