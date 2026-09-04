@@ -1,26 +1,5 @@
 use super::*;
 
-pub(super) fn has_recorded_session_repository(file: &UiSessionFile) -> bool {
-    if file.open_repos.iter().any(|path| !path.trim().is_empty()) {
-        return true;
-    }
-    if file
-        .active_repo
-        .as_deref()
-        .is_some_and(|path| !path.trim().is_empty())
-    {
-        return true;
-    }
-    if file
-        .recent_repos
-        .as_ref()
-        .is_some_and(|paths| paths.iter().any(|path| !path.trim().is_empty()))
-    {
-        return true;
-    }
-    false
-}
-
 pub(super) fn parse_repos(
     open_repos_raw: Vec<String>,
     active_repo_raw: Option<String>,

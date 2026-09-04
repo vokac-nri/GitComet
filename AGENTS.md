@@ -21,6 +21,9 @@ Do not "restore" them:
   `github.com/.../issues/new?...` URL carrying the OS username, local paths and a backtrace in a
   GET query string — sent the instant the browser navigated, before the user saw the form. Crash
   logging itself is unchanged and stays local; the card shows the log path.
+- **No user-survey prompt.** Upstream showed a startup toast linking to an upstream-owned Google
+  Form. This fork neither runs that survey nor sees its responses, so the prompt asked our users
+  to do unpaid research for someone else and the click handed a third party a usage signal.
 - **Remote markdown-preview images are off by default.** Image URLs come from repository content,
   so fetching them is a tracking-pixel vector. Gated behind "Load remote images in markdown
   previews" (Settings → Diff). The gate lives in `markdown_preview_image_source`, which every

@@ -158,7 +158,6 @@ struct UiSessionFile {
     repo_history_scopes: Option<BTreeMap<String, HistoryScopeSetting>>,
     repo_history_author_filters: Option<BTreeMap<String, Option<String>>>,
     repo_fetch_prune_deleted_remote_tracking_branches: Option<BTreeMap<String, bool>>,
-    survey_prompt: Option<SurveyPromptSession>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -514,20 +513,17 @@ fn app_state_dir() -> Option<PathBuf> {
 
 use history_mode::{HistoryModeSetting, HistoryScopeSetting};
 use parse::*;
-use survey::SurveyPromptSession;
 
 mod history_mode;
 mod parse;
 mod paths;
 mod repos;
 mod settings;
-mod survey;
 
 pub use history_mode::*;
 pub use paths::*;
 pub use repos::*;
 pub use settings::*;
-pub use survey::*;
 
 pub(crate) use history_mode::persist_repo_history_modes_batch_to_path;
 pub(crate) use repos::load_repo_session_preferences;

@@ -88,12 +88,6 @@ sudo apt install libxcb1 libxkbcommon0 libxkbcommon-x11-0
 
 GitComet requires a local Git installation of `2.50` or newer.
 
-### GitComet User Survey
-
-We’re running this short survey to better understand how people use our Git GUI client in their daily work. Your feedback will help us improve the product and prioritize the features that matter most.
-
-https://docs.google.com/forms/d/e/1FAIpQLSd8DKIl222UomSXrpv1q9rWodRlBSQo9pJDD62GbZEANTgD1A/viewform?usp=dialog
-
 ### Why GitComet
 
 GitComet started from frustration with existing tools on huge codebases like Chromium. We could not find a product that stays responsive and functional when browsing large repositories and file diffs.
