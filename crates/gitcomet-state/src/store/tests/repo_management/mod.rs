@@ -121,7 +121,7 @@ fn assert_open_repo_history_mode_resolution(
 ) {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_path = dir.path().join("repo");
@@ -150,6 +150,7 @@ fn assert_open_repo_history_mode_resolution(
         &id_alloc,
         &mut state,
         Msg::Internal(crate::msg::InternalMsg::RepoOpenedOk {
+            preferences: None,
             repo_id: RepoId(1),
             spec,
             repo: Arc::new(DummyRepo::new(&workdir)),
@@ -181,6 +182,7 @@ fn file_browser_tree_entries() -> Vec<gitcomet_core::domain::FileEntry> {
         path: Arc::new(PathBuf::from(path)),
         kind,
         depth,
+        ignored: false,
     };
 
     vec![
@@ -201,7 +203,7 @@ fn state_with_file_browser_tree() -> (
 ) {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     reduce(
         &mut repos,

@@ -20,7 +20,8 @@
 //! an empty directory, so these tests **skip** rather than fail when it has not
 //! been initialised -- a checkout without `--recurse-submodules` is normal, and
 //! a red suite would only teach people to ignore it. The skip prints why, so a
-//! run that silently checked nothing cannot be mistaken for a pass.
+//! run that silently checked nothing cannot be mistaken for a pass. CI fetches
+//! the pinned submodule and requires it with `GITCOMET_REQUIRE_SYNTAX_CORPUS=1`.
 //!
 //! ```sh
 //! git submodule update --init fixtures/syntax_test
@@ -277,6 +278,10 @@ macro_rules! corpus_or_skip {
         match corpus_root() {
             Ok(root) => root,
             Err(reason) => {
+                assert!(
+                    std::env::var("GITCOMET_REQUIRE_SYNTAX_CORPUS").as_deref() != Ok("1"),
+                    "required syntax corpus is unavailable: {reason}",
+                );
                 println!("skipping syntax corpus test: {reason}");
                 return;
             }
@@ -382,6 +387,8 @@ fn syntax_corpus_tokens_are_slices_of_their_own_line() {
 /// return trip starts from the projected position.
 #[test]
 fn syntax_corpus_pairs_agree_from_both_ends() {
+    let tab_width = 4;
+
     let root = corpus_or_skip!();
     let mut failures: Vec<String> = Vec::new();
     let mut probes = 0usize;
@@ -413,10 +420,11 @@ fn syntax_corpus_pairs_agree_from_both_ends() {
                 probes_in_file += 1;
                 probes += 1;
 
-                let column = display_offset_for_raw_offset(line, token.range.start);
+                let column = display_offset_for_raw_offset(tab_width, line, token.range.start);
                 // No pair is a legitimate answer: the corpus is full of
                 // deliberately unbalanced and malformed text.
                 let Some(hit) = prepared_document_syntax_pair_at_display_offset(
+                    tab_width,
                     sample.document,
                     line_ix,
                     column,
@@ -436,8 +444,10 @@ fn syntax_corpus_pairs_agree_from_both_ends() {
                         ));
                         continue;
                     }
-                    let width =
-                        crate::view::diff_utils::diff_text_display_len(sample.line(span.line_ix));
+                    let width = crate::view::diff_utils::diff_text_display_len(
+                        tab_width,
+                        sample.line(span.line_ix),
+                    );
                     if span.display_range.start >= span.display_range.end
                         || span.display_range.end > width
                     {
@@ -468,6 +478,7 @@ fn syntax_corpus_pairs_agree_from_both_ends() {
                     .saturating_sub(1)
                     .max(far.display_range.start);
                 let back = prepared_document_syntax_pair_at_display_offset(
+                    tab_width,
                     sample.document,
                     far.line_ix,
                     far_column,
@@ -588,17 +599,16 @@ fn syntax_corpus_files_colour_the_construct_they_are_named_for() {
 ///
 /// ```sh
 /// GITCOMET_SYNTAX_DUMP=config/makefile/Makefile \
-///   cargo test -p gitcomet-ui-gpui --lib syntax_corpus_dump -- --nocapture
+///   cargo test -p gitcomet-ui-gpui --lib syntax_corpus_dump -- --ignored --nocapture
 /// ```
 ///
 /// `..` marks a line the grammar coloured nothing on, which is what a break looks
 /// like from here.
 #[test]
+#[ignore = "manual syntax diagnostic; requires GITCOMET_SYNTAX_DUMP"]
 fn syntax_corpus_dump() {
-    let Some(requested) = std::env::var_os("GITCOMET_SYNTAX_DUMP") else {
-        println!("skipping syntax corpus dump: set $GITCOMET_SYNTAX_DUMP to a sample path");
-        return;
-    };
+    let requested = std::env::var_os("GITCOMET_SYNTAX_DUMP")
+        .expect("set GITCOMET_SYNTAX_DUMP to a sample path");
     let requested = PathBuf::from(requested);
     let path = if requested.is_absolute() {
         requested
@@ -692,14 +702,15 @@ fn syntax_corpus_dump() {
 ///
 /// ```sh
 /// GITCOMET_SYNTAX_PAIRS=languages/php/templating.php:12 \
-///   cargo test -p gitcomet-ui-gpui --lib syntax_pair_probe -- --nocapture
+///   cargo test -p gitcomet-ui-gpui --lib syntax_pair_probe -- --ignored --nocapture
 /// ```
 #[test]
+#[ignore = "manual pair diagnostic; requires GITCOMET_SYNTAX_PAIRS"]
 fn syntax_pair_probe() {
-    let Some(requested) = std::env::var_os("GITCOMET_SYNTAX_PAIRS") else {
-        println!("skipping pair probe: set $GITCOMET_SYNTAX_PAIRS to <path>:<line>");
-        return;
-    };
+    let tab_width = 4;
+
+    let requested = std::env::var_os("GITCOMET_SYNTAX_PAIRS")
+        .expect("set GITCOMET_SYNTAX_PAIRS to <path>:<line>");
     let requested = requested.to_string_lossy().into_owned();
     let (path, line_no) = requested
         .rsplit_once(':')
@@ -733,33 +744,36 @@ fn syntax_pair_probe() {
         line_ix + 1
     );
     println!("  {line}");
-    let width = crate::view::diff_utils::diff_text_display_len(line);
+    let width = crate::view::diff_utils::diff_text_display_len(tab_width, line);
     for column in 0..=width {
         let at = line
             .chars()
             .nth(column)
             .map_or_else(|| "<eol>".to_string(), |ch| format!("{ch:?}"));
-        let rendered =
-            match prepared_document_syntax_pair_at_display_offset(sample.document, line_ix, column)
-            {
-                Some(hit) => {
-                    let span = |s: &PreparedSyntaxPairSpan| {
-                        format!(
-                            "{}:{}..{}",
-                            s.line_ix + 1,
-                            s.display_range.start,
-                            s.display_range.end
-                        )
-                    };
+        let rendered = match prepared_document_syntax_pair_at_display_offset(
+            tab_width,
+            sample.document,
+            line_ix,
+            column,
+        ) {
+            Some(hit) => {
+                let span = |s: &PreparedSyntaxPairSpan| {
                     format!(
-                        "{:?} open={} close={}",
-                        hit.kind,
-                        hit.open.iter().map(span).collect::<Vec<_>>().join(","),
-                        hit.close.iter().map(span).collect::<Vec<_>>().join(","),
+                        "{}:{}..{}",
+                        s.line_ix + 1,
+                        s.display_range.start,
+                        s.display_range.end
                     )
-                }
-                None => "-".to_string(),
-            };
+                };
+                format!(
+                    "{:?} open={} close={}",
+                    hit.kind,
+                    hit.open.iter().map(span).collect::<Vec<_>>().join(","),
+                    hit.close.iter().map(span).collect::<Vec<_>>().join(","),
+                )
+            }
+            None => "-".to_string(),
+        };
         println!("  col {column:>3} {at:<8} {rendered}");
     }
 }

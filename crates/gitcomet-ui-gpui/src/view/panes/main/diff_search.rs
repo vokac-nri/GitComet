@@ -1,19 +1,18 @@
 use super::*;
 use crate::kit::text_model::TextModelSnapshot;
 use gitcomet_core::domain::Diff;
-use memchr::{memchr_iter, memchr2_iter};
-use regex::{Regex, RegexBuilder};
+use memchr::memchr2_iter;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::time::Duration;
+mod background;
+pub(in crate::view) use background::{SearchDocument, SearchDocumentKey};
 
 const FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES: usize = 32 * 1024;
 const FILE_PREVIEW_REGEX_SEARCH_WINDOW_BYTES: usize = 256 * 1024;
 const FILE_PREVIEW_REGEX_SEARCH_KEEP_BYTES: usize = 64 * 1024;
-const DIFF_SEARCH_QUERY_DEBOUNCE_MS: u64 = 150;
 const MAX_UTF8_CHAR_BYTES: usize = 4;
 const DIFF_SEARCH_TRIGRAM_MIN_QUERY_BYTES: usize = 3;
 /// Ceiling on the editor's match list. The other views are bounded by their row
@@ -21,237 +20,16 @@ const DIFF_SEARCH_TRIGRAM_MIN_QUERY_BYTES: usize = 3;
 /// would otherwise grow one per byte.
 const FILE_EDITOR_SEARCH_MAX_MATCHES: usize = 20_000;
 
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(in crate::view) struct DiffSearchOptions {
-    pub(in crate::view) match_case: bool,
-    pub(in crate::view) whole_word: bool,
-    pub(in crate::view) regex: bool,
-}
+pub(in crate::view) use gitcomet_core::text_search::{
+    TextSearchMatcher as DiffSearchMatcher, TextSearchOptions as DiffSearchOptions,
+    normalize_text_search_query as normalize_diff_search_query,
+};
+use gitcomet_core::text_search::{is_word_char, next_char_boundary_after};
 
-pub(in crate::view) fn normalize_diff_search_query(query: &str) -> Cow<'_, str> {
-    if !query.contains('\r') {
-        return Cow::Borrowed(query);
-    }
-    Cow::Owned(query.replace("\r\n", "\n").replace('\r', "\n"))
-}
-
-pub(in crate::view) struct DiffSearchMatcher {
-    query: String,
-    options: DiffSearchOptions,
-    regex: Option<Regex>,
-    regex_error: Option<String>,
-}
-
-impl DiffSearchMatcher {
-    pub(in crate::view) fn new(query: &str, options: DiffSearchOptions) -> Self {
-        let query = normalize_diff_search_query(query).into_owned();
-        let (regex, regex_error) = if options.regex && !query.is_empty() {
-            match RegexBuilder::new(&query)
-                .case_insensitive(!options.match_case)
-                .multi_line(true)
-                .build()
-            {
-                Ok(regex) => (Some(regex), None),
-                Err(err) => (None, Some(err.to_string())),
-            }
-        } else {
-            (None, None)
-        };
-
-        Self {
-            query,
-            options,
-            regex,
-            regex_error,
-        }
-    }
-
-    pub(in crate::view) fn query(&self) -> &str {
-        self.query.as_str()
-    }
-
-    pub(in crate::view) fn regex_error(&self) -> Option<&str> {
-        self.regex_error.as_deref()
-    }
-
-    pub(in crate::view) fn is_empty(&self) -> bool {
-        self.query.is_empty()
-    }
-
-    pub(in crate::view) fn can_use_ascii_case_insensitive_fast_path(&self) -> bool {
-        !self.options.match_case
-            && !self.options.whole_word
-            && !self.options.regex
-            && !self.query.contains('\n')
-    }
-
-    fn can_use_single_row_literal_path(&self) -> bool {
-        !self.options.regex && !self.query.contains('\n')
-    }
-
-    pub(in crate::view) fn is_match(&self, haystack: &str) -> bool {
-        self.find_range_at_or_after(haystack, 0).is_some()
-    }
-
-    pub(in crate::view) fn find_ranges_into(
-        &self,
-        haystack: &str,
-        out: &mut Vec<Range<usize>>,
-        max_matches: usize,
-    ) {
-        out.clear();
-        if max_matches == 0 || self.is_empty() || self.regex_error.is_some() {
-            return;
-        }
-
-        let mut search_start = 0usize;
-        while out.len() < max_matches {
-            let Some(range) = self.find_range_at_or_after(haystack, search_start) else {
-                break;
-            };
-            search_start = range.end;
-            out.push(range);
-        }
-    }
-
-    fn find_literal_case_sensitive_from(
-        &self,
-        haystack: &str,
-        start_at: usize,
-    ) -> Option<Range<usize>> {
-        let needle = self.query.as_bytes();
-        let haystack_bytes = haystack.as_bytes();
-        let (&first, _) = needle.first().zip(needle.last())?;
-        let last_start = haystack_bytes.len().checked_sub(needle.len())?;
-        let start_at = start_at.min(haystack_bytes.len());
-        if start_at > last_start {
-            return None;
-        }
-
-        for offset in memchr_iter(first, &haystack_bytes[start_at..=last_start]) {
-            let start = start_at + offset;
-            let range = start..(start + needle.len());
-            if haystack_bytes.get(range.clone()) == Some(needle)
-                && self.range_has_requested_boundaries(haystack, range.clone())
-            {
-                return Some(range);
-            }
-        }
-        None
-    }
-
-    fn find_literal_ascii_case_insensitive_from(
-        &self,
-        haystack: &str,
-        start_at: usize,
-    ) -> Option<Range<usize>> {
-        let needle = self.query.as_bytes();
-        let haystack_bytes = haystack.as_bytes();
-        let (&first, &last) = needle.first().zip(needle.last())?;
-        let last_start = haystack_bytes.len().checked_sub(needle.len())?;
-        let start_at = start_at.min(haystack_bytes.len());
-        if start_at > last_start {
-            return None;
-        }
-        let first_lower = first.to_ascii_lowercase();
-        let first_upper = first.to_ascii_uppercase();
-
-        if needle.len() == 1 {
-            for offset in memchr2_iter(first_lower, first_upper, &haystack_bytes[start_at..]) {
-                let start = start_at + offset;
-                let range = start..(start + 1);
-                if self.range_has_requested_boundaries(haystack, range.clone()) {
-                    return Some(range);
-                }
-            }
-            return None;
-        }
-
-        let middle = &needle[1..needle.len() - 1];
-        let last_lower = last.to_ascii_lowercase();
-        let last_upper = last.to_ascii_uppercase();
-        for offset in memchr2_iter(
-            first_lower,
-            first_upper,
-            &haystack_bytes[start_at..=last_start],
-        ) {
-            let start = start_at + offset;
-            let haystack_last = haystack_bytes[start + needle.len() - 1];
-            if haystack_last != last_lower && haystack_last != last_upper {
-                continue;
-            }
-            if !haystack_bytes[start + 1..start + needle.len() - 1].eq_ignore_ascii_case(middle) {
-                continue;
-            }
-            let range = start..(start + needle.len());
-            if self.range_has_requested_boundaries(haystack, range.clone()) {
-                return Some(range);
-            }
-        }
-        None
-    }
-
-    pub(in crate::view) fn find_row_overlay_ranges_into(
-        &self,
-        haystack: &str,
-        out: &mut Vec<Range<usize>>,
-        max_matches: usize,
-    ) {
-        self.find_ranges_into(haystack, out, max_matches);
-    }
-
-    fn find_range_at_or_after(&self, haystack: &str, start_at: usize) -> Option<Range<usize>> {
-        if self.is_empty() || self.regex_error.is_some() {
-            return None;
-        }
-
-        if let Some(regex) = self.regex.as_ref() {
-            let mut search_start = start_at.min(haystack.len());
-            loop {
-                let m = regex.find_at(haystack, search_start)?;
-                let range = m.start()..m.end();
-                if !range.is_empty() && self.range_has_requested_boundaries(haystack, range.clone())
-                {
-                    return Some(range);
-                }
-                search_start = next_char_boundary_after(haystack, m.start())?;
-            }
-        }
-
-        if self.options.match_case {
-            self.find_literal_case_sensitive_from(haystack, start_at)
-        } else {
-            self.find_literal_ascii_case_insensitive_from(haystack, start_at)
-        }
-    }
-
-    fn range_has_requested_boundaries(&self, haystack: &str, range: Range<usize>) -> bool {
-        if !self.options.whole_word {
-            return true;
-        }
-
-        !haystack[..range.start]
-            .chars()
-            .next_back()
-            .is_some_and(is_word_char)
-            && !haystack[range.end..]
-                .chars()
-                .next()
-                .is_some_and(is_word_char)
-    }
-}
-
-#[inline]
-fn is_word_char(ch: char) -> bool {
-    ch.is_alphanumeric() || ch == '_'
-}
-
-fn next_char_boundary_after(s: &str, ix: usize) -> Option<usize> {
-    if ix >= s.len() {
-        return None;
-    }
-
-    Some(ix + s[ix..].chars().next()?.len_utf8())
+/// Search matchers built since the last call, which resets the count.
+#[cfg(test)]
+pub(in crate::view) fn take_search_matchers_built_for_tests() -> usize {
+    gitcomet_core::text_search::take_text_search_matchers_built_for_tests()
 }
 
 #[derive(Clone, Copy)]
@@ -325,7 +103,7 @@ pub(in crate::view) enum DiffSearchQueryReuse {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DiffSearchFinalizeMode {
+pub(in crate::view) enum DiffSearchFinalizeMode {
     ScrollToFirst,
     PreserveCurrent {
         previous_match_ix: Option<usize>,
@@ -412,6 +190,7 @@ fn diff_search_inline_patch_query_uses_trigram_index(
 
 #[inline]
 fn diff_search_displayed_text_matches_query(
+    tab_width: usize,
     query: AsciiCaseInsensitiveNeedle<'_>,
     text: &str,
     expanded_tabs: &mut String,
@@ -421,43 +200,26 @@ fn diff_search_displayed_text_matches_query(
     }
 
     expanded_tabs.clear();
-    for ch in text.chars() {
-        match ch {
-            '\t' => expanded_tabs.push_str("    "),
-            _ => expanded_tabs.push(ch),
-        }
-    }
+    crate::view::tab_width::push_expanded(tab_width, expanded_tabs, text, &mut 0);
     query.is_match(expanded_tabs.as_str())
 }
 
-fn expand_tabs_to_string(text: &str) -> String {
-    if !text.contains('\t') {
-        return text.to_string();
-    }
-
-    let mut expanded = String::with_capacity(text.len());
-    for ch in text.chars() {
-        match ch {
-            '\t' => expanded.push_str("    "),
-            _ => expanded.push(ch),
-        }
-    }
-    expanded
-}
-
 pub(in crate::view) fn diff_search_split_row_texts_match_query(
+    tab_width: usize,
     query: AsciiCaseInsensitiveNeedle<'_>,
     left: Option<&str>,
     right: Option<&str>,
     expanded_tabs: &mut String,
 ) -> bool {
     if let Some(text) = left
-        && diff_search_displayed_text_matches_query(query, text, expanded_tabs)
+        && diff_search_displayed_text_matches_query(tab_width, query, text, expanded_tabs)
     {
         return true;
     }
 
-    right.is_some_and(|text| diff_search_displayed_text_matches_query(query, text, expanded_tabs))
+    right.is_some_and(|text| {
+        diff_search_displayed_text_matches_query(tab_width, query, text, expanded_tabs)
+    })
 }
 
 #[inline]
@@ -524,6 +286,7 @@ fn diff_search_resume_match_ix(
 }
 
 fn inline_patch_diff_search_text<'a>(
+    tab_width: usize,
     diff: &'a Diff,
     diff_click_kinds: &[DiffClickKind],
     diff_header_display_cache: &'a FxHashMap<usize, SharedString>,
@@ -546,14 +309,9 @@ fn inline_patch_diff_search_text<'a>(
         return Some(Cow::Borrowed(line.text.as_ref()));
     }
 
-    let mut expanded = String::with_capacity(line.text.len());
-    for ch in line.text.chars() {
-        match ch {
-            '\t' => expanded.push_str("    "),
-            _ => expanded.push(ch),
-        }
-    }
-    Some(Cow::Owned(expanded))
+    Some(Cow::Owned(
+        crate::view::tab_width::expand_patch_tabs(tab_width, line.text.as_ref()).into_owned(),
+    ))
 }
 
 fn inline_patch_diff_src_ix_for_visible_ix(
@@ -568,6 +326,7 @@ fn inline_patch_diff_src_ix_for_visible_ix(
 }
 
 fn inline_patch_diff_visible_ix_matches_query(
+    tab_width: usize,
     diff: &Diff,
     diff_click_kinds: &[DiffClickKind],
     diff_header_display_cache: &FxHashMap<usize, SharedString>,
@@ -583,11 +342,18 @@ fn inline_patch_diff_visible_ix_matches_query(
     ) else {
         return false;
     };
-    inline_patch_diff_search_text(diff, diff_click_kinds, diff_header_display_cache, src_ix)
-        .is_some_and(|text| query.is_match(text.as_ref()))
+    inline_patch_diff_search_text(
+        tab_width,
+        diff,
+        diff_click_kinds,
+        diff_header_display_cache,
+        src_ix,
+    )
+    .is_some_and(|text| query.is_match(text.as_ref()))
 }
 
 fn collect_inline_patch_diff_visible_matches_with_needle(
+    tab_width: usize,
     diff: &Diff,
     diff_click_kinds: &[DiffClickKind],
     diff_header_display_cache: &FxHashMap<usize, SharedString>,
@@ -601,6 +367,7 @@ fn collect_inline_patch_diff_visible_matches_with_needle(
         .unwrap_or(diff_visible_indices.len());
     for visible_ix in 0..total {
         if inline_patch_diff_visible_ix_matches_query(
+            tab_width,
             diff,
             diff_click_kinds,
             diff_header_display_cache,
@@ -621,26 +388,43 @@ fn resolved_output_line_ix_matches_query(
     if raw_text.len() <= FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES {
         return query.is_match(raw_text.as_ref());
     }
+    line_text_chunks_any(
+        raw_text,
+        query.as_bytes().len().saturating_sub(1),
+        || false,
+        |chunk| query.is_match(chunk),
+    )
+}
 
-    let overlap = query.as_bytes().len().saturating_sub(1);
-    let mut chunk_start = 0usize;
-    while chunk_start < raw_text.len() {
-        let scan_start = chunk_start.saturating_sub(overlap);
-        let scan_end = chunk_start
+/// Scans a long line in bounded chunks that overlap by `overlap` bytes, so a
+/// match can straddle two chunks. Chunks are resolved to char boundaries:
+/// `slice_text` returns "" for a split character, which skipped whole chunks.
+fn line_text_chunks_any(
+    text: &gitcomet_core::file_diff::FileDiffLineText,
+    overlap: usize,
+    is_cancelled: impl Fn() -> bool,
+    mut is_match: impl FnMut(&str) -> bool,
+) -> bool {
+    let len = text.len();
+    let mut start = 0usize;
+    while start < len && !is_cancelled() {
+        let end = start
             .saturating_add(FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES)
-            .min(raw_text.len());
-        let slice = raw_text
-            .slice_text(scan_start..scan_end)
-            .unwrap_or_default();
-        if query.is_match(slice.as_ref()) {
+            .min(len);
+        let Some((chunk, resolved)) = text.slice_text_resolved(start.saturating_sub(overlap)..end)
+        else {
+            return false;
+        };
+        if is_match(chunk.as_ref()) {
             return true;
         }
-        if scan_end >= raw_text.len() {
-            break;
-        }
-        chunk_start = scan_end;
+        // A character split by `end` starts the next chunk.
+        start = if resolved.end > start {
+            resolved.end
+        } else {
+            end
+        };
     }
-
     false
 }
 
@@ -775,28 +559,28 @@ struct LiteralFileDiffLineTextStreamSearch {
 
 impl LiteralFileDiffLineTextStreamSearch {
     fn new(matcher: &DiffSearchMatcher) -> Option<Self> {
-        if matcher.options.regex || matcher.query.is_empty() {
+        if matcher.options().regex || matcher.query().is_empty() {
             return None;
         }
 
         let needle = matcher
-            .query
+            .query()
             .as_bytes()
             .iter()
             .copied()
-            .map(|byte| folded_search_byte(byte, matcher.options.match_case))
+            .map(|byte| folded_search_byte(byte, matcher.options().match_case))
             .collect::<Vec<_>>();
         let prefix = build_literal_search_prefix_table(needle.as_slice());
 
         Some(Self {
             needle,
             prefix,
-            match_case: matcher.options.match_case,
-            whole_word: matcher.options.whole_word,
+            match_case: matcher.options().match_case,
+            whole_word: matcher.options().whole_word,
             matched: 0,
             stream_abs: 0,
             recent_bytes: VecDeque::with_capacity(
-                matcher.query.len().saturating_add(MAX_UTF8_CHAR_BYTES),
+                matcher.query().len().saturating_add(MAX_UTF8_CHAR_BYTES),
             ),
             pending_whole_word_start: None,
             pending_whole_word_after: Vec::with_capacity(MAX_UTF8_CHAR_BYTES),
@@ -1173,7 +957,7 @@ fn collect_file_diff_line_text_stream_match_visible_rows(
     matcher: &DiffSearchMatcher,
     out: &mut Vec<usize>,
 ) {
-    if matcher.options.regex {
+    if matcher.options().regex {
         collect_file_diff_line_text_regex_stream_match_visible_rows(rows, matcher, out);
     } else {
         collect_file_diff_line_text_literal_stream_match_visible_rows(rows, matcher, out);
@@ -1335,7 +1119,7 @@ pub(in crate::view) fn file_editor_search_ranges(
     let mut line_matches: Vec<Range<usize>> = Vec::new();
     for row in 0..snapshot.line_count() {
         let remaining = max_matches - found.len();
-        if remaining == 0 {
+        if remaining == 0 || matcher.is_cancelled() {
             break;
         }
         let line_range = snapshot.line_range(row);
@@ -1361,7 +1145,9 @@ impl MainPaneView {
             return None;
         }
         let repo = self.active_repo()?;
-        let DiffTarget::WorkingTree { path, area } = repo.diff_state.diff_target.as_ref()? else {
+        let DiffTarget::WorkingTree { path, area, .. } =
+            self.bound_diff_state(repo).diff_target.as_ref()?
+        else {
             return None;
         };
         if *area != DiffArea::Unstaged {
@@ -1384,6 +1170,18 @@ impl MainPaneView {
 
     pub(in crate::view) fn diff_search_has_query(&self) -> bool {
         self.diff_search_active && !self.diff_search_query.as_ref().is_empty()
+    }
+
+    /// The matcher for the active query, built once per (query, options) and
+    /// shared with every row processor; the diff, split and patch-split
+    /// processors each built (and, in regex mode, compiled) one per frame.
+    pub(in crate::view) fn diff_search_query_matcher_shared(
+        &mut self,
+    ) -> Option<Arc<DiffSearchMatcher>> {
+        let query = self.diff_search_query_or_empty();
+        let options = self.diff_search_options_or_default();
+        self.sync_diff_text_query_overlay_cache(query.as_ref(), options);
+        self.diff_text_query_cache_matcher_shared.clone()
     }
 
     pub(super) fn diff_search_current_matcher(&mut self) -> DiffSearchMatcher {
@@ -1510,11 +1308,60 @@ impl MainPaneView {
     pub(in super::super::super) fn diff_search_cancel_pending_query_recompute(&mut self) {
         self.diff_search_debounce_seq = self.diff_search_debounce_seq.wrapping_add(1);
         self.diff_search_pending_previous_query = None;
+        if let Some(token) = &self.diff_search_cancellation {
+            token.cancel();
+        }
+        // Unchanged rows keep the document and its query cache; a stale one
+        // is dropped so it does not pin replaced buffers.
+        if self
+            .diff_search_document
+            .as_ref()
+            .is_some_and(|(key, _)| *key != self.diff_search_document_key())
+        {
+            self.diff_search_document = None;
+        }
+        self.diff_search_pending_navigation = 0;
+        self.diff_search_probe_render = 0;
     }
 
-    pub(super) fn diff_search_schedule_query_recompute(
+    pub(in crate::view) fn diff_search_schedule_query_recompute(
         &mut self,
         previous_query: SharedString,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.diff_search_pending_finalize = DiffSearchFinalizeMode::ScrollToFirst;
+        // The document is unchanged, so the previous matches stay valid rows
+        // and ranges. Keep them on screen until the worker publishes instead
+        // of blanking highlights and the counter on every keystroke.
+        self.diff_search_queue_recompute(previous_query, false, cx);
+    }
+
+    pub(super) fn diff_search_schedule_preserving_current(&mut self, cx: &mut gpui::Context<Self>) {
+        // While a result is pending, the displayed matches are either cleared
+        // by a previous edit or stale; keep the anchor that worker will use.
+        if !self.diff_search_result_pending() {
+            self.diff_search_pending_finalize = DiffSearchFinalizeMode::preserve_current(
+                self.diff_search_match_ix,
+                self.diff_search_current_match_visible_ix(),
+            );
+        }
+        // The edited text invalidates the editor's byte ranges: clear them.
+        self.diff_search_queue_recompute(self.diff_search_query.clone(), true, cx);
+    }
+
+    /// A worker result for the current query is still to come. A worker whose
+    /// sequence was superseded (e.g. by a synchronous recompute) publishes
+    /// nothing, so it must not hold back navigation.
+    pub(in crate::view) fn diff_search_result_pending(&self) -> bool {
+        self.diff_search_pending_previous_query.is_some()
+            || self.diff_search_worker_running
+                && self.diff_search_worker_seq == self.diff_search_debounce_seq
+    }
+
+    fn diff_search_queue_recompute(
+        &mut self,
+        previous_query: SharedString,
+        document_changed: bool,
         cx: &mut gpui::Context<Self>,
     ) {
         if !self.diff_search_active {
@@ -1527,35 +1374,19 @@ impl MainPaneView {
         if self.diff_search_pending_previous_query.is_none() {
             self.diff_search_pending_previous_query = Some(previous_query);
         }
+        self.diff_search_probe_action = crate::ui_probe::begin_action("diff_search");
+        self.diff_search_probe_render = 0;
         self.diff_search_debounce_seq = self.diff_search_debounce_seq.wrapping_add(1);
-        let seq = self.diff_search_debounce_seq;
-
-        cx.spawn(
-            async move |view: gpui::WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| {
-                cx.background_executor()
-                    .timer(Duration::from_millis(DIFF_SEARCH_QUERY_DEBOUNCE_MS))
-                    .await;
-                let _ = view.update(cx, |this, cx| {
-                    if this.diff_search_debounce_seq != seq {
-                        return;
-                    }
-                    if this.diff_search_flush_pending_query_recompute() {
-                        cx.notify();
-                    }
-                });
-            },
-        )
-        .detach();
-    }
-
-    pub(super) fn diff_search_flush_pending_query_recompute(&mut self) -> bool {
-        let Some(previous_query) = self.diff_search_pending_previous_query.take() else {
-            return false;
-        };
-
-        self.diff_search_debounce_seq = self.diff_search_debounce_seq.wrapping_add(1);
-        self.diff_search_recompute_matches_for_query_change(previous_query.as_ref());
-        true
+        self.diff_search_pending_navigation = 0;
+        if let Some(token) = &self.diff_search_cancellation {
+            token.cancel();
+        }
+        if document_changed {
+            self.diff_search_matches.clear();
+            self.diff_search_match_ix = None;
+            self.file_editor_search_clear();
+        }
+        self.diff_search_start_background(cx);
     }
 
     pub(super) fn diff_search_recompute_matches_for_current_view(&mut self) {
@@ -1674,15 +1505,11 @@ impl MainPaneView {
                     .is_some_and(|row| matcher.is_match(row.text.as_ref())),
                 _ => false,
             };
-            if !matches {
-                continue;
+            if matches {
+                self.conflict_resolver.markdown_preview.columns[column]
+                    .reveal
+                    .request(visible_ix);
             }
-            match column {
-                ThreeWayColumn::Base => &self.conflict_resolver_diff_scroll,
-                ThreeWayColumn::Ours => &self.conflict_preview_ours_scroll,
-                ThreeWayColumn::Theirs => &self.conflict_preview_theirs_scroll,
-            }
-            .scroll_to_item_strict(visible_ix, gpui::ScrollStrategy::Center);
         }
     }
 
@@ -1690,8 +1517,7 @@ impl MainPaneView {
     ///
     /// Scans the text the preview *shows*, not the markdown behind it: Ctrl+F
     /// for `bold` finds a bolded word and does not match the `**` that made it
-    /// bold. Wrapped lists report the first visual row of the matching source
-    /// row, which is the row the reveal scrolls to.
+    /// bold.
     fn markdown_preview_search_scan(
         &mut self,
         surface: MarkdownSearchSurface,
@@ -1699,15 +1525,14 @@ impl MainPaneView {
     ) {
         // Collected before assigning: the documents are borrowed out of `self`.
         let mut matches = Vec::new();
-        for (list, document) in self.markdown_search_documents(surface) {
-            let plan = list.and_then(|list| self.markdown_preview_wrap_plan(list));
+        for document in self.markdown_search_documents(surface) {
             matches.extend(
                 document
                     .rows
                     .iter()
                     .enumerate()
                     .filter(|(_, row)| matcher.is_match(row.text.as_ref()))
-                    .map(|(row_ix, _)| plan.map_or(row_ix, |plan| plan.visual_ix_for_row(row_ix))),
+                    .map(|(row_ix, _)| row_ix),
             );
         }
         matches.sort_unstable();
@@ -1917,6 +1742,8 @@ impl MainPaneView {
     }
 
     fn diff_search_scan_current_view_general(&mut self, matcher: &DiffSearchMatcher) {
+        let tab_width = self.display_tab_width;
+
         self.diff_search_matches.clear();
 
         if self.is_file_preview_active() {
@@ -2029,8 +1856,18 @@ impl MainPaneView {
                     let (left, right) = provider.split_row_texts(mapped_ix)?;
                     Some((
                         visible_ix,
-                        left.map(|left| Cow::Owned(expand_tabs_to_string(left.as_ref()))),
-                        right.map(|right| Cow::Owned(expand_tabs_to_string(right.as_ref()))),
+                        left.map(|left| {
+                            Cow::Owned(
+                                crate::view::tab_width::expand_tabs(tab_width, left.as_ref())
+                                    .into_owned(),
+                            )
+                        }),
+                        right.map(|right| {
+                            Cow::Owned(
+                                crate::view::tab_width::expand_tabs(tab_width, right.as_ref())
+                                    .into_owned(),
+                            )
+                        }),
                     ))
                 })
                 .collect();
@@ -2087,6 +1924,8 @@ impl MainPaneView {
         &mut self,
         query: AsciiCaseInsensitiveNeedle<'_>,
     ) -> bool {
+        let tab_width = self.display_tab_width;
+
         let diff = match self.rendered_patch_diff_loadable() {
             Some(Loadable::Ready(diff)) => Arc::clone(diff),
             _ => return false,
@@ -2100,6 +1939,7 @@ impl MainPaneView {
 
         if !diff_search_inline_patch_query_uses_trigram_index(query) {
             collect_inline_patch_diff_visible_matches_with_needle(
+                tab_width,
                 diff.as_ref(),
                 diff_click_kinds,
                 diff_header_display_cache,
@@ -2117,6 +1957,7 @@ impl MainPaneView {
             if let Some(map) = self.diff_visible_inline_map.as_ref() {
                 map.for_each_visible_src_ix(|visible_ix, src_ix| {
                     if let Some(text) = inline_patch_diff_search_text(
+                        tab_width,
                         diff.as_ref(),
                         &self.diff_click_kinds,
                         &self.diff_header_display_cache,
@@ -2128,6 +1969,7 @@ impl MainPaneView {
             } else {
                 for (visible_ix, &src_ix) in self.diff_visible_indices.iter().enumerate() {
                     if let Some(text) = inline_patch_diff_search_text(
+                        tab_width,
                         diff.as_ref(),
                         &self.diff_click_kinds,
                         &self.diff_header_display_cache,
@@ -2149,6 +1991,7 @@ impl MainPaneView {
             DiffSearchVisibleCandidates::None => {}
             DiffSearchVisibleCandidates::All => {
                 collect_inline_patch_diff_visible_matches_with_needle(
+                    tab_width,
                     diff.as_ref(),
                     diff_click_kinds,
                     diff_header_display_cache,
@@ -2162,6 +2005,7 @@ impl MainPaneView {
                 for &visible_ix in candidate_visible_rows {
                     let visible_ix = visible_ix as usize;
                     if inline_patch_diff_visible_ix_matches_query(
+                        tab_width,
                         diff.as_ref(),
                         diff_click_kinds,
                         diff_header_display_cache,
@@ -2180,6 +2024,8 @@ impl MainPaneView {
     }
 
     fn diff_search_scan_inline_patch_diff_general(&mut self, matcher: &DiffSearchMatcher) -> bool {
+        let tab_width = self.display_tab_width;
+
         let diff = match self.rendered_patch_diff_loadable() {
             Some(Loadable::Ready(diff)) => Arc::clone(diff),
             _ => return false,
@@ -2189,6 +2035,7 @@ impl MainPaneView {
             let mut rows = Vec::new();
             map.for_each_visible_src_ix(|visible_ix, src_ix| {
                 if let Some(text) = inline_patch_diff_search_text(
+                    tab_width,
                     diff.as_ref(),
                     &self.diff_click_kinds,
                     &self.diff_header_display_cache,
@@ -2206,6 +2053,7 @@ impl MainPaneView {
                 .enumerate()
                 .filter_map(|(visible_ix, src_ix)| {
                     inline_patch_diff_search_text(
+                        tab_width,
                         diff.as_ref(),
                         &self.diff_click_kinds,
                         &self.diff_header_display_cache,
@@ -2228,6 +2076,8 @@ impl MainPaneView {
         visible_ix: usize,
         expanded_tabs: &mut String,
     ) -> bool {
+        let tab_width = self.display_tab_width;
+
         if !self.is_file_diff_view_active() || self.diff_view != DiffViewMode::Split {
             return false;
         }
@@ -2246,6 +2096,7 @@ impl MainPaneView {
             return false;
         };
         diff_search_split_row_texts_match_query(
+            tab_width,
             query,
             left.as_ref().map(|text| text.as_ref()),
             right.as_ref().map(|text| text.as_ref()),
@@ -2294,6 +2145,8 @@ impl MainPaneView {
         query: AsciiCaseInsensitiveNeedle<'_>,
         previous_matches: &mut Vec<usize>,
     ) -> bool {
+        let tab_width = self.display_tab_width;
+
         if self.is_file_editor_active()
             || self.is_file_preview_active()
             || self.active_conflict_target().is_some()
@@ -2324,6 +2177,7 @@ impl MainPaneView {
             index.candidates(query.as_bytes()),
             |visible_ix| {
                 inline_patch_diff_visible_ix_matches_query(
+                    tab_width,
                     diff.as_ref(),
                     diff_click_kinds,
                     diff_header_display_cache,
@@ -2478,7 +2332,12 @@ impl MainPaneView {
             return;
         }
 
-        self.diff_search_flush_pending_query_recompute();
+        if self.diff_search_result_pending() {
+            self.diff_search_pending_navigation =
+                self.diff_search_pending_navigation.saturating_sub(1);
+            return;
+        }
+
         if self.diff_search_matches.is_empty() {
             self.diff_search_recompute_matches();
         }
@@ -2502,7 +2361,12 @@ impl MainPaneView {
             return;
         }
 
-        self.diff_search_flush_pending_query_recompute();
+        if self.diff_search_result_pending() {
+            self.diff_search_pending_navigation =
+                self.diff_search_pending_navigation.saturating_add(1);
+            return;
+        }
+
         if self.diff_search_matches.is_empty() {
             self.diff_search_recompute_matches();
         }
@@ -2539,19 +2403,12 @@ impl MainPaneView {
                 None => {}
                 // No fixed row height and no `scroll_to_item` to hand this to,
                 // so the renderer measures the row and scrolls during prepaint.
-                Some(MarkdownSearchSurface::Worktree) => {
-                    self.markdown_preview_reveal.request(visible_ix)
-                }
-                Some(MarkdownSearchSurface::DiffInline) => self
-                    .diff_scroll
-                    .scroll_to_item_strict(visible_ix, gpui::ScrollStrategy::Center),
-                // Both sides share one visual row space, so one index moves both.
-                Some(MarkdownSearchSurface::DiffSplit) => {
-                    self.diff_scroll
-                        .scroll_to_item_strict(visible_ix, gpui::ScrollStrategy::Center);
-                    self.diff_split_right_scroll
-                        .scroll_to_item_strict(visible_ix, gpui::ScrollStrategy::Center);
-                }
+                // Both split sides share one row space and one scroller.
+                Some(
+                    MarkdownSearchSurface::Worktree
+                    | MarkdownSearchSurface::DiffInline
+                    | MarkdownSearchSurface::DiffSplit,
+                ) => self.markdown_interaction.reveal.request(visible_ix),
                 Some(MarkdownSearchSurface::Conflict) => {
                     self.conflict_markdown_preview_reveal(visible_ix)
                 }
@@ -2815,19 +2672,21 @@ fn conflict_resolver_visible_match_indices_with_matcher(
                 split_row_index,
                 two_way_split_projection,
             } = ctx.two_way_rows;
-            let rows = (0..two_way_split_projection.visible_len()).filter_map(|visible_ix| {
-                let (source_row, _conflict_ix) = two_way_split_projection.get(visible_ix)?;
-                let row = split_row_index.row_at(ctx.marker_segments, source_row)?;
-                Some((
-                    visible_ix,
-                    row.old
-                        .as_ref()
-                        .map(|text| Cow::Owned(text.as_ref().to_string())),
-                    row.new
-                        .as_ref()
-                        .map(|text| Cow::Owned(text.as_ref().to_string())),
-                ))
-            });
+            let rows = (0..two_way_split_projection.visible_len())
+                .take_while(|_| !matcher.is_cancelled())
+                .filter_map(|visible_ix| {
+                    let (source_row, _conflict_ix) = two_way_split_projection.get(visible_ix)?;
+                    let row = split_row_index.row_at(ctx.marker_segments, source_row)?;
+                    Some((
+                        visible_ix,
+                        row.old
+                            .as_ref()
+                            .map(|text| Cow::Owned(text.as_ref().to_string())),
+                        row.new
+                            .as_ref()
+                            .map(|text| Cow::Owned(text.as_ref().to_string())),
+                    ))
+                });
             collect_split_stream_match_visible_rows(rows, matcher, &mut out);
         }
     }
@@ -2945,14 +2804,18 @@ fn search_three_way_via_spans_with_matcher(
     let mut theirs_rows = Vec::new();
     let mut summary_rows = Vec::new();
 
-    for span in projection.spans() {
+    for span in projection
+        .spans()
+        .iter()
+        .take_while(|_| !matcher.is_cancelled())
+    {
         match *span {
             conflict_resolver::ThreeWayVisibleSpan::Lines {
                 visible_start,
                 source_line_start,
                 len,
             } => {
-                for i in 0..len {
+                for i in (0..len).take_while(|_| !matcher.is_cancelled()) {
                     let visible_ix = visible_start + i;
                     // section 30: rows are aligned; translate per side.
                     let row = source_line_start + i;
@@ -3347,84 +3210,6 @@ mod tests {
     }
 
     #[test]
-    fn diff_search_matcher_honors_case_sensitivity() {
-        let default_matcher = DiffSearchMatcher::new("render", DiffSearchOptions::default());
-        assert!(default_matcher.is_match("Render path"));
-
-        let case_sensitive = DiffSearchMatcher::new(
-            "render",
-            DiffSearchOptions {
-                match_case: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-        assert!(!case_sensitive.is_match("Render path"));
-        assert!(case_sensitive.is_match("render path"));
-    }
-
-    #[test]
-    fn diff_search_matcher_honors_whole_word_boundaries() {
-        let matcher = DiffSearchMatcher::new(
-            "render",
-            DiffSearchOptions {
-                whole_word: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-
-        assert!(matcher.is_match("render cache"));
-        assert!(!matcher.is_match("prerender cache"));
-        assert!(!matcher.is_match("render_cache"));
-    }
-
-    #[test]
-    fn diff_search_matcher_whole_word_uses_unicode_boundaries() {
-        let literal = DiffSearchMatcher::new(
-            "β",
-            DiffSearchOptions {
-                whole_word: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-        assert!(!literal.is_match("αβγ"));
-        assert!(literal.is_match("β value"));
-
-        let regex = DiffSearchMatcher::new(
-            "β",
-            DiffSearchOptions {
-                whole_word: true,
-                regex: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-        assert!(!regex.is_match("αβγ"));
-        assert!(regex.is_match("β value"));
-    }
-
-    #[test]
-    fn diff_search_matcher_handles_regex_and_invalid_regex() {
-        let regex = DiffSearchMatcher::new(
-            r"render\d+",
-            DiffSearchOptions {
-                regex: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-        assert!(regex.regex_error().is_none());
-        assert!(regex.is_match("RENDER42"));
-
-        let invalid = DiffSearchMatcher::new(
-            "(",
-            DiffSearchOptions {
-                regex: true,
-                ..DiffSearchOptions::default()
-            },
-        );
-        assert!(invalid.regex_error().is_some());
-        assert!(!invalid.is_match("("));
-    }
-
-    #[test]
     fn diff_search_matcher_regex_anchors_match_visible_rows() {
         let start_anchor = DiffSearchMatcher::new(
             r"^use",
@@ -3548,7 +3333,10 @@ mod tests {
         let payload_bytes = FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES * 128;
         let mut source = Vec::with_capacity(payload_bytes);
         source.extend_from_slice(b"needle ");
-        source.extend(std::iter::repeat(b'x').take(FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES));
+        source.extend(std::iter::repeat_n(
+            b'x',
+            FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES,
+        ));
         source.push(0xff);
         source.resize(payload_bytes, b'x');
         file.write_all(source.as_slice()).expect("write temp file");
@@ -3616,7 +3404,10 @@ mod tests {
         let payload_bytes = FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES * 128;
         let mut source = Vec::with_capacity(payload_bytes);
         source.extend_from_slice(b"Needle ");
-        source.extend(std::iter::repeat(b'x').take(FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES));
+        source.extend(std::iter::repeat_n(
+            b'x',
+            FILE_PREVIEW_SEARCH_SCAN_CHUNK_BYTES,
+        ));
         source.push(0xff);
         source.resize(payload_bytes, b'x');
         file.write_all(source.as_slice()).expect("write temp file");
@@ -3711,18 +3502,6 @@ mod tests {
         );
 
         assert!(matches.is_empty());
-    }
-
-    #[test]
-    fn diff_search_row_overlay_does_not_highlight_multiline_fragments() {
-        let matcher = DiffSearchMatcher::new("foo\nbar", DiffSearchOptions::default());
-        let mut ranges = Vec::new();
-
-        matcher.find_row_overlay_ranges_into("foo", &mut ranges, 64);
-        assert!(ranges.is_empty());
-
-        matcher.find_row_overlay_ranges_into("bar", &mut ranges, 64);
-        assert!(ranges.is_empty());
     }
 
     #[test]
@@ -3881,16 +3660,20 @@ mod tests {
 
     #[test]
     fn split_row_text_search_matches_rendered_tab_expansion() {
-        let query = AsciiCaseInsensitiveNeedle::new("a    b").expect("query");
+        let tab_width = 4;
+
+        let query = AsciiCaseInsensitiveNeedle::new("a   b").expect("query");
         let mut expanded_tabs = String::new();
 
         assert!(diff_search_split_row_texts_match_query(
+            tab_width,
             query,
             Some("a\tb"),
             None,
             &mut expanded_tabs,
         ));
         assert!(diff_search_split_row_texts_match_query(
+            tab_width,
             query,
             None,
             Some("a\tb"),

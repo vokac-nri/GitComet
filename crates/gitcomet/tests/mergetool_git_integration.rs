@@ -1,4 +1,8 @@
 use gitcomet_core::process::background_command as no_window_command;
+use gitcomet_core::test_support::git_fixture::{
+    FixtureTimer, LinearCommit, append_config, capture_tool_help, import_linear_history,
+    init_repository,
+};
 #[path = "support/gitcomet_bin.rs"]
 mod gitcomet_test_bin;
 #[path = "support/test_git_env.rs"]
@@ -8,8 +12,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-#[cfg(windows)]
-use std::sync::OnceLock;
 
 fn apply_isolated_git_config_env(cmd: &mut Command) {
     // Keep integration tests deterministic by ignoring host git config.
@@ -20,47 +22,6 @@ fn apply_isolated_git_config_env(cmd: &mut Command) {
     // Submodule scenarios in this suite clone from local file:// URLs.
     cmd.env("GIT_ALLOW_PROTOCOL", "file");
 }
-#[cfg(windows)]
-fn is_git_shell_startup_failure(text: &str) -> bool {
-    text.contains("sh.exe: *** fatal error -")
-        && (text.contains("couldn't create signal pipe") || text.contains("CreateFileMapping"))
-}
-
-#[cfg(windows)]
-fn git_shell_available_for_tooling() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let mut cmd = no_window_command("git");
-        apply_isolated_git_config_env(&mut cmd);
-        let output = match cmd.args(["mergetool", "--tool-help"]).output() {
-            Ok(output) => output,
-            Err(_) => return true,
-        };
-        if output.status.success() {
-            return true;
-        }
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        !is_git_shell_startup_failure(&text)
-    })
-}
-
-fn require_git_shell_for_tool_tests() -> bool {
-    #[cfg(windows)]
-    {
-        if !git_shell_available_for_tooling() {
-            eprintln!(
-                "skipping Git mergetool integration tests: Git-for-Windows shell startup failed in this environment"
-            );
-            return false;
-        }
-    }
-    true
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -82,6 +43,7 @@ fn is_effectively_absolute_path(value: &str) -> bool {
 }
 
 fn run_git(repo: &Path, args: &[&str]) {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
     let output = cmd
@@ -100,6 +62,7 @@ fn run_git(repo: &Path, args: &[&str]) {
 }
 
 fn run_git_capture(repo: &Path, args: &[&str]) -> Output {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
     cmd.arg("-C")
@@ -110,6 +73,7 @@ fn run_git_capture(repo: &Path, args: &[&str]) -> Output {
 }
 
 fn run_git_capture_with_env(repo: &Path, args: &[&str], env_vars: &[(&str, &str)]) -> Output {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
     cmd.arg("-C").arg(repo).args(args);
@@ -120,6 +84,7 @@ fn run_git_capture_with_env(repo: &Path, args: &[&str], env_vars: &[(&str, &str)
 }
 
 fn run_git_capture_in(cwd: &Path, args: &[&str]) -> Output {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
     cmd.current_dir(cwd)
@@ -141,6 +106,7 @@ fn run_git_expect_failure(repo: &Path, args: &[&str]) -> Output {
 }
 
 fn run_git_capture_with_display(repo: &Path, args: &[&str], display: Option<&str>) -> Output {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
     cmd.arg("-C").arg(repo).args(args);
@@ -153,8 +119,21 @@ fn run_git_capture_with_display(repo: &Path, args: &[&str], display: Option<&str
 }
 
 fn run_git_with_stdin(repo: &Path, args: &[&str], stdin_text: &str) -> Output {
+    run_git_with_stdin_and_env(repo, args, stdin_text, &[])
+}
+
+fn run_git_with_stdin_and_env(
+    repo: &Path,
+    args: &[&str],
+    stdin_text: &str,
+    env_vars: &[(&str, &str)],
+) -> Output {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = no_window_command("git");
     apply_isolated_git_config_env(&mut cmd);
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
     cmd.arg("-C")
         .arg(repo)
         .args(args)
@@ -177,10 +156,17 @@ fn write_file(repo: &Path, rel: &str, contents: &str) {
 }
 
 fn init_repo(repo: &Path) {
-    run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    init_repository(repo, |repo| {
+        run_git(repo, &["init", "-b", "main"]);
+        append_config(
+            repo,
+            &[
+                ("user.email", "you@example.com"),
+                ("user.name", "You"),
+                ("commit.gpgsign", "false"),
+            ],
+        );
+    });
 }
 
 fn commit_all(repo: &Path, message: &str) {
@@ -198,15 +184,16 @@ fn configure_gitcomet_mergetool(repo: &Path) {
         "{bin_q} mergetool --base \"$BASE\" --local \"$LOCAL\" --remote \"$REMOTE\" --merged \"$MERGED\""
     );
 
-    run_git(repo, &["config", "merge.tool", "gitcomet"]);
-    run_git(repo, &["config", "mergetool.gitcomet.cmd", &cmd]);
-    run_git(
+    append_config(
         repo,
-        &["config", "mergetool.gitcomet.trustExitCode", "true"],
+        &[
+            ("merge.tool", "gitcomet"),
+            ("mergetool.gitcomet.cmd", &cmd),
+            ("mergetool.gitcomet.trustExitCode", "true"),
+            ("mergetool.prompt", "false"),
+            ("mergetool.keepBackup", "false"),
+        ],
     );
-    run_git(repo, &["config", "mergetool.prompt", "false"]);
-    // Disable backup file creation for cleaner assertions.
-    run_git(repo, &["config", "mergetool.keepBackup", "false"]);
 }
 
 fn configure_gitcomet_mergetool_with_alias_flags(repo: &Path) {
@@ -216,52 +203,56 @@ fn configure_gitcomet_mergetool_with_alias_flags(repo: &Path) {
         "{bin_q} mergetool -o \"$MERGED\" --base \"$BASE\" --local \"$LOCAL\" --remote \"$REMOTE\" --L1 \"BASE_ALIAS\" --L2 \"LOCAL_ALIAS\" --L3 \"REMOTE_ALIAS\""
     );
 
-    run_git(repo, &["config", "merge.tool", "gitcomet"]);
-    run_git(repo, &["config", "mergetool.gitcomet.cmd", &cmd]);
-    run_git(
+    append_config(
         repo,
-        &["config", "mergetool.gitcomet.trustExitCode", "true"],
+        &[
+            ("merge.tool", "gitcomet"),
+            ("mergetool.gitcomet.cmd", &cmd),
+            ("mergetool.gitcomet.trustExitCode", "true"),
+            ("mergetool.prompt", "false"),
+            ("mergetool.keepBackup", "false"),
+        ],
     );
-    run_git(repo, &["config", "mergetool.prompt", "false"]);
-    run_git(repo, &["config", "mergetool.keepBackup", "false"]);
 }
 
 fn configure_kdiff3_path_override_to_gitcomet(repo: &Path, trust_exit_code: bool) {
     let bin = gitcomet_bin();
     let bin_path = bin.to_string_lossy().to_string();
 
-    run_git(repo, &["config", "merge.tool", "kdiff3"]);
-    run_git(repo, &["config", "mergetool.kdiff3.path", &bin_path]);
-    run_git(
+    append_config(
         repo,
         &[
-            "config",
-            "mergetool.kdiff3.trustExitCode",
-            if trust_exit_code { "true" } else { "false" },
+            ("merge.tool", "kdiff3"),
+            ("mergetool.kdiff3.path", &bin_path),
+            (
+                "mergetool.kdiff3.trustExitCode",
+                if trust_exit_code { "true" } else { "false" },
+            ),
+            ("mergetool.prompt", "false"),
+            ("mergetool.keepBackup", "false"),
         ],
     );
-    run_git(repo, &["config", "mergetool.prompt", "false"]);
-    run_git(repo, &["config", "mergetool.keepBackup", "false"]);
 }
 
 fn configure_meld_path_override_to_gitcomet(repo: &Path, trust_exit_code: bool) {
     let bin = gitcomet_bin();
     let bin_path = bin.to_string_lossy().to_string();
 
-    run_git(repo, &["config", "merge.tool", "meld"]);
-    run_git(repo, &["config", "mergetool.meld.path", &bin_path]);
-    run_git(repo, &["config", "mergetool.meld.hasOutput", "true"]);
-    run_git(repo, &["config", "mergetool.meld.useAutoMerge", "true"]);
-    run_git(
+    append_config(
         repo,
         &[
-            "config",
-            "mergetool.meld.trustExitCode",
-            if trust_exit_code { "true" } else { "false" },
+            ("merge.tool", "meld"),
+            ("mergetool.meld.path", &bin_path),
+            ("mergetool.meld.hasOutput", "true"),
+            ("mergetool.meld.useAutoMerge", "true"),
+            (
+                "mergetool.meld.trustExitCode",
+                if trust_exit_code { "true" } else { "false" },
+            ),
+            ("mergetool.prompt", "false"),
+            ("mergetool.keepBackup", "false"),
         ],
     );
-    run_git(repo, &["config", "mergetool.prompt", "false"]);
-    run_git(repo, &["config", "mergetool.keepBackup", "false"]);
 }
 
 /// Create a mergetool command that echoes a marker to stderr and resolves
@@ -479,15 +470,9 @@ fn setup_overlapping_conflict(repo: &Path) {
 /// Create a repo with a genuine merge conflict (overlapping changes) at a
 /// caller-provided path.
 fn setup_overlapping_conflict_at_path(repo: &Path, path: &str) {
+    let _timer = FixtureTimer::new("setup", "overlapping-conflict");
     init_repo(repo);
-    write_file(repo, path, "aaa\nbbb\nccc\n");
-    commit_all(repo, "base");
-
-    run_git(repo, &["checkout", "-b", "feature"]);
-    write_file(repo, path, "aaa\nREMOTE\nccc\n");
-    commit_all(repo, "feature: change line 2");
-
-    run_git(repo, &["checkout", "main"]);
+    import_conflict_base_and_theirs(repo, path, "aaa\nREMOTE\nccc\n", "feature: change line 2");
     write_file(repo, path, "aaa\nLOCAL\nccc\n");
     commit_all(repo, "main: change line 2");
 
@@ -507,16 +492,15 @@ fn setup_whitespace_only_conflict(repo: &Path) {
 
 /// Create a whitespace-only overlapping conflict at a caller-provided path.
 fn setup_whitespace_only_conflict_at_path(repo: &Path, path: &str) {
+    let _timer = FixtureTimer::new("setup", "whitespace-conflict");
     init_repo(repo);
-    write_file(repo, path, "aaa\nbbb\nccc\n");
-    commit_all(repo, "base");
-
-    run_git(repo, &["checkout", "-b", "feature"]);
     // Remote adds trailing tab to line 2.
-    write_file(repo, path, "aaa\nbbb\t\nccc\n");
-    commit_all(repo, "feature: add tab to line 2");
-
-    run_git(repo, &["checkout", "main"]);
+    import_conflict_base_and_theirs(
+        repo,
+        path,
+        "aaa\nbbb\t\nccc\n",
+        "feature: add tab to line 2",
+    );
     // Local adds trailing spaces to line 2.
     write_file(repo, path, "aaa\nbbb  \nccc\n");
     commit_all(repo, "main: add spaces to line 2");
@@ -528,13 +512,37 @@ fn setup_whitespace_only_conflict_at_path(repo: &Path, path: &str) {
     );
 }
 
+fn import_conflict_base_and_theirs(repo: &Path, path: &str, theirs: &str, message: &str) {
+    let mut command = no_window_command("git");
+    apply_isolated_git_config_env(&mut command);
+    command.arg("-C").arg(repo);
+    import_linear_history(
+        &mut command,
+        "feature",
+        [
+            LinearCommit {
+                author: "You <you@example.com>",
+                timestamp: 1_600_000_000,
+                message: "base",
+                path,
+                contents: "aaa\nbbb\nccc\n",
+            },
+            LinearCommit {
+                author: "You <you@example.com>",
+                timestamp: 1_600_000_001,
+                message,
+                path,
+                contents: theirs,
+            },
+        ],
+    );
+    run_git(repo, &["checkout", "-B", "main", "feature^"]);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────
 
 #[test]
 fn git_mergetool_resolves_overlapping_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -561,9 +569,6 @@ fn git_mergetool_resolves_overlapping_conflict() {
 
 #[test]
 fn git_mergetool_custom_cmd_copies_remote_to_merged() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -597,9 +602,6 @@ fn git_mergetool_custom_cmd_copies_remote_to_merged() {
 
 #[test]
 fn git_mergetool_accepts_kdiff3_alias_flags_in_cmd() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -629,9 +631,6 @@ fn git_mergetool_accepts_kdiff3_alias_flags_in_cmd() {
 
 #[test]
 fn git_mergetool_kdiff3_path_override_invokes_compat_mode() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -668,9 +667,6 @@ fn git_mergetool_kdiff3_path_override_invokes_compat_mode() {
 
 #[test]
 fn git_mergetool_kdiff3_path_override_records_real_argv_shape() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -728,9 +724,6 @@ fn git_mergetool_kdiff3_path_override_records_real_argv_shape() {
 
 #[test]
 fn git_mergetool_meld_path_override_invokes_compat_mode() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -764,9 +757,6 @@ fn git_mergetool_meld_path_override_invokes_compat_mode() {
 
 #[test]
 fn git_mergetool_kdiff3_path_override_handles_spaced_unicode_path() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -806,9 +796,6 @@ fn git_mergetool_kdiff3_path_override_handles_spaced_unicode_path() {
 
 #[test]
 fn git_mergetool_meld_path_override_handles_spaced_unicode_path() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -845,9 +832,6 @@ fn git_mergetool_meld_path_override_handles_spaced_unicode_path() {
 
 #[test]
 fn git_mergetool_with_trust_exit_code_marks_clean_merge_resolved() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Our mergetool with --auto resolves whitespace-only conflicts cleanly
     // (exit 0). With trustExitCode=true, git accepts the result and removes
     // the file from the unmerged index.
@@ -904,9 +888,6 @@ fn git_mergetool_with_trust_exit_code_marks_clean_merge_resolved() {
 
 #[test]
 fn git_mergetool_handles_path_with_spaces() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -945,9 +926,6 @@ fn git_mergetool_handles_path_with_spaces() {
 
 #[test]
 fn git_mergetool_handles_unicode_path() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -986,9 +964,6 @@ fn git_mergetool_handles_unicode_path() {
 
 #[test]
 fn git_mergetool_works_from_subdirectory() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1028,9 +1003,6 @@ fn git_mergetool_works_from_subdirectory() {
 
 #[test]
 fn git_mergetool_handles_add_add_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1068,9 +1040,6 @@ fn git_mergetool_handles_add_add_conflict() {
 
 #[test]
 fn git_mergetool_add_add_provides_empty_base_stage_file() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Portability parity with git t7610 "no-base file":
     // for add/add conflicts, the tool should still receive a BASE stage path
     // and report it as an empty stage file (size 0).
@@ -1140,9 +1109,6 @@ fn git_mergetool_add_add_provides_empty_base_stage_file() {
 
 #[test]
 fn git_mergetool_trust_exit_code_conflict_preserves_unmerged_state() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When our tool exits 1 (unresolved conflict) with trustExitCode=true,
     // git should leave the file as unmerged. This verifies the exit code
     // contract between gitcomet and git mergetool.
@@ -1189,23 +1155,37 @@ fn git_mergetool_trust_exit_code_conflict_preserves_unmerged_state() {
 
 #[test]
 fn git_mergetool_no_trust_exit_code_unchanged_output_stays_unresolved() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
     setup_overlapping_conflict(repo);
     configure_mergetool_selection(repo, "fake", None, None);
-    configure_mergetool_command(repo, "fake", "exit 0");
+    configure_mergetool_command(repo, "fake", "echo TOOL=fake >&2; :");
     configure_mergetool_trust_exit_code(repo, "fake", false);
 
-    let output = run_git_capture(repo, &["mergetool", "--no-prompt", "--tool", "fake"]);
+    let original = fs::read(repo.join("file.txt")).unwrap();
+    // --no-prompt suppresses the launch prompt, but Git still asks whether an
+    // unchanged merge succeeded. Supply a real pipe with an explicit refusal
+    // instead of relying on the Windows shell's handling of a null stdin.
+    let output = run_git_with_stdin_and_env(
+        repo,
+        &["mergetool", "--no-prompt", "--tool", "fake"],
+        "n\n",
+        &[("GIT_TRACE", "1"), ("GIT_TRACE2", "1")],
+    );
     let text = output_text(&output);
 
     assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == "TOOL=fake"),
+        "git mergetool stopped before the fake tool ran (status: {})\n{text}",
+        output.status
+    );
+    assert!(
         !output.status.success(),
-        "expected git mergetool to fail when trustExitCode=false and output is unchanged\n{text}"
+        "expected git mergetool to fail when trustExitCode=false and output is unchanged (status: {})\n{text}",
+        output.status
     );
     assert!(
         text.contains("seems unchanged"),
@@ -1214,6 +1194,11 @@ fn git_mergetool_no_trust_exit_code_unchanged_output_stays_unresolved() {
     assert!(
         text.contains("Was the merge successful"),
         "expected no-trust follow-up prompt in git output\n{text}"
+    );
+    assert_eq!(
+        fs::read(repo.join("file.txt")).unwrap(),
+        original,
+        "expected the unresolved merge contents to be preserved\n{text}"
     );
 
     let merged = fs::read_to_string(repo.join("file.txt")).unwrap();
@@ -1232,9 +1217,6 @@ fn git_mergetool_no_trust_exit_code_unchanged_output_stays_unresolved() {
 
 #[test]
 fn git_mergetool_no_trust_exit_code_changed_output_resolves_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1254,16 +1236,27 @@ fn git_mergetool_no_trust_exit_code_changed_output_resolves_conflict() {
     );
     configure_mergetool_trust_exit_code(repo, "fake", false);
 
-    let output = run_git_capture(repo, &["mergetool", "--no-prompt", "--tool", "fake"]);
+    // Capture Git's setup commands as well as the tool output: an early shell
+    // failure can otherwise report only "Merging: file.txt", hiding whether
+    // the tool ran at all. Successful tests keep this trace captured.
+    let output = run_git_capture_with_env(
+        repo,
+        &["mergetool", "--no-prompt", "--tool", "fake"],
+        &[("GIT_TRACE", "1"), ("GIT_TRACE2", "1")],
+    );
     let text = output_text(&output);
 
     assert!(
-        output.status.success(),
-        "expected git mergetool to accept changed output when trustExitCode=false\n{text}"
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .any(|line| line == "TOOL=fake"),
+        "git mergetool stopped before the fake tool ran (status: {})\n{text}",
+        output.status
     );
     assert!(
-        text.contains("TOOL=fake"),
-        "expected fake tool marker in output\n{text}"
+        output.status.success(),
+        "expected git mergetool to accept changed output when trustExitCode=false (status: {})\n{text}",
+        output.status
     );
     assert!(
         !text.contains("Was the merge successful"),
@@ -1283,9 +1276,6 @@ fn git_mergetool_no_trust_exit_code_changed_output_resolves_conflict() {
 
 #[test]
 fn git_mergetool_trust_exit_code_deleted_output_resolves_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // External tools can resolve by deleting MERGED (e.g. remove file outcome).
     // With trustExitCode=true, git should accept exit-code success, clear the
     // conflict, and stage file deletion.
@@ -1329,9 +1319,6 @@ fn git_mergetool_trust_exit_code_deleted_output_resolves_conflict() {
 
 #[test]
 fn git_mergetool_no_trust_exit_code_deleted_output_prompts_and_stays_unresolved() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // With trustExitCode=false, upstream git does not treat deleted MERGED as
     // a changed-resolution signal in this flow: it restores backup content,
     // prompts, and leaves the conflict unresolved.
@@ -1384,9 +1371,6 @@ fn git_mergetool_no_trust_exit_code_deleted_output_prompts_and_stays_unresolved(
 
 #[test]
 fn git_mergetool_multiple_conflicted_files() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1431,9 +1415,6 @@ fn git_mergetool_multiple_conflicted_files() {
 
 #[test]
 fn git_mergetool_pathspec_resolves_only_selected_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1499,9 +1480,6 @@ fn git_mergetool_pathspec_resolves_only_selected_conflict() {
 
 #[test]
 fn git_mergetool_crlf_content_preserved() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1543,9 +1521,6 @@ fn git_mergetool_crlf_content_preserved() {
 
 #[test]
 fn git_mergetool_write_to_temp_true_uses_absolute_stage_paths() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1580,9 +1555,6 @@ fn git_mergetool_write_to_temp_true_uses_absolute_stage_paths() {
 
 #[test]
 fn git_mergetool_write_to_temp_false_uses_workdir_prefixed_stage_paths() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1615,9 +1587,6 @@ fn git_mergetool_write_to_temp_false_uses_workdir_prefixed_stage_paths() {
 
 #[test]
 fn git_mergetool_honors_diff_order_file_configuration() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1638,9 +1607,6 @@ fn git_mergetool_honors_diff_order_file_configuration() {
 
 #[test]
 fn git_mergetool_o_flag_overrides_diff_order_file() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1676,16 +1642,15 @@ fn git_mergetool_o_flag_overrides_diff_order_file() {
 
 #[test]
 fn git_mergetool_tool_help_lists_gitcomet_tool() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
     init_repo(repo);
     configure_gitcomet_mergetool(repo);
 
-    let output = run_git_capture(repo, &["mergetool", "--tool-help"]);
+    let mut command = no_window_command("git");
+    apply_isolated_git_config_env(&mut command);
+    let output = capture_tool_help(command.arg("-C").arg(repo), "mergetool");
     let text = output_text(&output);
     assert!(
         output.status.success(),
@@ -1701,9 +1666,6 @@ fn git_mergetool_tool_help_lists_gitcomet_tool() {
 
 #[test]
 fn git_mergetool_gui_default_auto_prefers_gui_tool_when_display_set() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1740,9 +1702,6 @@ fn git_mergetool_gui_default_auto_prefers_gui_tool_when_display_set() {
 
 #[test]
 fn git_mergetool_gui_default_auto_prefers_cli_tool_without_display() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1778,9 +1737,6 @@ fn git_mergetool_gui_default_auto_prefers_cli_tool_without_display() {
 
 #[test]
 fn git_mergetool_gui_default_true_prefers_gui_tool_without_display() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1803,9 +1759,6 @@ fn git_mergetool_gui_default_true_prefers_gui_tool_without_display() {
 
 #[test]
 fn git_mergetool_gui_default_false_prefers_cli_tool_with_display() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1828,9 +1781,6 @@ fn git_mergetool_gui_default_false_prefers_cli_tool_with_display() {
 
 #[test]
 fn git_mergetool_gui_flag_overrides_selection() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1866,9 +1816,6 @@ fn git_mergetool_gui_flag_overrides_selection() {
 
 #[test]
 fn git_mergetool_no_gui_flag_overrides_gui_default_true() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -1905,9 +1852,6 @@ fn git_mergetool_no_gui_flag_overrides_gui_default_true() {
 
 #[test]
 fn git_mergetool_gui_fallback_when_no_guitool_configured() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When --gui is specified but no merge.guitool is configured,
     // git falls back to merge.tool.
     let tmp = tempfile::tempdir().unwrap();
@@ -1945,9 +1889,6 @@ fn git_mergetool_gui_fallback_when_no_guitool_configured() {
 
 #[test]
 fn git_mergetool_gui_default_true_fallback_when_no_guitool_configured() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Even with guiDefault=true, git mergetool should fall back to merge.tool
     // if no merge.guitool is configured.
     let tmp = tempfile::tempdir().unwrap();
@@ -1972,9 +1913,6 @@ fn git_mergetool_gui_default_true_fallback_when_no_guitool_configured() {
 
 #[test]
 fn git_mergetool_nonexistent_tool_reports_error() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
 
@@ -2025,9 +1963,6 @@ fn git_mergetool_nonexistent_tool_reports_error() {
 
 #[test]
 fn git_mergetool_absent_tool_reports_cmd_not_set_error() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Portability parity with git t7610: explicit --tool=<name> without a
     // configured mergetool.<name>.cmd should fail with actionable text.
     let tmp = tempfile::tempdir().unwrap();
@@ -2076,9 +2011,6 @@ fn git_mergetool_absent_tool_reports_cmd_not_set_error() {
 
 #[test]
 fn git_mergetool_delete_delete_conflict_handling() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When both branches delete the same file, git mergetool handles
     // this without invoking the external tool. The file just needs to
     // be staged as deleted.
@@ -2132,9 +2064,6 @@ fn git_mergetool_delete_delete_conflict_handling() {
 
 #[test]
 fn git_mergetool_delete_delete_choice_d_deletes_original_path() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Port of t7610 delete/delete "d" choice.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
@@ -2160,9 +2089,6 @@ fn git_mergetool_delete_delete_choice_d_deletes_original_path() {
 
 #[test]
 fn git_mergetool_delete_delete_choice_m_keeps_modified_destination() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Port of t7610 delete/delete "m" choice.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
@@ -2191,9 +2117,6 @@ fn git_mergetool_delete_delete_choice_m_keeps_modified_destination() {
 
 #[test]
 fn git_mergetool_delete_delete_choice_a_aborts_with_nonzero() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Port of t7610 delete/delete "a" (abort) behavior.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
@@ -2218,9 +2141,6 @@ fn git_mergetool_delete_delete_choice_a_aborts_with_nonzero() {
 
 #[test]
 fn git_mergetool_keep_backup_delete_delete_no_errors() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git t7610: "mergetool produces no errors when keepBackup is used"
     //
     // When both branches rename a file from the same path to different
@@ -2303,9 +2223,6 @@ fn git_mergetool_keep_backup_delete_delete_no_errors() {
 
 #[test]
 fn git_mergetool_keep_temporaries_delete_delete_abort_keeps_stage_files() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git t7610: "mergetool keeps tempfiles when aborting delete/delete"
     // for a path-targeted delete/delete conflict flow.
     let tmp = tempfile::tempdir().unwrap();
@@ -2365,9 +2282,6 @@ fn git_mergetool_keep_temporaries_delete_delete_abort_keeps_stage_files() {
 
 #[test]
 fn git_mergetool_modify_delete_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // One branch modifies a file, the other deletes it.
     // Git mergetool presents this as a special conflict type.
     let tmp = tempfile::tempdir().unwrap();
@@ -2416,9 +2330,6 @@ fn git_mergetool_modify_delete_conflict() {
 #[cfg(unix)]
 #[test]
 fn git_mergetool_symlink_conflict_resolved_via_local() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When both branches change a symlink's target, git mergetool handles
     // the symlink conflict internally with a l/r/a prompt (does NOT invoke
     // the external tool). Verify that answering "l" keeps the local target.
@@ -2469,9 +2380,6 @@ fn git_mergetool_symlink_conflict_resolved_via_local() {
 #[cfg(unix)]
 #[test]
 fn git_mergetool_symlink_conflict_resolved_via_remote() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Verify that answering "r" to a symlink conflict keeps the remote target.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path();
@@ -2516,9 +2424,6 @@ fn git_mergetool_symlink_conflict_resolved_via_remote() {
 #[cfg(unix)]
 #[test]
 fn git_mergetool_symlink_alongside_normal_file_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When both a symlink conflict and a normal file conflict exist,
     // git handles the symlink internally (l/r/a prompt) and invokes
     // our external tool for the normal file.
@@ -2765,9 +2670,6 @@ fn setup_modified_vs_deleted_submodule_conflict(repo: &Path, sub_repo: &Path) ->
 
 #[test]
 fn git_mergetool_submodule_conflict_resolved_via_local() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When both branches update a submodule to different commits,
     // git mergetool handles it internally with l/r/a prompt.
     // Answering "l" keeps the local submodule commit.
@@ -2858,9 +2760,6 @@ fn git_mergetool_submodule_conflict_resolved_via_local() {
 
 #[test]
 fn git_mergetool_submodule_conflict_resolved_via_remote() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Verify answering "r" keeps the remote submodule commit.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("main_repo");
@@ -2940,9 +2839,6 @@ fn git_mergetool_submodule_conflict_resolved_via_remote() {
 
 #[test]
 fn git_mergetool_submodule_conflict_choice_a_aborts_with_nonzero() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git submodule conflict prompt behavior: answering "a"
     // should abort the mergetool run and leave the submodule conflict unresolved.
     let tmp = tempfile::tempdir().unwrap();
@@ -3026,9 +2922,6 @@ fn git_mergetool_submodule_conflict_choice_a_aborts_with_nonzero() {
 
 #[test]
 fn git_mergetool_submodule_alongside_normal_file_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // When a repo has both a submodule conflict and a normal file conflict,
     // git handles the submodule internally and invokes our external tool
     // for the normal file conflict.
@@ -3120,9 +3013,6 @@ fn git_mergetool_submodule_alongside_normal_file_conflict() {
 
 #[test]
 fn git_mergetool_file_replaced_by_submodule_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // One branch keeps a regular file, the other replaces it with a submodule.
     // Git mergetool handles this as a file-vs-submodule conflict.
     let tmp = tempfile::tempdir().unwrap();
@@ -3179,9 +3069,6 @@ fn git_mergetool_file_replaced_by_submodule_conflict() {
 
 #[test]
 fn git_mergetool_submodule_in_subdirectory_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Submodule conflict where the submodule is inside a subdirectory.
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().join("main_repo");
@@ -3272,9 +3159,6 @@ fn git_mergetool_submodule_in_subdirectory_conflict() {
 
 #[test]
 fn git_mergetool_deleted_submodule_choice_r_keeps_modified_module() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git t7610 deleted-vs-modified submodule matrix:
     // when local side deleted and remote side modified, choosing "r"
     // should keep the modified submodule gitlink.
@@ -3309,9 +3193,6 @@ fn git_mergetool_deleted_submodule_choice_r_keeps_modified_module() {
 
 #[test]
 fn git_mergetool_deleted_submodule_choice_l_keeps_deletion() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git t7610 deleted-vs-modified submodule matrix:
     // when local side deleted and remote side modified, choosing "l"
     // should keep deletion.
@@ -3347,9 +3228,6 @@ fn git_mergetool_deleted_submodule_choice_l_keeps_deletion() {
 
 #[test]
 fn git_mergetool_deleted_submodule_remote_deleted_choice_r_keeps_deletion() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Reverse deleted-vs-modified orientation parity:
     // local side has modified submodule, remote side deleted it.
     // Choosing "r" should keep deletion (remote side).
@@ -3385,9 +3263,6 @@ fn git_mergetool_deleted_submodule_remote_deleted_choice_r_keeps_deletion() {
 
 #[test]
 fn git_mergetool_deleted_submodule_remote_deleted_choice_l_keeps_modified_module() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Reverse deleted-vs-modified orientation parity:
     // local side has modified submodule, remote side deleted it.
     // Choosing "l" should keep the modified submodule gitlink.
@@ -3422,9 +3297,6 @@ fn git_mergetool_deleted_submodule_remote_deleted_choice_l_keeps_modified_module
 
 #[test]
 fn git_mergetool_directory_vs_submodule_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     // Parity with git t7610: "directory vs modified submodule".
     // One branch replaces a submodule with a regular directory (containing files).
     // The other branch modifies the submodule.  Git handles this conflict with
@@ -3552,9 +3424,6 @@ fn setup_simple_overlapping_conflict(repo: &Path) {
 
 #[test]
 fn git_mergetool_respects_merge_conflictstyle_zdiff3_from_git_config() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);
@@ -3584,9 +3453,6 @@ fn git_mergetool_respects_merge_conflictstyle_zdiff3_from_git_config() {
 
 #[test]
 fn git_mergetool_respects_merge_conflictstyle_diff3_from_git_config() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);
@@ -3664,9 +3530,6 @@ fn gitcomet_mergetool_reads_conflictstyle_from_repo_when_cwd_is_outside_repo() {
 
 #[test]
 fn git_mergetool_kdiff3_path_override_respects_merge_conflictstyle_diff3_from_git_config() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);
@@ -3715,9 +3578,6 @@ fn git_mergetool_kdiff3_path_override_respects_merge_conflictstyle_diff3_from_gi
 
 #[test]
 fn git_mergetool_respects_diff_algorithm_histogram_from_git_config() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);
@@ -3765,9 +3625,6 @@ fn git_mergetool_respects_diff_algorithm_histogram_from_git_config() {
 
 #[test]
 fn git_mergetool_cli_flag_overrides_git_config() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);
@@ -3873,9 +3730,6 @@ fn setup_non_utf8_conflict(repo: &Path) {
 /// end-to-end through the actual `git mergetool` invocation.
 #[test]
 fn git_mergetool_binary_conflict_keeps_local_version() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     setup_binary_conflict(&repo);
@@ -3905,9 +3759,6 @@ fn git_mergetool_binary_conflict_keeps_local_version() {
 /// conflict handling without crashing and preserves raw invalid bytes.
 #[test]
 fn git_mergetool_non_utf8_conflict_keeps_local_version() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     setup_non_utf8_conflict(&repo);
@@ -3952,9 +3803,6 @@ fn git_mergetool_non_utf8_conflict_keeps_local_version() {
 /// the binary conflict is detected and handled separately.
 #[test]
 fn git_mergetool_binary_conflict_alongside_text_conflict() {
-    if !require_git_shell_for_tool_tests() {
-        return;
-    }
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     init_repo(&repo);

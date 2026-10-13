@@ -163,7 +163,7 @@ fn git_ops_log_walk_fixture_reports_commit_count_metrics() {
 
 #[test]
 fn git_ops_diff_rename_fixture_reports_rename_metrics() {
-    let fixture = GitOpsFixture::diff_rename_heavy(8);
+    let fixture = GitOpsFixture::diff_range_rename_heavy(8);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -183,7 +183,7 @@ fn git_ops_diff_rename_fixture_reports_rename_metrics() {
 
 #[test]
 fn git_ops_diff_binary_fixture_reports_binary_metrics() {
-    let fixture = GitOpsFixture::diff_binary_heavy(4, 1_024);
+    let fixture = GitOpsFixture::diff_range_binary_heavy(4, 1_024);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -203,7 +203,7 @@ fn git_ops_diff_binary_fixture_reports_binary_metrics() {
 
 #[test]
 fn git_ops_large_single_file_fixture_reports_line_count_metrics() {
-    let fixture = GitOpsFixture::diff_large_single_file(512, 32);
+    let fixture = GitOpsFixture::diff_range_large_single_file(512, 32);
     let hash_without_trace = fixture.run();
     let (hash_with_trace, metrics) = fixture.run_with_metrics();
 
@@ -768,6 +768,37 @@ fn branch_sidebar_fixture_scales_with_more_entries() {
     let large = BranchSidebarFixture::new(120, 600, 6, 40, 40, 80);
     assert!(small.row_count() > 0);
     assert!(large.row_count() > small.row_count());
+}
+
+/// The row hash is what a benchmark compares presentations with, so a status
+/// change must not be invisible to the measurement that exists to see it.
+#[test]
+fn branch_sidebar_row_hash_separates_submodule_rows_by_what_they_draw() {
+    use gitcomet_core::domain::{CommitId, SubmoduleStatus};
+
+    let row = |status, checked_out: Option<&str>| BranchSidebarRow::SubmoduleItem {
+        path: std::path::PathBuf::from("vendor/lib"),
+        status,
+        recorded_head: CommitId("aaaa".into()),
+        checked_out_head: checked_out.map(|id| CommitId(id.into())),
+    };
+    let base = hash_branch_sidebar_rows(&[row(SubmoduleStatus::UpToDate, Some("aaaa"))]);
+
+    assert_ne!(
+        base,
+        hash_branch_sidebar_rows(&[row(SubmoduleStatus::MergeConflict, Some("aaaa"))]),
+        "the status drives the badge, the icon colour and the tooltip"
+    );
+    assert_ne!(
+        base,
+        hash_branch_sidebar_rows(&[row(SubmoduleStatus::UpToDate, Some("bbbb"))]),
+        "the checked-out head drives the mismatch tooltip"
+    );
+    assert_ne!(
+        base,
+        hash_branch_sidebar_rows(&[row(SubmoduleStatus::UpToDate, None)]),
+        "and so does having no checked-out head at all"
+    );
 }
 
 #[test]
@@ -3176,6 +3207,21 @@ fn fs_event_single_file_save_is_deterministic() {
     let h1 = fixture.run();
     let h2 = fixture.run();
     assert_eq!(h1, h2);
+}
+
+/// The benchmark times `refresh_status` alone, so the untimed setup and
+/// restoration around it must leave every iteration the same work.
+#[test]
+fn fs_event_untimed_restore_returns_the_tree_to_its_clean_state() {
+    let fixture = FsEventFixture::git_checkout_batch(100, 30);
+    for _ in 0..2 {
+        let mutation = fixture.apply_mutation();
+        let (_, metrics) = fixture.refresh_status(&mutation);
+        assert_eq!(metrics.dirty_files_detected, 30);
+        fixture.restore(mutation);
+    }
+    let (_, after) = fixture.refresh_status(&FsEventMutation::default());
+    assert_eq!(after.dirty_files_detected, 0);
 }
 
 // ---------------------------------------------------------------------------

@@ -18,8 +18,8 @@ use gpui::{
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 fn assert_no_panic(label: &str, f: impl FnOnce()) {
@@ -94,7 +94,12 @@ fn builds_pure_components_without_panics() {
         });
 
         assert_no_panic("components::toast", || {
-            let _ = components::toast(theme, components::ToastKind::Success, "Hello");
+            let _ = components::toast(
+                theme,
+                ui_scale::DEFAULT_UI_SCALE_PERCENT,
+                components::ToastKind::Success,
+                "Hello",
+            );
         });
 
         assert_no_panic("components::Button render variants", || {
@@ -113,7 +118,7 @@ fn builds_pure_components_without_panics() {
                 .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
             let _ = components::Button::new("z5", "Create")
                 .style(components::ButtonStyle::Filled)
-                .separated_end_slot(div().text_xs().child("Enter"))
+                .separated_end_slot(div().text_size(theme.ui_text(12.0)).child("Enter"))
                 .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
         });
 
@@ -133,10 +138,8 @@ fn builds_pure_components_without_panics() {
             let tab = components::Tab::new(("t", 1u64))
                 .selected(true)
                 .child(div().child("Repo"))
-                .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
-            let _ = components::TabBar::new("tb")
-                .tab(tab)
-                .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
+                .render(theme);
+            let _ = components::TabBar::new("tb").tab(tab).render();
         });
 
         assert_no_panic("view::window_frame", || {
@@ -159,12 +162,8 @@ fn builds_pure_components_without_panics() {
             );
         });
 
-        assert_no_panic("window-frame uses shadow/rounding", || {
-            let _ = div()
-                .rounded(px(theme.radii.panel))
-                .shadow_lg()
-                .border_1()
-                .child("x");
+        assert_no_panic("window-frame uses rounding/border", || {
+            let _ = div().rounded(px(theme.radii.panel)).border_1().child("x");
         });
     }
 }
@@ -176,6 +175,7 @@ struct SmokeView {
 
 impl SmokeView {
     fn new(window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> Self {
+        window.activate();
         let input = cx.new(|cx| {
             components::TextInput::new(
                 components::TextInputOptions {
@@ -210,7 +210,7 @@ impl gpui::Render for SmokeView {
                             .debug_selector(|| "smoke_selected_tab_content".to_string())
                             .child("One"),
                     )
-                    .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT)
+                    .render(theme)
                     .debug_selector(|| "smoke_selected_tab".to_string()),
             )
             .tab(
@@ -221,10 +221,10 @@ impl gpui::Render for SmokeView {
                             .debug_selector(|| "smoke_idle_tab_content".to_string())
                             .child("Two"),
                     )
-                    .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT)
+                    .render(theme)
                     .debug_selector(|| "smoke_idle_tab".to_string()),
             )
-            .render(theme, ui_scale::DEFAULT_UI_SCALE_PERCENT);
+            .render();
 
         let content = div()
             .flex()
@@ -283,6 +283,7 @@ struct TextInputCursorScrollView {
 
 impl TextInputCursorScrollView {
     fn new(window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> Self {
+        window.activate();
         let scroll_handle = ScrollHandle::new();
         let input = cx.new({
             let scroll_handle = scroll_handle.clone();
@@ -349,6 +350,7 @@ impl gpui::Render for TextInputCursorScrollView {
 
 impl TextInputHostView {
     fn new(window: &mut gpui::Window, cx: &mut gpui::Context<Self>) -> Self {
+        window.activate();
         let input = cx.new(|cx| {
             components::TextInput::new(
                 components::TextInputOptions {
@@ -571,6 +573,109 @@ fn text_input_supports_basic_clipboard_and_word_shortcuts(cx: &mut gpui::TestApp
     cx.simulate_keystrokes("ctrl-left ctrl-delete");
     let text = cx.update(|_window, app| view.read(app).input.read(app).text().to_string());
     assert_eq!(text, "hello brave ");
+}
+
+#[gpui::test]
+fn text_input_cmd_backspace_and_cmd_delete_delete_to_the_line_edges(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = cx.add_window_view(SmokeView::new);
+    let set_text = |cx: &mut gpui::VisualTestContext, text: &'static str| {
+        cx.update(|window, app| {
+            let focus = view.update(app, |this, cx| this.input.read(cx).focus_handle());
+            window.focus(&focus, app);
+            view.update(app, |this, cx| {
+                this.input.update(cx, |input, cx| input.set_text(text, cx));
+            });
+        });
+    };
+    let text = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).input.read(app).text().to_string())
+    };
+
+    cx.update(|_window, app| {
+        app.bind_keys([
+            KeyBinding::new("alt-left", crate::kit::WordLeft, Some("TextInput")),
+            KeyBinding::new("cmd-left", crate::kit::Home, Some("TextInput")),
+            KeyBinding::new(
+                "cmd-backspace",
+                crate::kit::DeleteToLineStart,
+                Some("TextInput"),
+            ),
+            KeyBinding::new("cmd-delete", crate::kit::DeleteToLineEnd, Some("TextInput")),
+            KeyBinding::new(
+                "ctrl-shift-backspace",
+                crate::kit::DeleteToLineStart,
+                Some("TextInput"),
+            ),
+            KeyBinding::new(
+                "ctrl-shift-delete",
+                crate::kit::DeleteToLineEnd,
+                Some("TextInput"),
+            ),
+        ]);
+    });
+
+    // With the caret at the end, the usual case in a search box, the whole
+    // query goes.
+    set_text(cx, "hello brave world");
+    cx.simulate_keystrokes("cmd-backspace");
+    assert_eq!(text(cx), "");
+
+    // Mid-line, each deletes only its own side of the caret.
+    set_text(cx, "hello brave world");
+    cx.simulate_keystrokes("alt-left cmd-backspace");
+    assert_eq!(text(cx), "world");
+    set_text(cx, "hello brave world");
+    cx.simulate_keystrokes("alt-left cmd-delete");
+    assert_eq!(text(cx), "hello brave ");
+
+    // The Windows/Linux chords do the same.
+    set_text(cx, "hello brave world");
+    cx.simulate_keystrokes("alt-left ctrl-shift-backspace");
+    assert_eq!(text(cx), "world");
+    cx.simulate_keystrokes("ctrl-shift-delete");
+    assert_eq!(text(cx), "");
+
+    // With nothing on that side there is nothing to delete.
+    set_text(cx, "hello");
+    cx.simulate_keystrokes("cmd-left cmd-backspace");
+    assert_eq!(text(cx), "hello");
+    cx.simulate_keystrokes("cmd-delete");
+    assert_eq!(text(cx), "");
+}
+
+#[gpui::test]
+fn text_input_cmd_backspace_joins_lines_at_the_start_of_a_row(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = cx.add_window_view(TextInputCursorScrollView::new);
+    cx.update(|window, app| {
+        app.bind_keys([KeyBinding::new(
+            "cmd-backspace",
+            crate::kit::DeleteToLineStart,
+            Some("TextInput"),
+        )]);
+        let focus = view.update(app, |this, cx| this.input.read(cx).focus_handle());
+        window.focus(&focus, app);
+        view.update(app, |this, cx| {
+            this.input
+                .update(cx, |input, cx| input.set_text("first\nsecond", cx));
+        });
+        let _ = window.draw(app);
+    });
+    let text = |cx: &mut gpui::VisualTestContext| {
+        cx.update(|_window, app| view.read(app).input.read(app).text().to_string())
+    };
+
+    cx.simulate_keystrokes("cmd-backspace");
+    assert_eq!(
+        text(cx),
+        "first\n",
+        "deletes back to the start of its own row"
+    );
+    cx.simulate_keystrokes("cmd-backspace");
+    assert_eq!(
+        text(cx),
+        "first",
+        "at a row start, joins with the row above"
+    );
 }
 
 #[gpui::test]
@@ -891,6 +996,8 @@ fn text_input_context_menu_does_not_resize_input_container(cx: &mut gpui::TestAp
         click_count: 1,
     });
 
+    crate::test_support::refresh_and_draw(cx);
+
     let _ = cx
         .debug_bounds("text_input_context_select_all")
         .expect("expected text-input context menu to be open");
@@ -942,7 +1049,7 @@ fn text_input_context_menu_grows_wider_with_ui_zoom(cx: &mut gpui::TestAppContex
 
     cx.update(|window, app| {
         view.update(app, |_this, cx| {
-            crate::ui_scale::set_current(cx, 200);
+            crate::ui_scale::set_default(cx, 200);
         });
         crate::ui_scale::apply_to_window(window, 200);
         let _ = window.draw(app);
@@ -1206,11 +1313,55 @@ fn text_input_supports_shift_up_down_selection(cx: &mut gpui::TestAppContext) {
     assert_eq!(selection, Some("12345\n".into()));
 }
 
-struct SlowSubmoduleBackend;
+/// Hold backend operations until the test has observed their loading UI.
+/// The guard releases workers even if an assertion panics.
+#[derive(Default)]
+struct TestOperationGate {
+    state: Mutex<(bool, bool)>, // held, started
+    released: Condvar,
+}
 
-impl GitBackend for SlowSubmoduleBackend {
+struct PendingTestOperation(Arc<TestOperationGate>);
+
+impl TestOperationGate {
+    fn hold(self: &Arc<Self>) -> PendingTestOperation {
+        let mut state = self.state.lock().unwrap();
+        assert!(!state.0, "an operation is already pending");
+        *state = (true, false);
+        PendingTestOperation(self.clone())
+    }
+
+    fn wait(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.0 {
+            state.1 = true;
+            let _guard = self.released.wait_while(state, |state| state.0).unwrap();
+        }
+    }
+}
+
+impl PendingTestOperation {
+    fn has_started(&self) -> bool {
+        self.0.state.lock().unwrap().1
+    }
+}
+
+impl Drop for PendingTestOperation {
+    fn drop(&mut self) {
+        self.0.state.lock().unwrap().0 = false;
+        self.0.released.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct SubmoduleTestBackend {
+    gate: Arc<TestOperationGate>,
+}
+
+impl GitBackend for SubmoduleTestBackend {
     fn open(&self, workdir: &Path) -> Result<Arc<dyn GitRepository>> {
-        Ok(Arc::new(SlowSubmoduleRepo {
+        Ok(Arc::new(SubmoduleTestRepo {
+            gate: self.gate.clone(),
             spec: RepoSpec {
                 workdir: workdir.to_path_buf(),
             },
@@ -1218,24 +1369,29 @@ impl GitBackend for SlowSubmoduleBackend {
     }
 }
 
-struct SlowSubmoduleRepo {
+struct SubmoduleTestRepo {
     spec: RepoSpec,
+    gate: Arc<TestOperationGate>,
 }
 
-impl SlowSubmoduleRepo {
+impl SubmoduleTestRepo {
     fn unsupported<T>() -> Result<T> {
         Err(Error::new(ErrorKind::Unsupported(
-            "Slow submodule test repo does not implement this operation",
+            "Submodule test repo does not implement this operation",
         )))
     }
 }
 
-impl GitRepository for SlowSubmoduleRepo {
+impl GitRepository for SubmoduleTestRepo {
     fn spec(&self) -> &RepoSpec {
         &self.spec
     }
 
-    fn log_head_page(&self, _limit: usize, _cursor: Option<&LogCursor>) -> Result<LogPage> {
+    fn log_head_page(
+        &self,
+        _limit: usize,
+        _cursor: Option<&LogCursor>,
+    ) -> Result<std::sync::Arc<LogPage>> {
         Self::unsupported()
     }
 
@@ -1291,12 +1447,17 @@ impl GitRepository for SlowSubmoduleRepo {
         Self::unsupported()
     }
 
-    fn revert(&self, _id: &CommitId) -> Result<()> {
+    /// Keep removal in flight until the spinner test releases it.
+    fn remove_worktree_with_output(
+        &self,
+        _path: &Path,
+    ) -> Result<gitcomet_core::services::CommandOutput> {
+        self.gate.wait();
         Self::unsupported()
     }
 
     fn list_submodules(&self) -> Result<Vec<Submodule>> {
-        std::thread::sleep(Duration::from_millis(250));
+        self.gate.wait();
         Ok(Vec::new())
     }
 
@@ -1345,11 +1506,15 @@ impl GitRepository for SlowSubmoduleRepo {
     }
 }
 
-struct SlowStashBackend;
+#[derive(Default)]
+struct StashTestBackend {
+    gate: Arc<TestOperationGate>,
+}
 
-impl GitBackend for SlowStashBackend {
+impl GitBackend for StashTestBackend {
     fn open(&self, workdir: &Path) -> Result<Arc<dyn GitRepository>> {
-        Ok(Arc::new(SlowStashRepo {
+        Ok(Arc::new(StashTestRepo {
+            gate: self.gate.clone(),
             spec: RepoSpec {
                 workdir: workdir.to_path_buf(),
             },
@@ -1357,24 +1522,29 @@ impl GitBackend for SlowStashBackend {
     }
 }
 
-struct SlowStashRepo {
+struct StashTestRepo {
     spec: RepoSpec,
+    gate: Arc<TestOperationGate>,
 }
 
-impl SlowStashRepo {
+impl StashTestRepo {
     fn unsupported<T>() -> Result<T> {
         Err(Error::new(ErrorKind::Unsupported(
-            "Slow stash test repo does not implement this operation",
+            "Stash test repo does not implement this operation",
         )))
     }
 }
 
-impl GitRepository for SlowStashRepo {
+impl GitRepository for StashTestRepo {
     fn spec(&self) -> &RepoSpec {
         &self.spec
     }
 
-    fn log_head_page(&self, _limit: usize, _cursor: Option<&LogCursor>) -> Result<LogPage> {
+    fn log_head_page(
+        &self,
+        _limit: usize,
+        _cursor: Option<&LogCursor>,
+    ) -> Result<std::sync::Arc<LogPage>> {
         Self::unsupported()
     }
 
@@ -1430,16 +1600,12 @@ impl GitRepository for SlowStashRepo {
         Self::unsupported()
     }
 
-    fn revert(&self, _id: &CommitId) -> Result<()> {
-        Self::unsupported()
-    }
-
     fn stash_create(&self, _message: &str, _include_untracked: bool) -> Result<()> {
         Self::unsupported()
     }
 
     fn stash_list(&self) -> Result<Vec<StashEntry>> {
-        std::thread::sleep(Duration::from_millis(250));
+        self.gate.wait();
         Ok(Vec::new())
     }
 
@@ -1563,7 +1729,9 @@ fn wait_for_repo_open(store: &AppStore, repo_id: RepoId) {
     }
 }
 
-fn wait_for_initial_worktrees_load_to_settle(
+/// Hand-fed `BranchesLoaded`/`WorktreesLoaded` must land after the backend's own
+/// replies, which have no generation guard and would overwrite them.
+fn wait_for_sidebar_loads_to_settle(
     cx: &mut gpui::VisualTestContext,
     store: &AppStore,
     view: &gpui::Entity<crate::view::GitCometView>,
@@ -1573,21 +1741,26 @@ fn wait_for_initial_worktrees_load_to_settle(
     loop {
         sync_view_for_tests(cx, view);
 
-        let settled = store
-            .snapshot()
-            .repos
-            .iter()
-            .find(|repo| repo.id == repo_id)
-            .is_some_and(|repo| {
-                repo.sidebar_data_request.worktrees
-                    && !matches!(repo.worktrees, Loadable::Loading | Loadable::NotLoaded)
-            });
+        let state = store.snapshot();
+        let repo = state.repos.iter().find(|repo| repo.id == repo_id);
+        let settled = repo.is_some_and(|repo| {
+            repo.sidebar_data_request.worktrees
+                && !matches!(repo.worktrees, Loadable::Loading | Loadable::NotLoaded)
+                && !matches!(repo.branches, Loadable::Loading | Loadable::NotLoaded)
+        });
         if settled {
             return;
         }
 
         if Instant::now() >= deadline {
-            panic!("timed out waiting for initial worktrees load to settle");
+            panic!(
+                "timed out waiting for branch and worktree loads to settle: {:?}",
+                repo.map(|repo| (
+                    repo.sidebar_data_request.worktrees,
+                    &repo.branches,
+                    &repo.worktrees
+                ))
+            );
         }
 
         cx.run_until_parked();
@@ -1608,7 +1781,7 @@ fn wait_until(description: &str, ready: impl Fn() -> bool) {
     }
 }
 
-fn seed_workspace_repo(
+fn seed_worktree_repo(
     cx: &mut gpui::VisualTestContext,
     store: &AppStore,
     view: gpui::Entity<crate::view::GitCometView>,
@@ -1632,7 +1805,7 @@ fn seed_workspace_repo(
         }
 
         if Instant::now() >= deadline {
-            panic!("timed out waiting for the workspace view to leave the splash state");
+            panic!("timed out waiting for the window to leave the Home screen");
         }
 
         std::thread::sleep(Duration::from_millis(10));
@@ -1770,7 +1943,7 @@ fn restore_session_and_draw(
 #[gpui::test]
 fn gitcomet_view_renders_without_panicking(cx: &mut gpui::TestAppContext) {
     cx.update(|cx| {
-        let (store, events) = AppStore::new(Arc::new(TestBackend));
+        let (store, events) = AppStore::new_test(Arc::new(TestBackend));
         cx.open_window(Default::default(), |window, cx| {
             cx.new(|cx| crate::view::GitCometView::new(store, events, None, window, cx))
         })
@@ -1780,7 +1953,7 @@ fn gitcomet_view_renders_without_panicking(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn repo_tabs_can_drag_reorder_by_right_half(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -1826,7 +1999,7 @@ fn repo_tabs_can_drag_reorder_by_right_half(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn repo_tab_reorder_does_not_bounce_on_minor_pointer_reversal(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -1891,7 +2064,7 @@ fn repo_tab_reorder_does_not_bounce_on_minor_pointer_reversal(cx: &mut gpui::Tes
 
 #[gpui::test]
 fn repo_tabs_can_drag_reorder_by_left_half(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -1937,7 +2110,7 @@ fn repo_tabs_can_drag_reorder_by_left_half(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn repo_tabs_drop_on_self_is_noop(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -1979,7 +2152,7 @@ fn repo_tabs_drop_on_self_is_noop(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn repo_tabs_middle_click_closes_inactive_tab_without_reactivating(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2016,7 +2189,7 @@ fn repo_tabs_middle_click_closes_inactive_tab_without_reactivating(cx: &mut gpui
 
 #[gpui::test]
 fn repo_tabs_right_click_does_not_close(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2051,7 +2224,11 @@ fn repo_tabs_right_click_does_not_close(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn worktrees_section_shows_spinner_while_removing_worktree(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    // The removal must actually run: a repo the backend cannot open finishes
+    // its actions at once with a missing-handle error, spinner and all.
+    let backend = Arc::new(SubmoduleTestBackend::default());
+    let gate = backend.gate.clone();
+    let (store, events) = AppStore::new_test(backend);
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2064,7 +2241,9 @@ fn worktrees_section_shows_spinner_while_removing_worktree(cx: &mut gpui::TestAp
     let repo_ids =
         restore_session_and_draw(cx, &store_for_test, _view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
+    wait_for_repo_open(&store_for_test, repo_id);
 
+    let pending = gate.hold();
     store_for_test.dispatch(Msg::RemoveWorktree {
         repo_id,
         path: base.join("repo1").join("worktree_to_remove"),
@@ -2075,7 +2254,7 @@ fn worktrees_section_shows_spinner_while_removing_worktree(cx: &mut gpui::TestAp
     loop {
         sync_view_for_tests(cx, &_view);
 
-        if cx.debug_bounds(selector).is_some() {
+        if cx.debug_bounds(selector).is_some() && pending.has_started() {
             break;
         }
 
@@ -2090,12 +2269,17 @@ fn worktrees_section_shows_spinner_while_removing_worktree(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn submodules_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+    let backend = Arc::new(SubmoduleTestBackend::default());
+    let gate = backend.gate.clone();
+    let (store, events) = AppStore::new_test(backend);
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
     });
 
+    // Idle metadata prefetch can start as soon as the repository opens.
+    // Hold it before restoring the session so expansion cannot race completion.
+    let pending = gate.hold();
     let base = std::env::temp_dir().join(format!(
         "gitcomet_ui_test_submodules_spinner_{}",
         std::process::id()
@@ -2123,12 +2307,20 @@ fn submodules_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext)
                 repo.sidebar_data_request.submodules && matches!(repo.submodules, Loadable::Loading)
             });
 
-        if repo_requested && cx.debug_bounds(selector).is_some() {
+        if repo_requested && cx.debug_bounds(selector).is_some() && pending.has_started() {
             break;
         }
 
         if Instant::now() >= deadline {
-            panic!("timed out waiting for submodules spinner to render");
+            panic!(
+                "timed out waiting for submodules spinner to render: {:?}",
+                store_for_test
+                    .snapshot()
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == repo_id)
+                    .map(|repo| (&repo.sidebar_data_request, &repo.submodules))
+            );
         }
 
         cx.run_until_parked();
@@ -2138,7 +2330,11 @@ fn submodules_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext)
 
 #[gpui::test]
 fn stash_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowStashBackend));
+    let backend = Arc::new(StashTestBackend::default());
+    let gate = backend.gate.clone();
+    // The expanded sidebar requests stashes as soon as the repository opens.
+    let pending = gate.hold();
+    let (store, events) = AppStore::new_test(backend);
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2171,7 +2367,7 @@ fn stash_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext) {
                 repo.sidebar_data_request.stashes && matches!(repo.stashes, Loadable::Loading)
             });
 
-        if repo_requested && cx.debug_bounds(selector).is_some() {
+        if repo_requested && cx.debug_bounds(selector).is_some() && pending.has_started() {
             break;
         }
 
@@ -2185,8 +2381,8 @@ fn stash_section_shows_spinner_while_loading(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn listed_workspace_badge_double_click_opens_closed_repo_tab(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn listed_worktree_badge_double_click_opens_closed_repo_tab(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (_view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2200,7 +2396,7 @@ fn listed_workspace_badge_double_click_opens_closed_repo_tab(cx: &mut gpui::Test
         restore_session_and_draw(cx, &store_for_test, _view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &_view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &_view, repo_id);
 
     let linked_repo = base.join("repo-feature");
     store_for_test.dispatch(Msg::Internal(
@@ -2226,8 +2422,8 @@ fn listed_workspace_badge_double_click_opens_closed_repo_tab(cx: &mut gpui::Test
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &_view, "branch_workspace_badge", 64);
-    let badge_selector = debug_selector("branch_workspace_badge", badge_ix);
+    let badge_ix = wait_for_debug_index(cx, &_view, "branch_worktree_badge", 64);
+    let badge_selector = debug_selector("branch_worktree_badge", badge_ix);
     click_debug_selector(cx, badge_selector, 2);
 
     wait_until("linked repository tab to open from badge", || {
@@ -2247,7 +2443,7 @@ fn listed_workspace_badge_double_click_opens_closed_repo_tab(cx: &mut gpui::Test
 fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2261,7 +2457,7 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2286,10 +2482,10 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     let row_selector = Box::leak(format!("branch_row_{}_{}", repo_id.0, badge_ix).into_boxed_str());
     let badge_bounds = cx
-        .debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        .debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
         .expect("expected branch worktree badge bounds");
     let row_bounds = cx
         .debug_bounds(row_selector)
@@ -2308,15 +2504,19 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
     sync_view_for_tests(cx, &view);
 
     // Nothing is revealed on hover at the trailing edge any more: the `⋮` button
-    // is gone, so the worktree badge owns the row's right edge, one trailing pad
-    // in from it.
+    // is gone. Content keeps its inset plus trailing padding while the row's
+    // background reaches the panel edge.
     assert!(
         cx.debug_bounds(debug_selector("branch_dots", badge_ix))
             .is_none(),
         "expected the branch row's `⋮` slot to be gone"
     );
     assert!(
-        (row_bounds.right() - badge_bounds.right() - px(4.0)).abs() <= px(1.0),
+        (row_bounds.right()
+            - badge_bounds.right()
+            - px(crate::view::components::ROW_HIGHLIGHT_INSET_PX + 4.0))
+        .abs()
+            <= px(1.0),
         "expected branch worktree badge to sit one trailing pad off the row's right edge, \
          row right {:?} badge right {:?}",
         row_bounds.right(),
@@ -2327,6 +2527,7 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
     // the trailing area holds the worktree badge, which opens its own menu.
     let row_label_point = gpui::point(row_bounds.left() + px(48.0), row_center.y);
     cx.simulate_mouse_down(row_label_point, MouseButton::Right, Modifiers::default());
+    cx.simulate_mouse_up(row_label_point, MouseButton::Right, Modifiers::default());
     cx.run_until_parked();
     sync_view_for_tests(cx, &view);
 
@@ -2340,8 +2541,10 @@ fn branch_worktree_badge_aligns_to_edge_and_branch_menu_opens_on_right_click(
 
 #[gpui::test]
 fn worktree_branch_badge_shows_full_tooltip_when_truncated(cx: &mut gpui::TestAppContext) {
+    // Measures Compact layout; a fresh session now defaults to Comfortable.
+    cx.update(crate::appearance::pin_compact_for_test);
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2357,7 +2560,7 @@ fn worktree_branch_badge_shows_full_tooltip_when_truncated(cx: &mut gpui::TestAp
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     let branch = "feature/super-long-worktree-branch-name-that-needs-truncation-to-fit-the-sidebar"
         .to_string();
@@ -2378,6 +2581,10 @@ fn worktree_branch_badge_shows_full_tooltip_when_truncated(cx: &mut gpui::TestAp
     ));
 
     let section_ix = wait_for_debug_index(cx, &view, "worktrees_section", 64);
+    // The fixture backend reports unsupported loads as errors, which stay
+    // on screen over the sidebar this clicks.
+    cx.update(|_window, app| crate::view::test_support::dismiss_error_toasts(&view, app));
+    sync_view_for_tests(cx, &view);
     click_debug_selector(cx, debug_selector("worktrees_section", section_ix), 1);
 
     let label_ix = wait_for_debug_index(cx, &view, "worktree_branch_badge_label", 128);
@@ -2395,8 +2602,10 @@ fn worktree_branch_badge_shows_full_tooltip_when_truncated(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn worktree_branch_and_path_stay_within_one_sidebar_row(cx: &mut gpui::TestAppContext) {
+    // Measures Compact layout; a fresh session now defaults to Comfortable.
+    cx.update(crate::appearance::pin_compact_for_test);
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2412,7 +2621,7 @@ fn worktree_branch_and_path_stay_within_one_sidebar_row(cx: &mut gpui::TestAppCo
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
@@ -2436,6 +2645,10 @@ fn worktree_branch_and_path_stay_within_one_sidebar_row(cx: &mut gpui::TestAppCo
     ));
 
     let section_ix = wait_for_debug_index(cx, &view, "worktrees_section", 64);
+    // The fixture backend reports unsupported loads as errors, which stay
+    // on screen over the sidebar this clicks.
+    cx.update(|_window, app| crate::view::test_support::dismiss_error_toasts(&view, app));
+    sync_view_for_tests(cx, &view);
     click_debug_selector(cx, debug_selector("worktrees_section", section_ix), 1);
 
     let row_ix = wait_for_debug_index(cx, &view, "worktree_branch_badge", 128);
@@ -2492,8 +2705,8 @@ fn worktree_branch_and_path_stay_within_one_sidebar_row(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
-fn workspace_badge_appears_when_worktree_added_for_branch(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_appears_when_worktree_added_for_branch(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2507,7 +2720,7 @@ fn workspace_badge_appears_when_worktree_added_for_branch(cx: &mut gpui::TestApp
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2532,17 +2745,17 @@ fn workspace_badge_appears_when_worktree_added_for_branch(cx: &mut gpui::TestApp
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear when worktree is added for a branch"
     );
 }
 
 #[gpui::test]
-fn workspace_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2556,7 +2769,7 @@ fn workspace_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContex
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2581,9 +2794,9 @@ fn workspace_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContex
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear"
     );
@@ -2599,7 +2812,7 @@ fn workspace_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContex
     let disappeared = loop {
         sync_view_for_tests(cx, &view);
 
-        if find_debug_index(cx, "branch_workspace_badge", 64).is_none() {
+        if find_debug_index(cx, "branch_worktree_badge", 64).is_none() {
             break true;
         }
 
@@ -2617,8 +2830,8 @@ fn workspace_badge_disappears_when_worktree_removed(cx: &mut gpui::TestAppContex
 }
 
 #[gpui::test]
-fn workspace_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2632,7 +2845,7 @@ fn workspace_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppConte
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2657,9 +2870,9 @@ fn workspace_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppConte
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear"
     );
@@ -2680,7 +2893,7 @@ fn workspace_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppConte
     let disappeared = loop {
         sync_view_for_tests(cx, &view);
 
-        if find_debug_index(cx, "branch_workspace_badge", 64).is_none() {
+        if find_debug_index(cx, "branch_worktree_badge", 64).is_none() {
             break true;
         }
 
@@ -2698,8 +2911,8 @@ fn workspace_badge_disappears_when_worktree_detaches(cx: &mut gpui::TestAppConte
 }
 
 #[gpui::test]
-fn workspace_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2713,7 +2926,7 @@ fn workspace_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppCont
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2746,9 +2959,9 @@ fn workspace_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppCont
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear on old branch"
     );
@@ -2769,7 +2982,7 @@ fn workspace_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppCont
     let index = loop {
         sync_view_for_tests(cx, &view);
 
-        if let Some(ix) = find_debug_index(cx, "branch_workspace_badge", 64) {
+        if let Some(ix) = find_debug_index(cx, "branch_worktree_badge", 64) {
             break Some(ix);
         }
 
@@ -2789,7 +3002,7 @@ fn workspace_badge_moves_when_worktree_branch_renames(cx: &mut gpui::TestAppCont
 #[gpui::test]
 fn worktree_branch_badge_hidden_for_detached_worktree_item(cx: &mut gpui::TestAppContext) {
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2803,7 +3016,7 @@ fn worktree_branch_badge_hidden_for_detached_worktree_item(cx: &mut gpui::TestAp
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::WorktreesLoaded {
@@ -2834,10 +3047,8 @@ fn worktree_branch_badge_hidden_for_detached_worktree_item(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
-fn workspace_badge_survives_reload_repo_and_manual_worktree_resupply(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_survives_reload_repo_and_manual_worktree_resupply(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2851,7 +3062,7 @@ fn workspace_badge_survives_reload_repo_and_manual_worktree_resupply(
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2876,17 +3087,28 @@ fn workspace_badge_survives_reload_repo_and_manual_worktree_resupply(
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear"
     );
 
+    let branches_rev = |store: &AppStore| {
+        store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .map(|repo| repo.branches_rev)
+    };
+    let before_reload = branches_rev(&store_for_test);
     store_for_test.dispatch(Msg::ReloadRepo { repo_id });
-
-    sync_view_for_tests(cx, &view);
-    cx.run_until_parked();
+    // The pre-reload snapshot already looks settled.
+    wait_until("reload to reset branches", || {
+        branches_rev(&store_for_test) != before_reload
+    });
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2911,17 +3133,17 @@ fn workspace_badge_survives_reload_repo_and_manual_worktree_resupply(
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to survive repo reload and manual worktree resupply"
     );
 }
 
 #[gpui::test]
-fn workspace_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(SlowSubmoduleBackend));
+fn worktree_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(SubmoduleTestBackend::default()));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -2935,7 +3157,7 @@ fn workspace_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::Tes
         restore_session_and_draw(cx, &store_for_test, view.clone(), vec![base.join("repo1")]);
     let repo_id = repo_ids[0];
     wait_for_repo_open(&store_for_test, repo_id);
-    wait_for_initial_worktrees_load_to_settle(cx, &store_for_test, &view, repo_id);
+    wait_for_sidebar_loads_to_settle(cx, &store_for_test, &view, repo_id);
 
     store_for_test.dispatch(Msg::Internal(
         gitcomet_state::msg::InternalMsg::BranchesLoaded {
@@ -2960,9 +3182,9 @@ fn workspace_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::Tes
         },
     ));
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to appear"
     );
@@ -2979,7 +3201,7 @@ fn workspace_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::Tes
     let deadline = Instant::now() + Duration::from_secs(1);
     let disappeared = loop {
         sync_view_for_tests(cx, &view);
-        if find_debug_index(cx, "branch_workspace_badge", 64).is_none() {
+        if find_debug_index(cx, "branch_worktree_badge", 64).is_none() {
             break true;
         }
         if Instant::now() >= deadline {
@@ -3002,9 +3224,9 @@ fn workspace_badge_reappears_after_sidebar_data_request_cycle(cx: &mut gpui::Tes
         },
     });
 
-    let badge_ix = wait_for_debug_index(cx, &view, "branch_workspace_badge", 64);
+    let badge_ix = wait_for_debug_index(cx, &view, "branch_worktree_badge", 64);
     assert!(
-        cx.debug_bounds(debug_selector("branch_workspace_badge", badge_ix))
+        cx.debug_bounds(debug_selector("branch_worktree_badge", badge_ix))
             .is_some(),
         "expected workspace badge to still be present after re-enabling sidebar data request"
     );
@@ -3265,12 +3487,12 @@ fn picker_prompt_scrollbar_drag_scrolls_list(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn popover_is_clickable_above_content(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store_for_view, events, None, window, cx)
     });
-    seed_workspace_repo(
+    seed_worktree_repo(
         cx,
         &store,
         view.clone(),
@@ -3340,12 +3562,12 @@ fn popover_is_clickable_above_content(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn popover_closes_when_clicking_outside(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store_for_view, events, None, window, cx)
     });
-    seed_workspace_repo(
+    seed_worktree_repo(
         cx,
         &store,
         view.clone(),
@@ -3397,12 +3619,12 @@ fn titlebar_hamburger_opens_app_menu(cx: &mut gpui::TestAppContext) {
     }
 
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store_for_view, events, None, window, cx)
     });
-    seed_workspace_repo(
+    seed_worktree_repo(
         cx,
         &store,
         view.clone(),
@@ -3448,12 +3670,12 @@ fn titlebar_hamburger_opens_from_keyboard_and_restores_focus_on_escape(
     }
 
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store_for_view, events, None, window, cx)
     });
-    seed_workspace_repo(
+    seed_worktree_repo(
         cx,
         &store,
         view.clone(),
@@ -3498,12 +3720,12 @@ fn repo_tab_strip_plus_button_opens_add_repo_menu(cx: &mut gpui::TestAppContext)
     }
 
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store_for_view, events, None, window, cx)
     });
-    seed_workspace_repo(
+    seed_worktree_repo(
         cx,
         &store,
         view.clone(),
@@ -3551,7 +3773,7 @@ fn titlebar_window_controls_update_tooltip_on_hover(cx: &mut gpui::TestAppContex
         return;
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
     });
@@ -3950,7 +4172,7 @@ fn titlebar_only_reserves_visible_repository_controls_from_window_drag(
     cx: &mut gpui::TestAppContext,
 ) {
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4029,7 +4251,7 @@ fn titlebar_only_reserves_visible_repository_controls_from_window_drag(
 
 #[gpui::test]
 fn repo_tabs_scroll_with_the_wheel_once_they_overflow(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4073,7 +4295,7 @@ fn repo_tabs_scroll_with_the_wheel_once_they_overflow(cx: &mut gpui::TestAppCont
 
 #[gpui::test]
 fn repo_tab_strip_never_renders_scroll_arrows(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4104,6 +4326,12 @@ fn repo_tab_strip_never_renders_scroll_arrows(cx: &mut gpui::TestAppContext) {
                 .join(format!("repository-number-{ix}"))
         })
         .collect();
+    // Restore preserves already-open tabs. Close the roomy fixture before
+    // replacing it with the dense one.
+    store_for_test.dispatch(Msg::CloseRepos {
+        repo_ids: roomy_repo_ids,
+        activate_after: None,
+    });
     let dense_repo_ids = restore_session_and_draw(cx, &store_for_test, view.clone(), repos);
     sync_view_for_tests(cx, &view);
 
@@ -4136,7 +4364,7 @@ fn repo_tab_strip_never_renders_scroll_arrows(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn roomy_repo_tab_expands_to_show_its_full_repository_name(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4174,10 +4402,128 @@ fn roomy_repo_tab_expands_to_show_its_full_repository_name(cx: &mut gpui::TestAp
     );
 }
 
+/// AppKit paints the traffic lights straight over our bar, so the bar has to
+/// keep its own leading control out from under them. Nothing else measures the
+/// reserved inset against what actually gets painted.
+#[cfg(target_os = "macos")]
+#[gpui::test]
+fn the_title_bar_keeps_its_leading_control_clear_of_the_traffic_lights(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let store_for_test = store.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        crate::view::GitCometView::new(store, events, None, window, cx)
+    });
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_traffic_lights_{}",
+        std::process::id()
+    ));
+    restore_session_and_draw(cx, &store_for_test, view.clone(), vec![workdir]);
+
+    let picker = cx
+        .debug_bounds("repo_picker_toggle")
+        .expect("expected repository picker bounds");
+
+    assert!(
+        picker.left() >= crate::view::chrome::MACOS_TRAFFIC_LIGHTS_SAFE_INSET,
+        "the first control in the bar starts at {:?}, inside the {:?} reserved for the lights",
+        picker.left(),
+        crate::view::chrome::MACOS_TRAFFIC_LIGHTS_SAFE_INSET
+    );
+}
+
+/// The window chrome is deliberately outside the UI scale: a title bar shares
+/// its row with the OS window controls, which do not resize, so the bar, its
+/// buttons and the repository tabs must not move when the workspace under them
+/// zooms.
+#[gpui::test]
+fn the_title_bar_and_repository_tabs_hold_their_size_at_every_ui_scale(
+    cx: &mut gpui::TestAppContext,
+) {
+    // Width matters as much as height here: the scale parameter this change
+    // dropped from `Tab::natural_width` governs the strip's widths.
+    fn box_of(
+        cx: &mut gpui::VisualTestContext,
+        selector: &'static str,
+        at: u32,
+    ) -> gpui::Size<gpui::Pixels> {
+        cx.debug_bounds(selector)
+            .unwrap_or_else(|| panic!("missing {selector} at {at}% UI scale"))
+            .size
+    }
+
+    let _visual_guard = lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let store_for_test = store.clone();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        crate::view::GitCometView::new(store, events, None, window, cx)
+    });
+    let workdir = std::env::temp_dir().join(format!(
+        "gitcomet_ui_test_fixed_chrome_{}",
+        std::process::id()
+    ));
+    let repo_id = restore_session_and_draw(cx, &store_for_test, view.clone(), vec![workdir])[0];
+
+    let fixed = [
+        "titlebar_drag",
+        "repo_picker_toggle",
+        "add_repo_menu",
+        repo_tab_selector(repo_id),
+        repo_tab_label_text_selector(repo_id),
+    ];
+    // Proves the zoom actually landed: without it every assertion below would
+    // also hold for a scale change that never took effect.
+    let zooms = "sidebar_tab_files";
+
+    let default_percent = crate::ui_scale::DEFAULT_UI_SCALE_PERCENT;
+    let at_default = fixed.map(|selector| box_of(cx, selector, default_percent));
+    let zooms_at_default = box_of(cx, zooms, default_percent).height;
+
+    for percent in [80, 200] {
+        cx.update(|window, app| {
+            view.update(app, |this, cx| {
+                crate::ui_scale::set_default(cx, percent);
+                this.apply_ui_scale_percent(percent, window, cx);
+            });
+        });
+        sync_view_for_tests(cx, &view);
+
+        for (ix, selector) in fixed.into_iter().enumerate() {
+            assert_eq!(
+                box_of(cx, selector, percent),
+                at_default[ix],
+                "{selector} sits in the title bar and must not move at {percent}% UI scale"
+            );
+        }
+        // Absolute, not merely unchanged: the bar is mounted uncached in tests,
+        // so a bar that silently compressed would still "not move".
+        assert_eq!(
+            box_of(cx, "titlebar_drag", percent).height,
+            crate::view::chrome::TITLE_BAR_HEIGHT,
+            "the title bar must hold its own fixed height at {percent}% UI scale"
+        );
+        // Re-checked every step, so neither iteration can pass vacuously.
+        let zoomed = box_of(cx, zooms, percent).height;
+        if percent < default_percent {
+            assert!(
+                zoomed < zooms_at_default,
+                "the workspace under the title bar must shrink at {percent}%"
+            );
+        } else {
+            assert!(
+                zoomed > zooms_at_default,
+                "the workspace under the title bar must still zoom at {percent}%"
+            );
+        }
+    }
+}
+
 #[gpui::test]
 fn repository_tabs_shrink_long_names_before_short_names(cx: &mut gpui::TestAppContext) {
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4289,7 +4635,7 @@ fn repository_tabs_shrink_long_names_before_short_names(cx: &mut gpui::TestAppCo
 
 #[gpui::test]
 fn repo_tabs_show_separators_only_between_inactive_tabs(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4316,7 +4662,7 @@ fn repo_tabs_show_separators_only_between_inactive_tabs(cx: &mut gpui::TestAppCo
 
 #[gpui::test]
 fn dragging_a_repo_tab_to_the_edge_scrolls_the_strip(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4405,7 +4751,7 @@ fn dragging_a_repo_tab_to_the_edge_scrolls_the_strip(cx: &mut gpui::TestAppConte
 
 #[gpui::test]
 fn dragging_a_repo_tab_past_the_strip_ends_keeps_it_inside(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4477,7 +4823,7 @@ fn dragging_a_repo_tab_past_the_strip_ends_keeps_it_inside(cx: &mut gpui::TestAp
 
 #[gpui::test]
 fn add_repo_button_stays_after_the_overflowing_tab_viewport(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4512,7 +4858,7 @@ fn add_repo_button_stays_after_the_overflowing_tab_viewport(cx: &mut gpui::TestA
 
 #[gpui::test]
 fn add_repo_button_stays_at_the_strip_end_when_tabs_fit(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4546,7 +4892,7 @@ fn add_repo_button_stays_at_the_strip_end_when_tabs_fit(cx: &mut gpui::TestAppCo
 
 #[gpui::test]
 fn activating_a_repo_scrolls_its_tab_into_view(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_test = store.clone();
     let (view, cx) = cx.add_window_view(|window, cx| {
         crate::view::GitCometView::new(store, events, None, window, cx)
@@ -4827,6 +5173,90 @@ fn a_button_less_pointer_move_clears_a_stranded_claim(cx: &mut gpui::TestAppCont
         assert!(
             !crate::press_gesture::is_press_claimed(app),
             "a move with no button held must strand no claim"
+        );
+    });
+}
+
+/// The menu's rows clear `interaction.context_menu` and stop propagation in the
+/// bubble phase, so a guard that re-reads it after the press sees `None` and
+/// blurs the input it was meant to protect.
+#[gpui::test]
+fn text_input_context_menu_copy_keeps_focus_and_selection(cx: &mut gpui::TestAppContext) {
+    let _clipboard_guard = lock_clipboard_test();
+    let (view, cx) = cx.add_window_view(SmokeView::new);
+
+    cx.update(|window, app| {
+        let focus = view.update(app, |this, cx| this.input.read(cx).focus_handle());
+        window.focus(&focus, app);
+        view.update(app, |this, cx| {
+            this.input
+                .update(cx, |input, cx| input.set_text("hello world", cx));
+        });
+        let _ = window.draw(app);
+    });
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.input
+                .update(cx, |input, cx| input.select_all_text(window, cx));
+        });
+    });
+    cx.run_until_parked();
+
+    let click = cx
+        .debug_bounds("smoke_input")
+        .expect("expected smoke input bounds")
+        .center();
+    cx.simulate_mouse_move(click, None, Modifiers::default());
+    cx.simulate_event(MouseDownEvent {
+        position: click,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Right,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: click,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Right,
+        click_count: 1,
+    });
+    cx.run_until_parked();
+
+    let copy_click = cx
+        .debug_bounds("text_input_context_copy")
+        .expect("expected the copy row")
+        .center();
+    cx.simulate_mouse_move(copy_click, None, Modifiers::default());
+    cx.simulate_event(MouseDownEvent {
+        position: copy_click,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+        first_mouse: false,
+    });
+    cx.simulate_event(MouseUpEvent {
+        position: copy_click,
+        modifiers: Modifiers::default(),
+        button: MouseButton::Left,
+        click_count: 1,
+    });
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("hello world".into()),
+        "precondition: the menu's Copy row ran"
+    );
+    cx.update(|window, app| {
+        let input = view.read(app).input.clone();
+        assert!(
+            input.read(app).focus_handle().is_focused(window),
+            "using the input's own menu must not blur it"
+        );
+        assert_eq!(
+            input.read(app).selected_text(),
+            Some("hello world".to_string()),
+            "the selection the menu just copied must survive"
         );
     });
 }

@@ -1,3 +1,4 @@
+mod contributions;
 use super::super::branch_sidebar::{BranchSection, BranchSidebarRow};
 use super::super::caches::BranchSidebarFingerprint;
 use super::super::file_icons;
@@ -5,11 +6,14 @@ use super::super::sidebar_presentation::{
     SidebarPresentation, SidebarPresentationCache, SidebarRequestFingerprint,
 };
 use super::super::*;
+use crate::kit::click::PointerClickExt as _;
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use gitcomet_core::domain::{FileEntry, FileEntryKind, LogScope};
 use gitcomet_state::model::{Loadable, SidebarDataRequest, SidebarMode};
 use gitcomet_state::msg::Msg;
 use palette::IntoColor;
 use rustc_hash::{FxHashSet, FxHasher};
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
@@ -19,14 +23,24 @@ use std::sync::Arc;
 use crate::kit::TextInput;
 use crate::kit::TextInputOptions;
 use crate::view::components::InteractiveRowExt as _;
-use crate::view::panes::main::diff_search::{DiffSearchMatcher, DiffSearchOptions};
+use gitcomet_core::text_search::{TextSearchMatcher, TextSearchOptions};
+pub(in crate::view) mod explorer_operations;
+pub(in crate::view) use explorer_operations::ExplorerAction;
+mod file_browser_status;
+use file_browser_status::FileBrowserStatusCache;
+// File rows borrow the branch tree's row height: one rhythm for both lists.
+use crate::view::rows::sidebar::{sidebar_list_row_height, sidebar_list_row_height_px};
 
 type FileBrowserRowsCache = std::cell::RefCell<
     Option<(
-        (RepoId, u64, DiffSearchOptions, u64, bool),
+        (RepoId, u64, TextSearchOptions, u64, bool),
         Rc<[FileBrowserVisibleRow]>,
     )>,
 >;
+type ExplorerCutCache = std::cell::RefCell<Option<(u64, Option<Rc<[PathBuf]>>)>>;
+
+type FileSearchMatcherCache =
+    std::cell::RefCell<Option<(String, TextSearchOptions, Rc<Vec<TextSearchMatcher>>)>>;
 
 /// One row of the file explorer list.
 ///
@@ -40,11 +54,19 @@ type FileBrowserRowsCache = std::cell::RefCell<
 /// its folder has neither.
 #[derive(Clone, Debug)]
 enum FileBrowserVisibleRow {
+    NameEntry {
+        depth: usize,
+    },
     /// Header of the unsaved-edits section. Click toggles the section.
-    UnsavedHeader { count: usize },
+    FileSetHeader {
+        count: usize,
+    },
     /// A file with an unsaved editor buffer, shown by its full repo-relative
     /// path since it is out of its folder here.
-    UnsavedFile { path: Arc<PathBuf> },
+    FileSetFile {
+        path: Arc<PathBuf>,
+        open: gitcomet_extension_api::HostedAction,
+    },
     Entry {
         entry_index: usize,
         depth: usize,
@@ -71,11 +93,77 @@ impl FileBrowserVisibleRow {
 /// the branch tree's sections use.
 const FILE_BROWSER_UNSAVED_SECTION_KEY: &str = "file_browser:unsaved_edits";
 
-const FILE_BROWSER_ROW_HEIGHT_PX: f32 = 22.0;
 /// How long a queued reveal may wait for the expanded rows it needs. Generous
 /// enough for the store round trip, short enough that a request the user has
 /// moved on from never fires.
 const FILE_BROWSER_REVEAL_MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The checked-out local branch and its tip, but only once both pieces of
+/// sidebar data agree. A detached `HEAD` and a branch list that has not landed
+/// yet deliberately leave the locate action disabled.
+fn active_local_branch_target(repo: &RepoState) -> Option<(&str, &CommitId)> {
+    let Loadable::Ready(head) = &repo.head_branch else {
+        return None;
+    };
+    if head == "HEAD" {
+        return None;
+    }
+    let Loadable::Ready(branches) = &repo.branches else {
+        return None;
+    };
+    branches
+        .iter()
+        .find(|branch| branch.name.as_str() == head.as_str())
+        .map(|branch| (head.as_str(), &branch.target))
+}
+
+/// Expand the Local section and every possible slash-group on the path to a
+/// branch. Including the full branch name matters when a ref is both a leaf and
+/// a group (`feature` alongside `feature/one`); for an ordinary leaf its key is
+/// simply absent and this is a no-op.
+fn expand_local_branch_path(collapsed_items: &mut BTreeSet<String>, branch_name: &str) -> bool {
+    let mut changed = false;
+    let mut expand = |key: &str| {
+        if branch_sidebar::is_collapsed(collapsed_items, key) {
+            branch_sidebar::set_collapse_state(collapsed_items, key, false);
+            changed = true;
+        }
+    };
+
+    expand(branch_sidebar::local_section_storage_key());
+    let mut group_path = String::new();
+    for segment in branch_name.split('/') {
+        if !group_path.is_empty() {
+            group_path.push('/');
+        }
+        group_path.push_str(segment);
+        expand(&branch_sidebar::local_group_storage_key(&group_path));
+    }
+    changed
+}
+
+/// Prefer the branch's row in the Local tree over a duplicate in the Pinned
+/// section, which is emitted earlier in the presentation.
+fn local_branch_home_row_index(rows: &[BranchSidebarRow], branch_name: &str) -> Option<usize> {
+    rows.iter().rposition(|row| {
+        matches!(
+            row,
+            BranchSidebarRow::Branch {
+                name,
+                section: BranchSection::Local,
+                ..
+            } if name.as_ref() == branch_name
+        )
+    })
+}
+
+fn file_browser_row_label_color(theme: AppTheme, selected: bool) -> gpui::Rgba {
+    if selected {
+        selected_branch_label_color(theme)
+    } else {
+        theme.colors.foreground.primary
+    }
+}
 
 /// A section of the sidebar that gets its own icon in the collapsed rail and,
 /// when clicked, opens in a floating popover without expanding the sidebar.
@@ -85,20 +173,31 @@ pub(in crate::view) enum CollapsedSidebarSection {
     Remote,
     Worktrees,
     Submodules,
+    Annex,
     Stashes,
     Files,
 }
 
 impl CollapsedSidebarSection {
-    /// Rail order, top to bottom.
-    pub(in crate::view) const ALL: [Self; 6] = [
+    /// Rail order, top to bottom, matching the expanded sidebar.
+    pub(in crate::view) const ALL: [Self; 7] = [
         Self::Local,
         Self::Remote,
         Self::Worktrees,
         Self::Submodules,
+        Self::Annex,
         Self::Stashes,
         Self::Files,
     ];
+
+    /// Whether the rail shows this section for `repo`. The git-annex section
+    /// exists only where annex is in use, like its expanded counterpart.
+    pub(in crate::view) fn is_available(self, repo: Option<&RepoState>) -> bool {
+        match self {
+            Self::Annex => repo.is_some_and(repo_uses_annex),
+            _ => true,
+        }
+    }
 
     pub(in crate::view) fn icon_path(self) -> &'static str {
         match self {
@@ -106,6 +205,7 @@ impl CollapsedSidebarSection {
             Self::Remote => "icons/cloud.svg",
             Self::Worktrees => "icons/git_worktree.svg",
             Self::Submodules => "icons/box.svg",
+            Self::Annex => "icons/disk.svg",
             Self::Stashes => super::super::icons::STASH_ICON_PATH,
             Self::Files => "icons/file.svg",
         }
@@ -117,6 +217,7 @@ impl CollapsedSidebarSection {
             Self::Remote => "Remote Branches",
             Self::Worktrees => "Worktrees",
             Self::Submodules => "Submodules",
+            Self::Annex => "git-annex",
             Self::Stashes => "Stashes",
             Self::Files => "Files",
         }
@@ -128,34 +229,12 @@ impl CollapsedSidebarSection {
             Self::Remote => "collapsed_sidebar_icon_remote",
             Self::Worktrees => "collapsed_sidebar_icon_worktrees",
             Self::Submodules => "collapsed_sidebar_icon_submodules",
+            Self::Annex => "collapsed_sidebar_icon_annex",
             Self::Stashes => "collapsed_sidebar_icon_stashes",
             Self::Files => "collapsed_sidebar_icon_files",
         }
     }
 
-    /// The branch list this section shows, if any. Branch sections are the ones
-    /// that support the popover filter (and can spill results into each other).
-    fn branch_section(self) -> Option<BranchSection> {
-        match self {
-            Self::Local => Some(BranchSection::Local),
-            Self::Remote => Some(BranchSection::Remote),
-            _ => None,
-        }
-    }
-
-    /// The other branch section, whose matches the filter also surfaces.
-    fn counterpart(self) -> Option<Self> {
-        match self {
-            Self::Local => Some(Self::Remote),
-            Self::Remote => Some(Self::Local),
-            _ => None,
-        }
-    }
-
-    /// The section-level menu the expanded sidebar hangs off this section's
-    /// header row, paired with the invoker id that header uses so both routes
-    /// light up the same "menu is open" highlight. Files has no section menu:
-    /// its actions live on the individual file rows.
     pub(in crate::view) fn section_menu(
         self,
         repo_id: RepoId,
@@ -183,11 +262,18 @@ impl CollapsedSidebarSection {
                 format!("submodules_section_menu_{}", repo_id.0),
                 PopoverKind::submodule(repo_id, SubmodulePopoverKind::SectionMenu),
             ),
+            Self::Annex => (
+                format!("annex_section_menu_{}", repo_id.0),
+                PopoverKind::annex(repo_id, AnnexPopoverKind::SectionMenu),
+            ),
             Self::Stashes => (
                 format!("stash_section_menu_{}", repo_id.0),
                 PopoverKind::StashPrompt,
             ),
-            Self::Files => return None,
+            Self::Files => (
+                format!("explorer_settings_menu_{}", repo_id.0),
+                PopoverKind::ExplorerSettingsMenu { repo_id },
+            ),
         };
         Some((invoker.into(), kind))
     }
@@ -198,20 +284,79 @@ impl CollapsedSidebarSection {
             Self::Remote => Some(branch_sidebar::remote_section_storage_key()),
             Self::Worktrees => Some(branch_sidebar::worktrees_section_storage_key()),
             Self::Submodules => Some(branch_sidebar::submodules_section_storage_key()),
+            Self::Annex => Some(branch_sidebar::annex_section_storage_key()),
             Self::Stashes => Some(branch_sidebar::stash_section_storage_key()),
             Self::Files => None,
         }
     }
 }
 
+/// Extension tabs after Branches and Files for the active repository, as
+/// the window routes them.
+#[derive(Clone)]
+pub(in crate::view) struct SidebarExtensionTabs {
+    /// Each listed tab's position among the registered ones, and its title.
+    pub(in crate::view) tabs: Vec<(usize, SharedString, Option<SharedString>)>,
+    pub(in crate::view) selected: Option<usize>,
+    pub(in crate::view) host_tabs: bool,
+    /// The selected tab's view, once built.
+    pub(in crate::view) view: Option<gpui::AnyView>,
+}
+
+impl SidebarExtensionTabs {
+    /// The selected tab, when its view is there to show.
+    fn showing(&self) -> Option<usize> {
+        self.selected.filter(|_| self.view.is_some())
+    }
+
+    fn same(&self, other: &Self) -> bool {
+        self.host_tabs == other.host_tabs
+            && self.tabs == other.tabs
+            && self.selected == other.selected
+            && self.view.as_ref().map(gpui::AnyView::entity_id)
+                == other.view.as_ref().map(gpui::AnyView::entity_id)
+    }
+}
+
 pub(in super::super) struct SidebarPaneView {
+    /// Tabs contributed after Branches and Files; `None` without any.
+    extension_tabs: Option<SidebarExtensionTabs>,
+    explorer_focus: gpui::FocusHandle,
+    /// Input events can arrive before the store publishes the preceding click.
+    explorer_pending_focus: Option<(RepoId, PathBuf)>,
+    explorer_name_input: Entity<TextInput>,
+    explorer_name_edit: Option<explorer_operations::NameEdit>,
+    /// Cut paths mirrored from the clipboard, keyed on
+    /// `clipboard::files_revision`. The row builder used to read the platform
+    /// clipboard itself, which on Linux/X11 is a synchronous selection transfer
+    /// -- once per prepaint, and gpui re-renders on every mouse move during a
+    /// drag.
+    explorer_cut_cache: ExplorerCutCache,
+    explorer_drop_target: Option<PathBuf>,
+    explorer_drop_region: std::cell::RefCell<Option<explorer_operations::DropRegion>>,
+    explorer_drag_repo: Option<RepoId>,
+    /// The row that claimed `explorer_drop_target`. Rows are not one-to-one
+    /// with destinations, so only this identifies the claimant.
+    explorer_drop_row: Option<PathBuf>,
+    explorer_hover_task: Option<gpui::Task<()>>,
+    explorer_scroll_task: Option<gpui::Task<()>>,
+    explorer_empty_bounds: Rc<Cell<Option<gpui::Bounds<Pixels>>>>,
+    contributions: Option<contributions::SidebarContributions>,
     pub(in super::super) store: Arc<AppStore>,
     state: Arc<AppState>,
     pub(in super::super) theme: AppTheme,
+    sidebar_focus: gpui::FocusHandle,
     _ui_model_subscription: gpui::Subscription,
+    // Only one surface is mounted at a time. Park the other handle when
+    // switching between the expanded tree and a rail popover.
     branches_scroll: UniformListScrollHandle,
+    inactive_branches_scroll: UniformListScrollHandle,
+    sticky_context: Option<sticky::StickyContext>,
+    sidebar_selection_cache: Option<sticky::SelectionCache>,
+    pending_sidebar_navigation: Option<sticky::NavigationTarget>,
+    sidebar_scroll_animation: Option<sticky::ScrollAnimation>,
+    expanded_branches_visible: bool,
     file_browser_scroll: UniformListScrollHandle,
-    pub(in super::super) collapsed_popover_scroll: gpui::ScrollHandle,
     file_browser_search_input: Entity<TextInput>,
     _search_input_subscription: gpui::Subscription,
     /// Live filter for the branch sidebar (Local/Remote/pinned sections). The
@@ -220,13 +365,12 @@ pub(in super::super) struct SidebarPaneView {
     branch_filter_input: Entity<TextInput>,
     pub(in super::super) branch_filter_query: String,
     _branch_filter_subscription: gpui::Subscription,
-    /// The collapsed-rail branch popovers keep their filter behind a header
-    /// toggle. Separate from `branch_filter_input` so a popover filter never
-    /// leaks into the expanded sidebar's filter (and vice versa).
-    collapsed_popover_filter_open: bool,
-    collapsed_popover_filter_input: Entity<TextInput>,
-    pub(in super::super) collapsed_popover_filter_query: String,
-    _collapsed_popover_filter_subscription: gpui::Subscription,
+    branch_search_open: bool,
+    file_search_open: bool,
+    branch_search_options: TextSearchOptions,
+    file_matchers_cache: FileSearchMatcherCache,
+    file_match_count_cache: std::cell::RefCell<Option<(Rc<[FileBrowserVisibleRow]>, usize)>>,
+    section_locator_cache: std::cell::RefCell<Option<search::SectionLocatorCache>>,
     sidebar_presentation_cache: SidebarPresentationCache,
     path_display_cache: std::cell::RefCell<path_display::PathDisplayCache>,
     sidebar_collapsed_items_by_repo: BTreeMap<std::path::PathBuf, BTreeSet<String>>,
@@ -237,66 +381,77 @@ pub(in super::super) struct SidebarPaneView {
     sidebar_request_fingerprint: SidebarRequestFingerprint,
     pub(in super::super) active_context_menu_invoker: Option<SharedString>,
     selected_branch: Option<SelectedBranch>,
-    file_search_options: DiffSearchOptions,
+    // A branch can appear in several pinned groups and as an individual pin.
+    // Keep the clicked copy's stable row key; None selects the tree copy.
+    selected_branch_pin_key: Option<SharedString>,
+    file_search_options: TextSearchOptions,
     file_browser_rows_cache: FileBrowserRowsCache,
-    /// Set transiently while rendering a collapsed-sidebar section popover so the
-    /// shared branch-row renderer draws the section-scoped rows instead of the
-    /// full cached presentation. `None` during normal (expanded) rendering.
-    pub(in super::super) collapsed_popover_presentation: Option<SidebarPresentation>,
+    file_browser_status_cache: std::cell::RefCell<FileBrowserStatusCache>,
     /// When set (and the sidebar is collapsed), this pane renders only the given
     /// section as popover content instead of the full sidebar. The root view
     /// syncs this to its `sidebar_collapsed_popover` before embedding the pane.
-    collapsed_popover_section: Option<CollapsedSidebarSection>,
+    pub(in crate::view) collapsed_popover_section: Option<CollapsedSidebarSection>,
     /// A file the explorer has been asked to scroll to, held until the store
     /// snapshot with its folders expanded arrives.
     pending_file_browser_reveal: Option<std::path::PathBuf>,
     /// When the request was made. Bounded so an unresolvable reveal expires
     /// instead of firing at some unrelated later moment.
     pending_file_browser_reveal_at: Option<std::time::Instant>,
+    #[cfg(any(test, feature = "benchmarks"))]
+    pub(in crate::view) render_count: usize,
+    #[cfg(any(test, feature = "benchmarks"))]
+    pub(in crate::view) rendered_rows: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct SidebarNotifyFingerprint {
+    sidebar_mode: SidebarMode,
     active_repo_id: Option<RepoId>,
     repo_fingerprint: Option<BranchSidebarFingerprint>,
     open_repo_workdirs_count: usize,
     open_repo_workdirs_hash: u64,
-    active_workspace_badges_count: usize,
-    active_workspace_badges_hash: u64,
+    active_worktree_badges_count: usize,
+    active_worktree_badges_hash: u64,
     file_browser_rev: u64,
     /// The file the main pane has open. The tree highlights it, so the sidebar
     /// has to repaint when it changes — nothing else in this fingerprint moves
     /// when the user opens a different file.
     diff_target_rev: u64,
+    status_revs: (u64, u64),
+    selected_commit: Option<CommitId>,
 }
 
 impl SidebarNotifyFingerprint {
+    #[cfg(test)]
     fn from_state(state: &AppState) -> Self {
+        Self::from_state_with_cache(state, &mut SidebarPresentationCache::default())
+    }
+
+    fn from_state_with_cache(state: &AppState, cache: &mut SidebarPresentationCache) -> Self {
         let active_repo_id = state.active_repo;
-        let repo_fingerprint = active_repo_id
-            .and_then(|repo_id| state.repos.iter().find(|r| r.id == repo_id))
-            .map(BranchSidebarFingerprint::from_repo);
+        let repo = active_repo_id.and_then(|repo_id| state.repos.iter().find(|r| r.id == repo_id));
+        let repo_fingerprint = repo.map(BranchSidebarFingerprint::from_repo);
         let (open_repo_workdirs_count, open_repo_workdirs_hash) =
             open_repo_workdirs_fingerprint(state);
-        let (active_workspace_badges_count, active_workspace_badges_hash) =
-            active_workspace_badges_fingerprint(state);
-        let file_browser_rev = active_repo_id
-            .and_then(|repo_id| state.repos.iter().find(|r| r.id == repo_id))
-            .map(|r| r.file_browser.file_browser_rev)
-            .unwrap_or(0);
-        let diff_target_rev = active_repo_id
-            .and_then(|repo_id| state.repos.iter().find(|r| r.id == repo_id))
-            .map(|r| r.diff_state.diff_target_rev)
-            .unwrap_or(0);
+        let (active_worktree_badges_count, active_worktree_badges_hash) =
+            cache.active_worktree_badges_fingerprint(state);
+        let file_browser_rev = repo.map(|r| r.file_browser.file_browser_rev).unwrap_or(0);
+        let diff_target_rev = repo.map(|r| r.diff_state.diff_target_rev).unwrap_or(0);
+        let status_revs = repo
+            .map(|r| (r.worktree_status_cache_rev(), r.staged_status_cache_rev()))
+            .unwrap_or_default();
         Self {
+            sidebar_mode: state.sidebar_mode,
             active_repo_id,
             repo_fingerprint,
             open_repo_workdirs_count,
             open_repo_workdirs_hash,
-            active_workspace_badges_count,
-            active_workspace_badges_hash,
+            active_worktree_badges_count,
+            active_worktree_badges_hash,
             file_browser_rev,
             diff_target_rev,
+            status_revs,
+            selected_commit: repo.and_then(|repo| repo.history_state.selected_commit.clone()),
         }
     }
 }
@@ -313,21 +468,56 @@ impl SidebarPaneView {
         cx: &mut gpui::Context<Self>,
     ) -> Self {
         let state = Arc::clone(&ui_model.read(cx).state);
-        let initial_fingerprint = SidebarNotifyFingerprint::from_state(&state);
+        let mut sidebar_presentation_cache = SidebarPresentationCache::default();
+        let initial_fingerprint = SidebarNotifyFingerprint::from_state_with_cache(
+            &state,
+            &mut sidebar_presentation_cache,
+        );
         let subscription = cx.observe(&ui_model, |this, model, cx| {
             let next = Arc::clone(&model.read(cx).state);
-            let next_fingerprint = SidebarNotifyFingerprint::from_state(&next);
+            let next_fingerprint = SidebarNotifyFingerprint::from_state_with_cache(
+                &next,
+                &mut this.sidebar_presentation_cache,
+            );
             let should_notify = next_fingerprint != this.notify_fingerprint;
             let repo_changed =
                 this.notify_fingerprint.active_repo_id != next_fingerprint.active_repo_id;
 
             this.notify_fingerprint = next_fingerprint;
+            if this.state.sidebar_mode != next.sidebar_mode {
+                this.sidebar_scroll_animation = None;
+                this.pending_sidebar_navigation = None;
+            }
+            this.sync_shared_sidebar_preferences(&next, cx);
             this.state = next;
+            if this
+                .explorer_pending_focus
+                .as_ref()
+                .is_some_and(|(id, path)| {
+                    this.active_repo_id() != Some(*id)
+                        || this.active_repo().is_some_and(|repo| {
+                            repo.file_browser.selection.focused.as_ref() == Some(path)
+                        })
+                })
+            {
+                this.explorer_pending_focus = None;
+            }
+            if selected_remote_branch_is_missing(&this.state, this.selected_branch.as_ref()) {
+                this.selected_branch = None;
+                this.selected_branch_pin_key = None;
+            }
             this.dispatch_sidebar_data_request_if_needed(cx);
 
             // Reflect the newly-active repo's stored search query in the input.
             // Guarded by repo change so it never fights per-keystroke edits.
             if repo_changed {
+                this.sticky_context = None;
+                this.pending_sidebar_navigation = None;
+                this.sidebar_scroll_animation = None;
+                this.branches_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+                this.inactive_branches_scroll
+                    .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
                 this.sync_search_input_with_state(cx);
             }
 
@@ -340,6 +530,7 @@ impl SidebarPaneView {
             TextInput::new_inert(
                 TextInputOptions {
                     placeholder: "Search files...".into(),
+                    leading_icon: Some("icons/zoom.svg"),
                     chromeless: true,
                     multiline: true,
                     ..Default::default()
@@ -348,8 +539,9 @@ impl SidebarPaneView {
             )
         });
         let store_for_search = Arc::clone(&store);
-        let search_input_subscription =
-            cx.observe(&file_browser_search_input, move |this, input, cx| {
+        let search_input_subscription = cx.subscribe(
+            &file_browser_search_input,
+            move |this, input, _: &crate::kit::TextInputChanged, cx| {
                 // The TextInput entity owns its text (uncontrolled). We only read
                 // the typed value and mirror it into app state for filtering — we
                 // never write back into the input on a keystroke, which would reset
@@ -365,37 +557,13 @@ impl SidebarPaneView {
                     });
                 }
                 cx.notify();
-            });
+            },
+        );
 
         let branch_filter_input = cx.new(|cx| {
             TextInput::new_inert(
                 TextInputOptions {
-                    placeholder: "Filter branches...".into(),
-                    leading_icon: Some("icons/git_branch.svg"),
-                    chromeless: true,
-                    ..Default::default()
-                },
-                cx,
-            )
-        });
-        let branch_filter_subscription =
-            cx.observe(&branch_filter_input, move |this, input, cx| {
-                // The input owns its text (uncontrolled); mirror it into the
-                // local query used by the row builder, never writing back.
-                let text = input.read(cx).text().to_string();
-                if this.branch_filter_query != text {
-                    this.branch_filter_query = text;
-                    this.branches_scroll
-                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
-                    this.sync_popover_branch_filter(cx);
-                    cx.notify();
-                }
-            });
-
-        let collapsed_popover_filter_input = cx.new(|cx| {
-            TextInput::new_inert(
-                TextInputOptions {
-                    placeholder: "Filter branches...".into(),
+                    placeholder: "Search sidebar...".into(),
                     leading_icon: Some("icons/zoom.svg"),
                     chromeless: true,
                     ..Default::default()
@@ -403,53 +571,99 @@ impl SidebarPaneView {
                 cx,
             )
         });
-        let collapsed_popover_filter_subscription =
-            cx.observe(&collapsed_popover_filter_input, move |this, input, cx| {
-                // Uncontrolled, like the sidebar filter: mirror the text into the
-                // query the popover presentation builder reads, never writing back.
+        let branch_filter_subscription = cx.subscribe(
+            &branch_filter_input,
+            move |this, input, _: &crate::kit::TextInputChanged, cx| {
+                // The input owns its text (uncontrolled); mirror it into the
+                // local query used by the row builder, never writing back.
                 let text = input.read(cx).text().to_string();
-                if this.collapsed_popover_filter_query != text {
-                    this.collapsed_popover_filter_query = text;
-                    this.collapsed_popover_scroll
-                        .set_offset(gpui::point(px(0.0), px(0.0)));
+                if this.branch_filter_query != text {
+                    this.sticky_context = None;
+                    this.pending_sidebar_navigation = None;
+                    this.sidebar_scroll_animation = None;
+                    this.branch_filter_query = text;
+                    this.branches_scroll
+                        .scroll_to_item(0, gpui::ScrollStrategy::Top);
+                    this.sync_popover_branch_filter(cx);
                     cx.notify();
                 }
-            });
+            },
+        );
 
         let mut this = Self {
+            explorer_focus: cx.focus_handle(),
+            explorer_pending_focus: None,
+            explorer_name_input: cx.new(|cx| {
+                TextInput::new_inert(
+                    TextInputOptions {
+                        placeholder: "Name".into(),
+                        chromeless: true,
+                        ..Default::default()
+                    },
+                    cx,
+                )
+            }),
+            explorer_name_edit: None,
+            explorer_cut_cache: std::cell::RefCell::new(None),
+            explorer_drop_target: None,
+            explorer_drop_region: Default::default(),
+            explorer_drag_repo: None,
+            explorer_drop_row: None,
+            explorer_hover_task: None,
+            explorer_scroll_task: None,
+            explorer_empty_bounds: Rc::new(Cell::new(None)),
+            contributions: contributions::SidebarContributions::new(cx),
             store,
             state,
             theme,
+            sidebar_focus: cx.focus_handle(),
             _ui_model_subscription: subscription,
             branches_scroll: UniformListScrollHandle::default(),
+            inactive_branches_scroll: UniformListScrollHandle::default(),
+            sticky_context: None,
+            sidebar_selection_cache: None,
+            pending_sidebar_navigation: None,
+            sidebar_scroll_animation: None,
+            expanded_branches_visible: false,
             file_browser_scroll: UniformListScrollHandle::default(),
-            collapsed_popover_scroll: gpui::ScrollHandle::new(),
             file_browser_search_input,
             _search_input_subscription: search_input_subscription,
             branch_filter_input,
             branch_filter_query: String::new(),
             _branch_filter_subscription: branch_filter_subscription,
-            collapsed_popover_filter_open: false,
-            collapsed_popover_filter_input,
-            collapsed_popover_filter_query: String::new(),
-            _collapsed_popover_filter_subscription: collapsed_popover_filter_subscription,
-            sidebar_presentation_cache: SidebarPresentationCache::default(),
+            branch_search_open: false,
+            file_search_open: false,
+            branch_search_options: TextSearchOptions::default(),
+            file_matchers_cache: Default::default(),
+            file_match_count_cache: Default::default(),
+            section_locator_cache: Default::default(),
+            sidebar_presentation_cache,
             path_display_cache: std::cell::RefCell::new(path_display::PathDisplayCache::default()),
             sidebar_collapsed_items_by_repo,
             sidebar_pinned_branches_by_repo,
+            extension_tabs: None,
             root_view,
             tooltip_host,
             notify_fingerprint: initial_fingerprint,
             sidebar_request_fingerprint: SidebarRequestFingerprint::default(),
             active_context_menu_invoker: None,
             selected_branch: None,
-            file_search_options: DiffSearchOptions::default(),
+            selected_branch_pin_key: None,
+            file_search_options: TextSearchOptions::default(),
             file_browser_rows_cache: std::cell::RefCell::new(None),
-            collapsed_popover_presentation: None,
+            file_browser_status_cache: Default::default(),
             collapsed_popover_section: None,
             pending_file_browser_reveal: None,
             pending_file_browser_reveal_at: None,
+            #[cfg(any(test, feature = "benchmarks"))]
+            render_count: 0,
+            #[cfg(any(test, feature = "benchmarks"))]
+            rendered_rows: 0,
         };
+        let initial_state = Arc::clone(&this.state);
+        this.state = Arc::new(AppState::default());
+        this.sync_shared_sidebar_preferences(&initial_state, cx);
+        this.state = initial_state;
         this.dispatch_sidebar_data_request_if_needed(cx);
         // Reflect any already-active repo's stored search query on first mount.
         this.sync_search_input_with_state(cx);
@@ -462,8 +676,9 @@ impl SidebarPaneView {
     }
 
     /// Sync the section this pane should render as collapsed-rail popover content.
-    /// No `cx.notify()`: the root re-renders (and re-embeds this pane) whenever the
-    /// value changes, so an extra notify would only cause a redundant paint.
+    /// Notifies on change: the expanded pane is mounted as a cached view, which
+    /// only re-renders when it is marked dirty, so a silent field change could
+    /// leave a stale frame on screen.
     pub(in super::super) fn set_collapsed_popover_section(
         &mut self,
         section: Option<CollapsedSidebarSection>,
@@ -472,16 +687,19 @@ impl SidebarPaneView {
         if self.collapsed_popover_section == section {
             return;
         }
+        if self.collapsed_popover_section.is_some() != section.is_some() {
+            std::mem::swap(
+                &mut self.branches_scroll,
+                &mut self.inactive_branches_scroll,
+            );
+        }
+        self.sidebar_scroll_animation = None;
         self.collapsed_popover_section = section;
-        self.reset_collapsed_popover_filter(cx);
-    }
-
-    fn toggle_file_search_option(
-        &mut self,
-        toggle: impl FnOnce(&mut DiffSearchOptions),
-        cx: &mut gpui::Context<Self>,
-    ) {
-        toggle(&mut self.file_search_options);
+        self.sticky_context = None;
+        if section.is_some() {
+            self.branches_scroll
+                .scroll_to_item_strict(0, gpui::ScrollStrategy::Top);
+        }
         cx.notify();
     }
 
@@ -496,6 +714,9 @@ impl SidebarPaneView {
         let input_text = self
             .file_browser_search_input
             .read_with(cx, |i: &TextInput, _cx| i.text().to_string());
+        if !query.trim().is_empty() {
+            self.file_search_open = true;
+        }
         if input_text != query {
             self.file_browser_search_input
                 .update(cx, |input: &mut TextInput, cx| {
@@ -519,24 +740,49 @@ impl SidebarPaneView {
     pub(in super::super) fn set_selected_branch(
         &mut self,
         repo_id: RepoId,
-        section: BranchSection,
-        name: &str,
+        target: BranchMenuTarget,
+        pin_key: Option<SharedString>,
         cx: &mut gpui::Context<Self>,
     ) {
-        let next = Some(SelectedBranch {
-            repo_id,
-            section,
-            name: name.to_string(),
-        });
-        if self.selected_branch.as_ref() == next.as_ref() {
+        let next = Some(SelectedBranch { repo_id, target });
+        let released_click = self.clear_sidebar_click_target();
+        if self.selected_branch.as_ref() == next.as_ref()
+            && self.selected_branch_pin_key == pin_key
+            && !released_click
+        {
             return;
         }
         self.selected_branch = next;
+        self.selected_branch_pin_key = pin_key;
+        cx.notify();
+    }
+
+    /// Apply the single-click outcome shared by a rendered branch row and any
+    /// action that promises to behave like one.
+    pub(in super::super) fn select_branch_and_reveal_tip(
+        &mut self,
+        repo_id: RepoId,
+        target: BranchMenuTarget,
+        commit_id: CommitId,
+        fallback_scope: Option<LogScope>,
+        pin_key: Option<SharedString>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.set_selected_branch(repo_id, target.clone(), pin_key, cx);
+        self.reveal_branch_commit_in_history(repo_id, target, commit_id, fallback_scope, cx);
         cx.notify();
     }
 
     pub(in super::super) fn selected_branch(&self) -> Option<&SelectedBranch> {
         self.selected_branch.as_ref()
+    }
+
+    pub(in super::super) fn selected_branch_for_row(
+        &self,
+        pin_key: Option<&SharedString>,
+    ) -> Option<&SelectedBranch> {
+        self.selected_branch()
+            .filter(|_| self.selected_branch_pin_key.as_ref() == pin_key)
     }
 
     pub(in super::super) fn active_repo_id(&self) -> Option<RepoId> {
@@ -580,6 +826,15 @@ impl SidebarPaneView {
     /// it from the filter input's subscription, which a headless test has no
     /// way to drive.
     #[cfg(test)]
+    pub(in crate::view) fn list_scroll_for_test(&self) -> gpui::ScrollHandle {
+        if self.collapsed_popover_section == Some(CollapsedSidebarSection::Files) {
+            self.file_browser_scroll.0.borrow().base_handle.clone()
+        } else {
+            self.branches_scroll.0.borrow().base_handle.clone()
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::view) fn set_branch_filter_query_for_test(&mut self, query: &str) {
         self.branch_filter_query = query.to_string();
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
@@ -600,16 +855,72 @@ impl SidebarPaneView {
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
     }
 
-    pub(in super::super) fn saved_sidebar_collapsed_items(
-        &self,
-    ) -> BTreeMap<std::path::PathBuf, BTreeSet<String>> {
-        self.sidebar_collapsed_items_by_repo
-            .iter()
-            .filter(|&(_repo, items)| !items.is_empty())
-            .map(|(repo, items)| (repo.clone(), items.clone()))
-            .collect()
+    fn sync_shared_sidebar_preferences(&mut self, next: &AppState, cx: &mut gpui::Context<Self>) {
+        let mut changed = false;
+        for repo in &next.repos {
+            let Some(snapshot) = &repo.shared_preferences else {
+                continue;
+            };
+            if self
+                .state
+                .repos
+                .iter()
+                .find(|old| old.id == repo.id)
+                .and_then(|old| old.shared_preferences.as_ref())
+                .is_some_and(|old| old.revision == snapshot.revision && old.key == snapshot.key)
+            {
+                continue;
+            }
+            let path = repo.spec.workdir.clone();
+            self.sidebar_pinned_branches_by_repo
+                .insert(path.clone(), snapshot.preferences.pinned_items.clone());
+            let items = self
+                .sidebar_collapsed_items_by_repo
+                .entry(path)
+                .or_default();
+            items.retain(|key| branch_sidebar::is_top_level_collapse_key(key));
+            items.extend(snapshot.preferences.collapsed_items.iter().cloned());
+            changed = true;
+        }
+        if changed {
+            self.sidebar_presentation_cache = SidebarPresentationCache::default();
+            self.sync_popover_pinned_branches(cx);
+            self.sync_popover_collapsed_items(cx);
+        }
     }
 
+    fn publish_sidebar_collapse_changes(&self, repo_id: RepoId, before: &BTreeSet<String>) {
+        let Some(repo) = self.state.repos.iter().find(|repo| repo.id == repo_id) else {
+            return;
+        };
+        let after = self
+            .sidebar_collapsed_items_by_repo
+            .get(&repo.spec.workdir)
+            .cloned()
+            .unwrap_or_default();
+        let persistent = |key: &&String| !branch_sidebar::is_top_level_collapse_key(key);
+        let added = after
+            .difference(before)
+            .filter(persistent)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let removed = before
+            .difference(&after)
+            .filter(persistent)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        if !added.is_empty() || !removed.is_empty() {
+            self.store.dispatch(Msg::UpdateRepositoryPreference {
+                repo_id,
+                update: gitcomet_state::model::RepositoryPreferenceUpdate::CollapseItems {
+                    added,
+                    removed,
+                },
+            });
+        }
+    }
+
+    #[cfg(test)]
     pub(in super::super) fn saved_sidebar_pinned_branches(
         &self,
     ) -> BTreeMap<std::path::PathBuf, BTreeSet<String>> {
@@ -627,11 +938,23 @@ impl SidebarPaneView {
         name: &str,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.toggle_sidebar_pin(
+            repo_id,
+            branch_sidebar::branch_pin_storage_key(section, name),
+            cx,
+        );
+    }
+
+    pub(in crate::view) fn toggle_sidebar_pin(
+        &mut self,
+        repo_id: RepoId,
+        key: String,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let Some(repo) = self.state.repos.iter().find(|r| r.id == repo_id) else {
             return;
         };
         let repo_path = repo.spec.workdir.clone();
-        let key = branch_sidebar::branch_pin_storage_key(section, name);
 
         let items = self
             .sidebar_pinned_branches_by_repo
@@ -645,7 +968,14 @@ impl SidebarPaneView {
         }
 
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
-        self.schedule_ui_settings_persist(cx);
+        let pinned = self
+            .sidebar_pinned_branches_by_repo
+            .get(&repo_path)
+            .is_some_and(|items| items.contains(&key));
+        self.store.dispatch(Msg::UpdateRepositoryPreference {
+            repo_id,
+            update: gitcomet_state::model::RepositoryPreferenceUpdate::Pin { key, pinned },
+        });
         self.sync_popover_pinned_branches(cx);
         cx.notify();
     }
@@ -664,26 +994,50 @@ impl SidebarPaneView {
         section: BranchSection,
         cx: &mut gpui::Context<Self>,
     ) {
+        let filter = self.branch_filter_query.clone();
+        self.unpin_branches_matching(repo_id, section, &filter, cx);
+    }
+
+    pub(in crate::view) fn unpin_branches_matching(
+        &mut self,
+        repo_id: RepoId,
+        section: BranchSection,
+        filter: &str,
+        cx: &mut gpui::Context<Self>,
+    ) {
         let Some(repo) = self.state.repos.iter().find(|r| r.id == repo_id) else {
             return;
         };
         let repo_path = repo.spec.workdir.clone();
-        let filter = self.branch_filter_query.as_str();
         let Some(items) = self.sidebar_pinned_branches_by_repo.get_mut(&repo_path) else {
             return;
         };
 
-        let before = items.len();
-        items.retain(|key| !branch_sidebar::pinned_branch_renders(repo, key, section, filter));
-        if items.len() == before {
+        let before = items.clone();
+        for row in branch_sidebar::matching_pinned_roots(
+            repo,
+            items,
+            &crate::view::sidebar_search::SidebarSearch::new(filter, self.branch_search_options),
+        ) {
+            if let Some((candidate, key)) = branch_sidebar::pinned_row_storage_key(&row)
+                && candidate == section
+            {
+                items.remove(&key);
+            }
+        }
+        if *items == before {
             return;
         }
+        let removed = before.difference(items).cloned().collect();
         if items.is_empty() {
             self.sidebar_pinned_branches_by_repo.remove(&repo_path);
         }
 
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
-        self.schedule_ui_settings_persist(cx);
+        self.store.dispatch(Msg::UpdateRepositoryPreference {
+            repo_id,
+            update: gitcomet_state::model::RepositoryPreferenceUpdate::RemovePins(removed),
+        });
         self.sync_popover_pinned_branches(cx);
         cx.notify();
     }
@@ -696,11 +1050,12 @@ impl SidebarPaneView {
     /// are not on screen.
     fn sync_popover_branch_filter(&self, cx: &mut gpui::Context<Self>) {
         let query = self.branch_filter_query.clone();
+        let options = self.branch_search_options;
         let root_view = self.root_view.clone();
         cx.defer(move |cx| {
             let _ = root_view.update(cx, |root, cx| {
                 root.popover_host.update(cx, |host, cx| {
-                    host.set_branch_filter_query(query, cx);
+                    host.set_branch_search(query, options, cx);
                 });
             });
         });
@@ -737,12 +1092,6 @@ impl SidebarPaneView {
         });
     }
 
-    fn schedule_ui_settings_persist(&mut self, cx: &mut gpui::Context<Self>) {
-        let _ = self.root_view.update(cx, |root, cx| {
-            root.schedule_ui_settings_persist(cx);
-        });
-    }
-
     pub(in super::super) fn toggle_active_repo_collapse_key(
         &mut self,
         collapse_key: SharedString,
@@ -753,7 +1102,7 @@ impl SidebarPaneView {
 
     /// Drive a collapse key to an explicit state instead of flipping it.
     ///
-    /// The pinned sections render force-expanded while a branch filter is live,
+    /// Branch groups render force-expanded while a branch filter is live,
     /// no matter what the stored key says, so a menu labelling itself from the
     /// rendered state has to send the state it means — a flip would move the
     /// key the opposite way from the label the user clicked.
@@ -787,6 +1136,11 @@ impl SidebarPaneView {
             return;
         }
 
+        let before = self
+            .sidebar_collapsed_items_by_repo
+            .get(&repo_path)
+            .cloned()
+            .unwrap_or_default();
         let items = self
             .sidebar_collapsed_items_by_repo
             .entry(repo_path.clone())
@@ -804,7 +1158,13 @@ impl SidebarPaneView {
         );
 
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
-        self.schedule_ui_settings_persist(cx);
+        // Explicit expansion changes retain the offset; only data refreshes
+        // restore a content anchor. GPUI still clamps a shortened list.
+        self.sticky_context = None;
+        self.pending_sidebar_navigation = None;
+        self.sidebar_scroll_animation = None;
+        self.branches_scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        self.publish_sidebar_collapse_changes(repo_id, &before);
         self.sync_popover_collapsed_items(cx);
         if should_load_submodules_on_expand && expanded_now {
             self.store.dispatch(Msg::LoadSubmodules { repo_id });
@@ -830,7 +1190,7 @@ impl SidebarPaneView {
             return;
         };
         let path = path.trim();
-        if path.is_empty() {
+        if path.is_empty() && (section != BranchSection::Remote || remote.is_none()) {
             return;
         }
 
@@ -864,10 +1224,20 @@ impl SidebarPaneView {
         };
 
         let repo_path = repo.spec.workdir.clone();
+        let repo_id = repo.id;
+        let before = self
+            .sidebar_collapsed_items_by_repo
+            .get(&repo_path)
+            .cloned()
+            .unwrap_or_default();
         let items = self
             .sidebar_collapsed_items_by_repo
             .entry(repo_path.clone())
             .or_default();
+        if path.is_empty() {
+            let key = branch_sidebar::remote_header_storage_key(remote.as_deref().unwrap());
+            branch_sidebar::set_collapse_state(items, &key, collapsed);
+        }
         for group_path in &group_paths {
             let key = match section {
                 BranchSection::Local => branch_sidebar::local_group_storage_key(group_path),
@@ -883,16 +1253,34 @@ impl SidebarPaneView {
         }
 
         self.sidebar_presentation_cache = SidebarPresentationCache::default();
-        self.schedule_ui_settings_persist(cx);
+        self.sticky_context = None;
+        self.pending_sidebar_navigation = None;
+        self.sidebar_scroll_animation = None;
+        self.branches_scroll.0.borrow_mut().deferred_scroll_to_item = None;
+        self.publish_sidebar_collapse_changes(repo_id, &before);
         self.sync_popover_collapsed_items(cx);
         self.dispatch_sidebar_data_request_if_needed(cx);
         cx.notify();
+    }
+
+    pub(in crate::view) fn set_expanded_branches_visible(
+        &mut self,
+        visible: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.expanded_branches_visible = visible;
+        if !visible {
+            self.sidebar_scroll_animation = None;
+            self.pending_sidebar_navigation = None;
+        }
+        self.dispatch_sidebar_data_request_if_needed(cx);
     }
 
     fn dispatch_sidebar_data_request_if_needed(&mut self, cx: &mut gpui::Context<Self>) {
         let next = sidebar_presentation::sidebar_request_fingerprint(
             self.state.as_ref(),
             &self.sidebar_collapsed_items_by_repo,
+            self.expanded_branches_visible && self.state.sidebar_mode == SidebarMode::Branches,
         );
         if next == self.sidebar_request_fingerprint {
             return;
@@ -902,6 +1290,7 @@ impl SidebarPaneView {
         let Some((repo_id, request)) = sidebar_presentation::active_sidebar_data_request(
             self.state.as_ref(),
             &self.sidebar_collapsed_items_by_repo,
+            self.expanded_branches_visible && self.state.sidebar_mode == SidebarMode::Branches,
         ) else {
             return;
         };
@@ -913,31 +1302,99 @@ impl SidebarPaneView {
     pub(in super::super) fn branch_sidebar_presentation_cached(
         &mut self,
     ) -> Option<SidebarPresentation> {
-        sidebar_presentation::build_sidebar_presentation(
+        let presentation = sidebar_presentation::build_sidebar_presentation_scoped(
             &mut self.sidebar_presentation_cache,
             self.state.as_ref(),
             &self.sidebar_collapsed_items_by_repo,
             &self.sidebar_pinned_branches_by_repo,
             &self.branch_filter_query,
-        )
+            self.branch_search_options,
+            self.collapsed_popover_section
+                .and_then(|section| section.storage_key()),
+        )?;
+        let presentation = if self.collapsed_popover_section.is_none() {
+            match &mut self.contributions {
+                Some(contributions) => contributions.project(presentation),
+                None => presentation,
+            }
+        } else {
+            presentation
+        };
+        self.update_sticky_context(&presentation);
+        Some(presentation)
+    }
+
+    /// Shows Branches or Files (`None`) or contributed tab `index`.
+    /// Deferred: a tab is clicked inside this pane's update, and the root
+    /// updates this pane again as the selection changes.
+    fn select_routed_tab(
+        &self,
+        index: Option<usize>,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let root = self.root_view.clone();
+        window.defer(cx, move |window, cx| {
+            let _ = root.update(cx, |root, cx| {
+                root.select_routed_view(
+                    crate::view::repository_views::RoutedArea::Sidebar,
+                    index,
+                    window,
+                    cx,
+                )
+            });
+        });
+    }
+
+    /// The window's routing of contributed tabs for the active repository.
+    pub(in crate::view) fn set_extension_tabs(
+        &mut self,
+        tabs: Option<SidebarExtensionTabs>,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let same = match (&self.extension_tabs, &tabs) {
+            (Some(current), Some(next)) => current.same(next),
+            (None, None) => true,
+            _ => false,
+        };
+        if !same {
+            self.extension_tabs = tabs;
+            cx.notify();
+        }
     }
 
     pub(in super::super) fn sidebar(&mut self, cx: &mut gpui::Context<Self>) -> gpui::Div {
+        self.sync_contributed_rows(cx);
         let theme = self.theme;
 
         self.apply_pending_file_browser_reveal(cx);
         let tab_bar = self.render_tab_bar(theme, cx);
         let mode = self.state.sidebar_mode;
-        let content = match mode {
-            SidebarMode::Branches => self.render_branches_content(theme, cx),
-            SidebarMode::Files => self.render_file_browser_content(theme, cx),
+        let contributed = self
+            .extension_tabs
+            .as_ref()
+            .filter(|tabs| tabs.showing().is_some())
+            .and_then(|tabs| tabs.view.clone());
+        let content = match (contributed, mode) {
+            (Some(view), _) => div()
+                .flex_1()
+                .min_h(px(0.0))
+                .debug_selector(|| "sidebar_extension_tab_content".to_string())
+                .child(view)
+                .into_any_element(),
+            (None, SidebarMode::Branches) => self.render_branches_content(theme, cx),
+            (None, SidebarMode::Files) => self.render_file_browser_content(theme, cx),
         };
 
+        // `size_full`, not just `h_full`: mounted as a cached view this is laid
+        // out as a root against the pane's bounds, where an auto width would
+        // shrink to the content instead of stretching like a flex child does.
         div()
             .flex()
             .flex_col()
-            .h_full()
+            .size_full()
             .min_h(px(0.0))
+            .on_key_down(cx.listener(Self::on_sidebar_key_down))
             .child(tab_bar)
             .child(content)
     }
@@ -953,18 +1410,14 @@ impl SidebarPaneView {
     ) -> AnyElement {
         let theme = self.theme;
         let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let ui_scale = ui_scale::UiScale::current(cx);
+        let scaled_px = ui_scale::scaler(ui_scale_percent);
 
-        // Only the branch sections carry a filter; Files has its own always-visible
-        // search bar, and the remaining sections have nothing to narrow.
-        let filterable = section.branch_section().is_some();
-        let filter_open = filterable && self.collapsed_popover_filter_open;
-
-        // Every section but Files has the same header menu the expanded sidebar
-        // hangs off its section row (add a worktree, stash, submodule, ...). The
-        // rail popover shows only the section's rows, so without this button —
-        // and the right-click on the panel behind it — those actions would be
-        // out of reach while the sidebar is collapsed.
+        // Every section has the same header menu the expanded sidebar hangs off
+        // its section row or tab strip (add a worktree, stash, Files settings,
+        // ...). The rail popover shows only the section's rows, so without this
+        // button — and the right-click on the panel behind it — those actions
+        // would be out of reach while the sidebar is collapsed.
         let section_menu = self
             .active_repo_id()
             .and_then(|repo_id| section.section_menu(repo_id));
@@ -978,8 +1431,6 @@ impl SidebarPaneView {
             .flex_row()
             .items_center()
             .pl(scaled_px(10.0))
-            // Keep the vertical metrics of the plain title so the sections
-            // without a toggle (Files especially) lay out exactly as before.
             .pr(scaled_px(6.0))
             .pt(scaled_px(8.0))
             .pb(scaled_px(6.0))
@@ -987,52 +1438,23 @@ impl SidebarPaneView {
                 div()
                     .flex_1()
                     .min_w(px(0.0))
-                    .text_size(scaled_px(12.0))
+                    .text_size(theme.ui_text(12.0))
                     .font_weight(FontWeight::BOLD)
                     .text_color(theme.colors.foreground.primary)
                     .child(section.title()),
             )
-            .when(filterable, |header| {
-                header.child(
-                    components::Button::new("collapsed_popover_filter_toggle", "")
-                        .borderless()
-                        .style(components::ButtonStyle::Subtle)
-                        .selected(filter_open)
-                        .selected_bg(with_alpha(
-                            theme.colors.accent.foreground,
-                            if theme.is_dark { 0.34 } else { 0.24 },
-                        ))
-                        .start_slot(crate::view::icons::svg_icon(
-                            "icons/zoom.svg",
-                            if filter_open {
-                                theme.colors.foreground.primary
-                            } else {
-                                theme.colors.foreground.secondary
-                            },
-                            scaled_px(13.0),
-                        ))
-                        .on_click(theme, cx, move |this, _e, window, cx| {
-                            this.toggle_collapsed_popover_filter(window, cx);
-                        })
-                        .w(scaled_px(22.0))
-                        .h(scaled_px(22.0))
-                        .gitcomet_tooltip(
-                            theme,
-                            if filter_open {
-                                "Hide filter".into()
-                            } else {
-                                "Filter branches".into()
-                            },
-                        )
-                        .debug_selector(|| "collapsed_popover_filter_toggle".to_string()),
-                )
-            })
+            .child(self.render_search_toggle(
+                section == CollapsedSidebarSection::Files,
+                "collapsed_popover_filter_toggle",
+                cx,
+            ))
+            .child(self.render_section_locator(section, cx))
             .when_some(section_menu.clone(), |header, (invoker, kind)| {
                 header.child(
                     components::Button::new("collapsed_popover_section_menu", "")
                         .borderless()
                         .style(components::ButtonStyle::Subtle)
-                        .selected(section_menu_active)
+                        .open(section_menu_active)
                         .selected_bg(with_alpha(
                             theme.colors.accent.foreground,
                             if theme.is_dark { 0.34 } else { 0.24 },
@@ -1047,316 +1469,57 @@ impl SidebarPaneView {
                             scaled_px(15.0),
                         ))
                         .on_click(theme, cx, move |this, e, window, cx| {
-                            this.activate_context_menu_invoker(invoker.clone(), cx);
-                            this.open_popover_at(kind.clone(), e.position(), window, cx);
+                            this.open_popover_at(
+                                kind.clone().invoked_by(invoker.clone()),
+                                e.position(),
+                                window,
+                                cx,
+                            );
                         })
-                        .w(scaled_px(22.0))
-                        .h(scaled_px(22.0))
+                        .w(components::control_height(ui_scale))
+                        .h(components::control_height(ui_scale))
                         .gitcomet_tooltip(theme, "More actions".into())
                         .debug_selector(|| "collapsed_popover_section_menu".to_string()),
                 )
             });
 
-        let filter_bar = filter_open.then(|| self.render_collapsed_popover_filter_bar(theme, cx));
-
-        let divider = div()
-            .flex_none()
-            .h(px(1.0))
-            .w_full()
-            .bg(theme.colors.stroke.subtle);
-
-        let is_files = matches!(section, CollapsedSidebarSection::Files);
-        let collapsed_popover_scroll = self.collapsed_popover_scroll.clone();
-
-        let surface = div()
+        self.apply_pending_file_browser_reveal(cx);
+        let content = if section == CollapsedSidebarSection::Files {
+            self.render_file_browser_content(theme, cx)
+        } else {
+            self.render_branches_content(theme, cx)
+        };
+        let _ = window;
+        div()
             .id("collapsed_sidebar_popover_content")
             .debug_selector(|| "collapsed_sidebar_popover_content".to_string())
             .flex()
             .flex_col()
-            .flex_1()
+            .size_full()
             .min_h(px(0.0))
-            // The rows are rendered by this entity, so scrolling must live here;
-            // an overflow container in the parent entity cannot measure them.
-            .overflow_y_scroll()
-            .track_scroll(&collapsed_popover_scroll)
-            // Establish the base text color for the popover subtree. Rows that rely
-            // on the ambient color (e.g. worktree path labels) would otherwise fall
-            // back to the default text style across the panel/entity boundary and
-            // render near-black.
             .text_color(theme.colors.foreground.primary)
+            .track_focus(&self.sidebar_focus)
+            .on_key_down(cx.listener(Self::on_sidebar_key_down))
             .child(title)
-            .child(divider)
-            .children(filter_bar);
-
-        let content = if is_files {
-            self.render_collapsed_popover_file_section(theme, window, cx)
-        } else {
-            self.render_collapsed_popover_branch_section(section, window, cx)
-        };
-        let scrollbar = components::Scrollbar::new(
-            "collapsed_sidebar_popover_scrollbar",
-            collapsed_popover_scroll,
-        );
-        #[cfg(test)]
-        let scrollbar = scrollbar.debug_selector("collapsed_sidebar_popover_scrollbar");
-
-        // Keep the scrollbar outside the moving surface. If it is a child of the
-        // surface, GPUI applies the content scroll offset to the track itself.
-        div()
-            .relative()
-            .flex()
-            .flex_col()
-            .min_h(px(0.0))
-            .text_color(theme.colors.foreground.primary)
-            .child(surface.child(content))
-            .child(scrollbar.render(theme))
-            .into_any()
-    }
-
-    /// The filter field revealed by the popover header's magnifier. It sits below
-    /// the header, above every branch row, and filters both branch sections.
-    fn render_collapsed_popover_filter_bar(
-        &mut self,
-        theme: AppTheme,
-        cx: &mut gpui::Context<Self>,
-    ) -> gpui::Div {
-        let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let has_query = !self.collapsed_popover_filter_query.trim().is_empty();
-        div()
-            .flex_none()
-            .px(scaled_px(8.0))
-            .pt(scaled_px(8.0))
-            .pb(scaled_px(2.0))
-            .debug_selector(|| "collapsed_popover_filter_bar".to_string())
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .min_h(scaled_px(28.0))
-                    .pl(scaled_px(8.0))
-                    .pr(scaled_px(2.0))
-                    .rounded(px(theme.radii.control))
-                    .border_1()
-                    .border_color(theme.colors.stroke.default)
-                    .bg(theme.colors.surface.panel)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .py(scaled_px(4.0))
-                            .child(self.collapsed_popover_filter_input.clone()),
-                    )
-                    .when(has_query, |row| {
-                        row.child(
-                            components::Button::new("collapsed_popover_filter_clear", "")
-                                .borderless()
-                                .style(components::ButtonStyle::Subtle)
-                                .start_slot(crate::view::icons::svg_icon(
-                                    "icons/generic_close.svg",
-                                    theme.colors.foreground.secondary,
-                                    scaled_px(12.0),
-                                ))
-                                .on_click(theme, cx, |this, _e, _w, cx| {
-                                    this.clear_collapsed_popover_filter(cx);
-                                })
-                                .w(scaled_px(24.0))
-                                .h(scaled_px(24.0))
-                                .gitcomet_tooltip(theme, "Clear filter".into())
-                                .debug_selector(|| "collapsed_popover_filter_clear".to_string()),
-                        )
-                    }),
-            )
-    }
-
-    /// Show/hide the popover filter. Opening focuses the field so the user can
-    /// type straight away; closing drops the query so the rows come back.
-    fn toggle_collapsed_popover_filter(
-        &mut self,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        self.collapsed_popover_filter_open = !self.collapsed_popover_filter_open;
-        if self.collapsed_popover_filter_open {
-            let focus_handle = self.collapsed_popover_filter_input.read(cx).focus_handle();
-            window.focus(&focus_handle, cx);
-        } else {
-            self.clear_collapsed_popover_filter(cx);
-        }
-        cx.notify();
-    }
-
-    fn clear_collapsed_popover_filter(&mut self, cx: &mut gpui::Context<Self>) {
-        if self.collapsed_popover_filter_query.is_empty() {
-            return;
-        }
-        self.collapsed_popover_filter_input.update(cx, |input, cx| {
-            input.set_text("", cx);
-        });
-        self.collapsed_popover_filter_query.clear();
-        cx.notify();
-    }
-
-    /// Reset the popover filter when the rail opens a different section (or the
-    /// popover closes), so a stale query never greets the next section.
-    pub(in super::super) fn reset_collapsed_popover_filter(
-        &mut self,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        self.clear_collapsed_popover_filter(cx);
-        if self.collapsed_popover_filter_open {
-            self.collapsed_popover_filter_open = false;
-            cx.notify();
-        }
-    }
-
-    fn render_collapsed_popover_file_section(
-        &mut self,
-        theme: AppTheme,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> AnyElement {
-        let search_bar = self.render_file_browser_search_bar(theme, cx);
-        let visible_rows = self.file_browser_visible_rows(cx);
-        let body: AnyElement = if visible_rows.is_empty() {
-            let message = match self.active_repo() {
-                None => "No repository selected.",
-                Some(repo) => match &repo.file_browser.entries {
-                    Loadable::NotLoaded | Loadable::Loading => "Loading files...",
-                    Loadable::Ready(entries) if entries.is_empty() => "Empty repository.",
-                    Loadable::Ready(_) => "No files visible.",
-                    Loadable::Error(_) => "Error loading files.",
-                },
-            };
-            components::empty_state(theme, "Files", message).into_any_element()
-        } else {
-            let rows = Self::render_file_browser_rows(self, 0..visible_rows.len(), window, cx);
-            // Match the branch-section popovers: intrinsic eager rows, with the
-            // enclosing popover panel owning the min/max bounds and scrolling.
-            div()
-                .debug_selector(|| "collapsed_file_browser_rows".to_string())
-                .flex()
-                .flex_col()
-                .pt(px(2.0))
-                .pb(px(6.0))
-                .pl(px(components::ROW_HIGHLIGHT_INSET_PX))
-                .pr(px(components::ROW_HIGHLIGHT_INSET_PX))
-                .children(rows)
-                .into_any_element()
-        };
-
-        div()
-            .flex()
-            .flex_col()
-            .child(search_bar)
-            .child(body)
+            .child(div().flex_none().h(px(1.0)).bg(theme.colors.stroke.subtle))
+            .child(content)
             .into_any_element()
     }
 
-    fn render_collapsed_popover_branch_section(
-        &mut self,
-        section: CollapsedSidebarSection,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> AnyElement {
-        let theme = self.theme;
-        let Some(presentation) = self.build_collapsed_popover_presentation(section) else {
-            return components::empty_state(theme, section.title(), "No repository selected.")
-                .into_any_element();
-        };
-        let row_count = presentation.rows.len();
-        if row_count == 0 {
-            let filtering = self.collapsed_popover_filter_open
-                && !self.collapsed_popover_filter_query.trim().is_empty();
-            let message = if filtering {
-                "No matching branches."
-            } else {
-                "Nothing here yet."
-            };
-            return components::empty_state(theme, section.title(), message).into_any_element();
-        }
-
-        // Render the scoped rows eagerly (a single section is bounded) so the
-        // shared row renderer can reuse the transient presentation override.
-        self.collapsed_popover_presentation = Some(presentation);
-        let rows = Self::render_branch_sidebar_rows(self, 0..row_count, window, cx);
-        self.collapsed_popover_presentation = None;
-
-        // Intrinsic height: the enclosing popover panel sizes to content and owns
-        // the scroll, so this just stacks the rows.
-        div()
-            .flex()
-            .flex_col()
-            .pt(px(2.0))
-            // A little breathing room below the last row (content-sized popovers
-            // otherwise sit the last item flush against the bottom border).
-            .pb(px(6.0))
-            .pl(px(components::ROW_HIGHLIGHT_INSET_PX))
-            .pr(px(components::ROW_HIGHLIGHT_INSET_PX))
-            .children(rows)
-            .into_any_element()
-    }
-
+    #[cfg(test)]
     fn build_collapsed_popover_presentation(
         &mut self,
         section: CollapsedSidebarSection,
     ) -> Option<SidebarPresentation> {
-        // Workspace badges are collapse-independent; reuse the cached ones.
-        let base = self.branch_sidebar_presentation_cached()?;
-        let repo = self.active_repo()?;
-        let mut collapsed = self
-            .sidebar_collapsed_items_by_repo
-            .get(&repo.spec.workdir)
-            .cloned()
-            .unwrap_or_default();
-        // Force-expand the target section so its content is present regardless of
-        // the persisted collapse state (which we never mutate here).
-        if let Some(key) = section.storage_key()
-            && branch_sidebar::is_collapsed(&collapsed, key)
-        {
-            branch_sidebar::toggle_collapse_state(&mut collapsed, key);
-        }
-        // Each branch popover surfaces its matching Pinned section, so keep that
-        // one expanded regardless of the persisted collapse state.
-        let pinned_section = match section {
-            CollapsedSidebarSection::Local => Some(BranchSection::Local),
-            CollapsedSidebarSection::Remote => Some(BranchSection::Remote),
-            _ => None,
-        };
-        if let Some(pinned_section) = pinned_section {
-            let pinned_key = branch_sidebar::pinned_section_storage_key(pinned_section);
-            if branch_sidebar::is_collapsed(&collapsed, pinned_key) {
-                branch_sidebar::toggle_collapse_state(&mut collapsed, pinned_key);
-            }
-        }
-        let pinned = self
-            .sidebar_pinned_branches_by_repo
-            .get(&repo.spec.workdir)
-            .cloned()
-            .unwrap_or_default();
-        let query = if self.collapsed_popover_filter_open {
-            self.collapsed_popover_filter_query.trim()
-        } else {
-            ""
-        };
-        // While filtering, ignore every persisted collapse state: a match hidden
-        // inside a collapsed `feat/` group would make the filter look broken.
-        let collapsed = if query.is_empty() {
-            collapsed
-        } else {
-            BTreeSet::new()
-        };
-        let full = branch_sidebar::branch_sidebar_rows(repo, &collapsed, &pinned, query);
-        let scoped = if query.is_empty() {
-            section_content_rows(&full, section)
-        } else {
-            filter_result_rows(&full, section)
-        };
-        Some(SidebarPresentation {
-            rows: scoped.into(),
-            workspace_badges: base.workspace_badges,
-        })
+        sidebar_presentation::build_sidebar_presentation_scoped(
+            &mut self.sidebar_presentation_cache,
+            self.state.as_ref(),
+            &self.sidebar_collapsed_items_by_repo,
+            &self.sidebar_pinned_branches_by_repo,
+            &self.branch_filter_query,
+            self.branch_search_options,
+            section.storage_key(),
+        )
     }
 
     /// Kick off any lazy data load a section needs before it can render in the
@@ -1404,13 +1567,17 @@ impl SidebarPaneView {
                         .dispatch(Msg::LoadFileBrowser { repo_id, source });
                 }
             }
-            CollapsedSidebarSection::Local | CollapsedSidebarSection::Remote => {}
+            // Large-file support loads with the repository.
+            CollapsedSidebarSection::Local
+            | CollapsedSidebarSection::Remote
+            | CollapsedSidebarSection::Annex => {}
         }
     }
 
     fn render_tab_bar(&mut self, theme: AppTheme, cx: &mut gpui::Context<Self>) -> gpui::Div {
         let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let ui_scale = ui_scale::UiScale::current(cx);
+        let scaled_px = ui_scale::scaler(ui_scale_percent);
         let mode = self.state.sidebar_mode;
         // The Files tab's list is the thing pinned to a commit, so the header
         // above it takes the browse tint only while that list is on screen.
@@ -1424,166 +1591,185 @@ impl SidebarPaneView {
             theme.colors.surface.chrome
         };
 
-        let store_branches = Arc::clone(&self.store);
-        let store_files = Arc::clone(&self.store);
-        // `theme.colors.interaction.hover_background` is nearly identical to the sidebar chrome bg,
-        // so use the standard text-tinted overlay that reads on hover.
-        let tab_hover_bg = theme.hover_overlay();
-        // Lifts the active chip, which already carries `interaction.selected_background` and so
-        // cannot show the plain overlay the inactive one uses.
-        let tab_active_hover_bg = crate::theme::mix_colors(
-            theme.colors.interaction.selected_background,
-            theme.colors.foreground.primary,
-            if theme.is_dark { 0.08 } else { 0.05 },
-        );
-        // Same value as `ButtonStyle::Subtle`'s hover border, so the chips match
-        // the locate button sharing their strip.
-        let tab_hover_border = with_alpha(
-            theme.colors.foreground.secondary,
-            if theme.is_dark { 0.45 } else { 0.32 },
-        );
-        // On light themes `interaction.selected_background` lands almost on top
-        // of the chrome this strip paints, so a filled chip has no edge of its
-        // own and the selected tab does not read as selected at all. Give it
-        // the same selection indicator outline that selected rows and buttons
-        // already carry on light themes, at rest and on hover alike. Dark
-        // themes have the fill contrast already, so they stay borderless.
-        let tab_selected_border = if theme.is_dark {
-            gpui::rgba(0x00000000)
-        } else {
-            theme.colors.interaction.selected_indicator
-        };
-        // Hovering the selected chip must not trade its outline down for the
-        // weaker idle-hover one, so on light themes it keeps the indicator and
-        // only the fill lifts.
-        let tab_selected_hover_border = if theme.is_dark {
-            tab_hover_border
-        } else {
-            tab_selected_border
-        };
-
-        // The ids are load-bearing, not just for tests: gpui only allocates the
-        // element state that makes a `.hover()` repaint the view for *stateful*
-        // elements. On a bare `div()` the hover style is computed but nothing
-        // ever asks for a new frame, so it never reaches the screen.
-        let branches_tab = div()
-            .id("sidebar_tab_branches")
-            .debug_selector(|| "sidebar_tab_branches".to_string())
-            .flex()
-            .flex_row()
-            .items_center()
-            .px(scaled_px(8.0))
-            .h(scaled_px(22.0))
-            .rounded(px(theme.radii.control))
-            .border_1()
-            .when(mode == SidebarMode::Branches, |d| {
-                d.bg(theme.colors.interaction.selected_background)
-                    .border_color(tab_selected_border)
-                    .text_color(theme.colors.interaction.selected_foreground)
-            })
-            .when(mode != SidebarMode::Branches, |d| {
-                d.bg(gpui::transparent_black())
-                    .border_color(gpui::transparent_black())
-                    .text_color(theme.colors.foreground.secondary)
-            })
-            .hover(move |d| {
-                if mode != SidebarMode::Branches {
-                    d.border_color(tab_hover_border).bg(tab_hover_bg)
+        // A contributed tab, while it shows, takes the strip's selection.
+        let contributed = self
+            .extension_tabs
+            .as_ref()
+            .and_then(SidebarExtensionTabs::showing);
+        let store = Arc::clone(&self.store);
+        let tabs = components::SegmentedControl::new("sidebar_view_toggle")
+            .segment(
+                components::Segment::new("sidebar_tab_branches", "Branches")
+                    .icon("icons/git_branch.svg")
+                    .selected(mode == SidebarMode::Branches && contributed.is_none())
+                    .tooltip("Branches", Vec::new()),
+            )
+            .segment(
+                components::Segment::new("sidebar_tab_files", "Files")
+                    .icon("icons/folder.svg")
+                    .selected(mode == SidebarMode::Files && contributed.is_none())
+                    .tooltip("Files", Vec::new()),
+            )
+            .render(theme, ui_scale, cx, move |this, index, window, cx| {
+                let mode = if index == 0 {
+                    SidebarMode::Branches
                 } else {
-                    d.border_color(tab_selected_hover_border)
-                        .bg(tab_active_hover_bg)
+                    SidebarMode::Files
+                };
+                store.dispatch(Msg::SetSidebarMode { mode });
+                if contributed.is_some() {
+                    this.select_routed_tab(None, window, cx);
                 }
-            })
-            .cursor(CursorStyle::PointingHand)
-            .text_size(scaled_px(12.0))
-            .child("Branches")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, _e, _window, _cx| {
-                    store_branches.dispatch(Msg::SetSidebarMode {
-                        mode: SidebarMode::Branches,
-                    });
-                }),
-            );
+            });
 
-        let files_tab = div()
-            .id("sidebar_tab_files")
-            .debug_selector(|| "sidebar_tab_files".to_string())
-            .flex()
-            .flex_row()
-            .items_center()
-            .px(scaled_px(8.0))
-            .h(scaled_px(22.0))
-            .rounded(px(theme.radii.control))
-            .border_1()
-            .when(mode == SidebarMode::Files, |d| {
-                // Carry the tint onto the active chip too, so it does not read
-                // as a neutral hole punched in a tinted bar.
-                d.bg(if browsing_files {
-                    crate::theme::historical_header_bg(
-                        theme,
-                        theme.colors.interaction.selected_background,
-                    )
-                } else {
-                    theme.colors.interaction.selected_background
-                })
-                .border_color(tab_selected_border)
-                .text_color(theme.colors.interaction.selected_foreground)
-            })
-            .when(mode != SidebarMode::Files, |d| {
-                d.bg(gpui::transparent_black())
-                    .border_color(gpui::transparent_black())
-                    .text_color(theme.colors.foreground.secondary)
-            })
-            .hover(move |d| {
-                if mode != SidebarMode::Files {
-                    d.border_color(tab_hover_border).bg(tab_hover_bg)
-                } else {
-                    d.border_color(tab_selected_hover_border)
-                        .bg(tab_active_hover_bg)
-                }
-            })
-            .cursor(CursorStyle::PointingHand)
-            .text_size(scaled_px(12.0))
-            .child("Files")
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |_this, _e, _window, _cx| {
-                    store_files.dispatch(Msg::SetSidebarMode {
-                        mode: SidebarMode::Files,
-                    });
-                }),
-            );
-
-        // Shown for the whole time the tree it scrolls is on screen — hiding it
-        // when nothing is open made the strip's contents flicker as files were
-        // opened and closed. It greys out instead.
-        let show_locate = mode == SidebarMode::Files;
-        let can_locate = self
+        // Each tab keeps its locate action in the same trailing slot for the
+        // whole time its tree is visible. Unavailable actions grey out instead
+        // of making the strip shift as repository data changes.
+        let active_local_branch_name = self
+            .section_locator_target(CollapsedSidebarSection::Local)
+            .and_then(|target| match target {
+                sticky::NavigationTarget::Branch(BranchMenuTarget::Local { name }) => Some(name),
+                _ => None,
+            });
+        let can_locate_active_branch = active_local_branch_name.is_some();
+        let can_locate_open_file = self
             .active_repo()
             .and_then(|repo| repo.open_file_path())
             .is_some();
+        let explorer_settings = self
+            .active_repo_id()
+            .and_then(|repo_id| CollapsedSidebarSection::Files.section_menu(repo_id));
+        let explorer_settings_open = explorer_settings
+            .as_ref()
+            .is_some_and(|(invoker, _)| self.active_context_menu_invoker.as_ref() == Some(invoker));
 
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(scaled_px(2.0))
-            .w_full()
-            .h(scaled_px(28.0))
-            .px(scaled_px(4.0))
-            .bg(bg)
-            .child(branches_tab)
-            .child(files_tab)
-            .when(show_locate, |strip| {
+        let extension_tabs: Vec<_> = self
+            .extension_tabs
+            .iter()
+            .flat_map(|tabs| tabs.tabs.iter().cloned())
+            .map(|(index, title, icon)| {
+                let mut tab =
+                    components::NavTab::new(format!("sidebar_tab_extension_{index}"), title)
+                        .selected(contributed == Some(index));
+                if let Some(icon) = icon {
+                    tab = tab.icon(icon);
+                }
+                let tab = tab.render(theme, ui_scale).on_activate(
+                    false,
+                    controls::ControlActivation::ManagedFocus,
+                    cx.listener(move |this, _, window, cx| {
+                        this.select_routed_tab(Some(index), window, cx);
+                    }),
+                );
+                div()
+                    .debug_selector(move || format!("sidebar_tab_extension_{index}"))
+                    .child(tab)
+            })
+            .collect();
+
+        let host_tabs = self
+            .extension_tabs
+            .as_ref()
+            .is_none_or(|tabs| tabs.host_tabs);
+        components::navigation_tab_strip(bg, ui_scale)
+            .when(host_tabs, |strip| strip.child(tabs))
+            .children(extension_tabs)
+            .child(div().ml_auto().when(contributed.is_none(), |slot| {
+                slot.child(self.render_search_toggle(
+                    mode == SidebarMode::Files,
+                    "sidebar_search_toggle",
+                    cx,
+                ))
+            }))
+            // Between search and locate: both flank it as per-tab tools, and the
+            // locate slot keeps its far-edge position across tabs.
+            .when(
+                mode == SidebarMode::Files && contributed.is_none(),
+                |strip| {
+                    strip.child(
+                        components::Button::new("sidebar_explorer_settings", "")
+                            .borderless()
+                            .style(components::ButtonStyle::Subtle)
+                            .open(explorer_settings_open)
+                            .disabled(explorer_settings.is_none())
+                            .selected_bg(with_alpha(
+                                theme.colors.accent.foreground,
+                                if theme.is_dark { 0.34 } else { 0.24 },
+                            ))
+                            .start_slot(crate::view::icons::svg_icon(
+                                "icons/cog.svg",
+                                if explorer_settings_open {
+                                    theme.colors.accent.foreground
+                                } else if explorer_settings.is_some() {
+                                    theme.colors.foreground.secondary
+                                } else {
+                                    with_alpha(theme.colors.foreground.secondary, 0.45)
+                                },
+                                scaled_px(13.0),
+                            ))
+                            .on_click(theme, cx, move |this, e, window, cx| {
+                                if let Some((invoker, kind)) = explorer_settings.clone() {
+                                    this.open_popover_at(
+                                        kind.invoked_by(invoker),
+                                        e.position(),
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            })
+                            .w(components::control_height(ui_scale))
+                            .h(components::control_height(ui_scale))
+                            .gitcomet_tooltip(theme, "Files settings".into())
+                            .debug_selector(|| "sidebar_explorer_settings".to_string()),
+                    )
+                },
+            )
+            .when(
+                mode == SidebarMode::Branches && contributed.is_none(),
+                |strip| {
+                    let tooltip = active_local_branch_name.map_or_else(
+                        || SharedString::from("No active local branch to show"),
+                        |name| {
+                            SharedString::from(format!(
+                                "Show and select the active local branch: {name}"
+                            ))
+                        },
+                    );
+                    strip.child(
+                        components::Button::new("sidebar_locate_active_branch", "")
+                            .borderless()
+                            .style(components::ButtonStyle::Subtle)
+                            .disabled(!can_locate_active_branch)
+                            .start_slot(crate::view::icons::svg_icon(
+                                "icons/locate.svg",
+                                if can_locate_active_branch {
+                                    theme.colors.foreground.secondary
+                                } else {
+                                    with_alpha(theme.colors.foreground.secondary, 0.45)
+                                },
+                                scaled_px(13.0),
+                            ))
+                            .on_click(theme, cx, |this, _e, _window, cx| {
+                                this.locate_active_local_branch(cx);
+                            })
+                            // Pushed to the far edge so it reads as an action on the
+                            // strip rather than a third tab.
+                            .w(components::control_height(ui_scale))
+                            .h(components::control_height(ui_scale))
+                            .gitcomet_tooltip(theme, tooltip)
+                            .debug_selector(|| "sidebar_locate_active_branch".to_string()),
+                    )
+                },
+            )
+            .when(mode == SidebarMode::Files, |strip| {
                 strip.child(
                     components::Button::new("sidebar_locate_open_file", "")
                         .borderless()
                         .style(components::ButtonStyle::Subtle)
-                        .disabled(!can_locate)
+                        .disabled(!can_locate_open_file)
                         .start_slot(crate::view::icons::svg_icon(
                             "icons/locate.svg",
-                            if can_locate {
+                            if can_locate_open_file {
                                 theme.colors.foreground.secondary
                             } else {
                                 with_alpha(theme.colors.foreground.secondary, 0.45)
@@ -1595,12 +1781,11 @@ impl SidebarPaneView {
                         })
                         // Pushed to the far edge so it reads as an action on the
                         // strip rather than a third tab.
-                        .ml_auto()
-                        .w(scaled_px(22.0))
-                        .h(scaled_px(22.0))
+                        .w(components::control_height(ui_scale))
+                        .h(components::control_height(ui_scale))
                         .gitcomet_tooltip(
                             theme,
-                            if can_locate {
+                            if can_locate_open_file {
                                 format!(
                                     "Show the open file in the explorer ({})",
                                     crate::view::shortcut_labels::secondary_shortcut("Shift+L")
@@ -1613,6 +1798,74 @@ impl SidebarPaneView {
                         .debug_selector(|| "sidebar_locate_open_file".to_string()),
                 )
             })
+    }
+
+    /// Scroll to the checked-out local branch, opening every group that hides
+    /// it, and then select its tip exactly as a single click on its row would.
+    pub(in super::super) fn locate_active_local_branch(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some((repo_id, repo_path, branch_name, commit_id)) =
+            self.active_repo().and_then(|repo| {
+                let (branch_name, commit_id) = active_local_branch_target(repo)?;
+                Some((
+                    repo.id,
+                    repo.spec.workdir.clone(),
+                    branch_name.to_string(),
+                    commit_id.clone(),
+                ))
+            })
+        else {
+            return;
+        };
+
+        if !self.branch_filter_query.is_empty() {
+            self.clear_branch_filter(cx);
+        }
+
+        let before = self
+            .sidebar_collapsed_items_by_repo
+            .get(&repo_path)
+            .cloned()
+            .unwrap_or_default();
+        let collapse_changed = {
+            let collapsed_items = self
+                .sidebar_collapsed_items_by_repo
+                .entry(repo_path.clone())
+                .or_default();
+            expand_local_branch_path(collapsed_items, &branch_name)
+        };
+        if self
+            .sidebar_collapsed_items_by_repo
+            .get(&repo_path)
+            .is_some_and(BTreeSet::is_empty)
+        {
+            self.sidebar_collapsed_items_by_repo.remove(&repo_path);
+        }
+
+        self.sidebar_presentation_cache = SidebarPresentationCache::default();
+        if collapse_changed {
+            self.publish_sidebar_collapse_changes(repo_id, &before);
+            self.sync_popover_collapsed_items(cx);
+            self.dispatch_sidebar_data_request_if_needed(cx);
+        }
+
+        let row_ix = self
+            .branch_sidebar_presentation_cached()
+            .and_then(|presentation| local_branch_home_row_index(&presentation.rows, &branch_name));
+        self.select_branch_and_reveal_tip(
+            repo_id,
+            BranchMenuTarget::local(branch_name),
+            commit_id,
+            Some(LogScope::FullReachable),
+            None,
+            cx,
+        );
+        if row_ix.is_some() {
+            self.pending_sidebar_navigation = self
+                .selected_branch
+                .as_ref()
+                .map(|selected| sticky::NavigationTarget::Branch(selected.target.clone()));
+        }
+        cx.notify();
     }
 
     /// Scroll the file explorer to the file the main pane has open, expanding
@@ -1633,7 +1886,12 @@ impl SidebarPaneView {
             return;
         };
 
-        if self.state.sidebar_mode != SidebarMode::Files {
+        let files_visible = self
+            .collapsed_popover_section
+            .map_or(self.state.sidebar_mode == SidebarMode::Files, |section| {
+                section == CollapsedSidebarSection::Files
+            });
+        if !files_visible {
             self.store.dispatch(Msg::SetSidebarMode {
                 mode: SidebarMode::Files,
             });
@@ -1685,7 +1943,8 @@ impl SidebarPaneView {
             self.pending_file_browser_reveal_at = None;
             return;
         }
-        if self.state.sidebar_mode != SidebarMode::Files {
+        if self.collapsed_popover_section.is_none() && self.state.sidebar_mode != SidebarMode::Files
+        {
             return;
         }
         let Some(repo) = self.active_repo() else {
@@ -1694,6 +1953,10 @@ impl SidebarPaneView {
         // Still filtered, or the entries have not landed: wait for the frame
         // that has them rather than scrolling to a row that will move.
         if !repo.file_browser.search_query.is_empty() {
+            return;
+        }
+        // Rows for a browse point that has moved on are about to be replaced.
+        if repo.file_browser.stale {
             return;
         }
         let Loadable::Ready(entries) = &repo.file_browser.entries else {
@@ -1726,66 +1989,38 @@ impl SidebarPaneView {
         cx.notify();
     }
 
-    /// A slim always-visible filter field pinned above the branch tree. It
-    /// narrows the Local/Remote (and pinned) sections live; a query force-expands
-    /// those sections so matches are always visible.
     fn render_branch_filter_bar(
         &mut self,
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
-    ) -> gpui::Div {
-        let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let has_query = !self.branch_filter_query.trim().is_empty();
-        div()
-            .px(scaled_px(8.0))
-            .pt(scaled_px(8.0))
-            .pb(scaled_px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .min_h(scaled_px(28.0))
-                    .pl(scaled_px(8.0))
-                    .pr(scaled_px(2.0))
-                    .rounded(px(theme.radii.control))
-                    .border_1()
-                    .border_color(theme.colors.stroke.default)
-                    .bg(theme.colors.surface.raised)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .py(scaled_px(4.0))
-                            .child(self.branch_filter_input.clone()),
-                    )
-                    .when(has_query, |row| {
-                        row.child(
-                            components::Button::new("branch_filter_clear", "")
-                                .borderless()
-                                .style(components::ButtonStyle::Subtle)
-                                .start_slot(crate::view::icons::svg_icon(
-                                    "icons/generic_close.svg",
-                                    theme.colors.foreground.secondary,
-                                    scaled_px(12.0),
-                                ))
-                                .on_click(theme, cx, |this, _e, _w, cx| {
-                                    this.clear_branch_filter(cx);
-                                })
-                                .w(scaled_px(24.0))
-                                .h(scaled_px(24.0))
-                                .gitcomet_tooltip(theme, "Clear filter".into())
-                                .debug_selector(|| "branch_filter_clear".to_string()),
-                        )
-                    }),
-            )
+    ) -> gpui::Stateful<gpui::Div> {
+        self.render_sidebar_search(false, theme, cx)
+    }
+
+    pub(in crate::view) fn set_extension_branch_search(
+        &mut self,
+        query: String,
+        options: TextSearchOptions,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.branch_search_options = options;
+        self.branch_filter_query = query.clone();
+        self.branch_filter_input
+            .update(cx, |input, cx| input.set_text(query, cx));
+        self.branch_search_open = !self.branch_filter_query.is_empty();
+        self.sidebar_presentation_cache = SidebarPresentationCache::default();
+        self.sticky_context = None;
+        self.sync_popover_branch_filter(cx);
+        cx.notify();
     }
 
     fn clear_branch_filter(&mut self, cx: &mut gpui::Context<Self>) {
         self.branch_filter_input.update(cx, |input, cx| {
             input.set_text("", cx);
         });
+        self.sticky_context = None;
+        self.pending_sidebar_navigation = None;
+        self.sidebar_scroll_animation = None;
         self.branch_filter_query.clear();
         self.sync_popover_branch_filter(cx);
         cx.notify();
@@ -1797,15 +2032,19 @@ impl SidebarPaneView {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         const SIDEBAR_TOP_INSET_PX: f32 = 2.0;
+        let ui_scale_percent = ui_scale::current(cx).percent;
+        let scaled_px = ui_scale::scaler(ui_scale_percent);
 
-        let filter_bar = self.render_branch_filter_bar(theme, cx);
+        let filter_bar = self
+            .branch_search_open
+            .then(|| self.render_branch_filter_bar(theme, cx));
         let Some(presentation) = self.branch_sidebar_presentation_cached() else {
             return div()
                 .flex()
                 .flex_col()
                 .h_full()
                 .min_h(px(0.0))
-                .child(filter_bar)
+                .children(filter_bar)
                 .child(components::empty_state(
                     theme,
                     "Branches",
@@ -1822,24 +2061,82 @@ impl SidebarPaneView {
         )
         .h_full()
         .min_h(px(0.0))
-        .track_scroll(&self.branches_scroll);
+        .track_scroll(&self.branches_scroll)
+        .when(self.collapsed_popover_section.is_none(), |list| {
+            list.with_decoration(sticky::StickyRows { view: cx.entity() })
+        });
         let list = restrict_scroll_to_vertical_axis(list);
+        let view = cx.entity();
+        let row_height = sidebar_list_row_height(theme, ui_scale_percent);
+        let list = div()
+            .relative()
+            .h_full()
+            .min_h(px(0.0))
+            .child(
+                gpui::canvas(
+                    move |bounds, window, cx| {
+                        // Match the list's device-pixel rounding before it
+                        // measures and renders the first row of this frame.
+                        let row_height = window.pixel_snap(row_height);
+                        view.update(cx, |this, cx| {
+                            this.prepare_sidebar_scroll(bounds, row_height, window, cx)
+                        });
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            .child(list);
         // Rows use the full pane width; the scrollbar overlays them (its track
         // is transparent, only the thumb paints while scrolling/hovering).
         let list = div()
             .flex_1()
             .min_h(px(0.0))
-            .pt(px(SIDEBAR_TOP_INSET_PX))
-            .pl(px(components::ROW_HIGHLIGHT_INSET_PX))
-            .pr(px(components::ROW_HIGHLIGHT_INSET_PX))
+            .pt(scaled_px(SIDEBAR_TOP_INSET_PX))
             .child(list);
         let panel_body: AnyElement = div()
             .id("branch_sidebar_scroll_container")
+            .debug_selector(|| "branch_sidebar_scroll_container".to_string())
+            .on_scroll_wheel(cx.listener(|this, _: &gpui::ScrollWheelEvent, _, cx| {
+                if this.sidebar_scroll_animation.take().is_some() {
+                    cx.notify();
+                }
+            }))
+            .on_mouse_down_all({
+                let view = cx.entity();
+                move |event, phase, hitbox, _, cx| {
+                    if phase == gpui::DispatchPhase::Capture
+                        && hitbox.bounds.contains(&event.position)
+                    {
+                        view.update(cx, |this, _| {
+                            this.sidebar_scroll_animation = None;
+                        });
+                    }
+                }
+            })
+            .min_h(px(0.0))
             .relative()
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
+            .when_some(self.sidebar_click_target_bounds(), |panel, bounds| {
+                panel.on_mouse_move_all({
+                    let view = cx.entity();
+                    move |event, phase, _, _, cx| {
+                        if phase == gpui::DispatchPhase::Capture
+                            && !bounds.contains(&event.position)
+                        {
+                            view.update(cx, |this, cx| {
+                                if this.clear_sidebar_click_target() {
+                                    cx.notify();
+                                }
+                            });
+                        }
+                    }
+                })
+            })
             .child(list.into_any_element())
             .child(
                 components::Scrollbar::new(
@@ -1856,8 +2153,17 @@ impl SidebarPaneView {
             .flex_col()
             .h_full()
             .min_h(px(0.0))
-            .child(filter_bar)
-            .child(panel_body)
+            .children(filter_bar)
+            .child(
+                div()
+                    .id("sidebar_branches_body")
+                    .debug_selector(|| "sidebar_branches_body".to_string())
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(panel_body),
+            )
             .into_any()
     }
 
@@ -1865,107 +2171,8 @@ impl SidebarPaneView {
         &mut self,
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
-    ) -> gpui::Div {
-        let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let search_options = self.file_search_options;
-        let search_query = self
-            .active_repo()
-            .map(|repo| repo.file_browser.search_query.clone())
-            .unwrap_or_default();
-        let search_error = file_search_matchers(&search_query, search_options)
-            .iter()
-            .any(|matcher| matcher.regex_error().is_some());
-        let option_selected_bg = with_alpha(
-            theme.colors.accent.foreground,
-            if theme.is_dark { 0.34 } else { 0.24 },
-        );
-        div()
-            .px(scaled_px(8.0))
-            .pt(scaled_px(8.0))
-            .pb(scaled_px(6.0))
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_start()
-                    .min_h(scaled_px(28.0))
-                    .pl(scaled_px(8.0))
-                    .pr(scaled_px(2.0))
-                    .rounded(px(theme.radii.control))
-                    .border_1()
-                    .border_color(if search_error {
-                        theme.colors.status.danger.foreground
-                    } else {
-                        theme.colors.stroke.default
-                    })
-                    .bg(theme.colors.surface.raised)
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .py(scaled_px(4.0))
-                            .child(self.file_browser_search_input.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .h(scaled_px(28.0))
-                            .flex()
-                            .items_center()
-                            .child(
-                                components::Button::new("file_search_match_case", "Aa")
-                                    .borderless()
-                                    .style(components::ButtonStyle::Subtle)
-                                    .selected(search_options.match_case)
-                                    .selected_bg(option_selected_bg)
-                                    .on_click(theme, cx, |this, _e, _w, cx| {
-                                        this.toggle_file_search_option(
-                                            |options| options.match_case = !options.match_case,
-                                            cx,
-                                        );
-                                    })
-                                    .w(scaled_px(24.0))
-                                    .h(scaled_px(24.0))
-                                    .gitcomet_tooltip(theme, "Match case".into())
-                                    .debug_selector(|| "file_search_match_case".to_string()),
-                            )
-                            .child(
-                                components::Button::new("file_search_whole_word", "W")
-                                    .borderless()
-                                    .style(components::ButtonStyle::Subtle)
-                                    .selected(search_options.whole_word)
-                                    .selected_bg(option_selected_bg)
-                                    .on_click(theme, cx, |this, _e, _w, cx| {
-                                        this.toggle_file_search_option(
-                                            |options| options.whole_word = !options.whole_word,
-                                            cx,
-                                        );
-                                    })
-                                    .w(scaled_px(24.0))
-                                    .h(scaled_px(24.0))
-                                    .gitcomet_tooltip(theme, "Match whole word".into())
-                                    .debug_selector(|| "file_search_whole_word".to_string()),
-                            )
-                            .child(
-                                components::Button::new("file_search_regex", ".*")
-                                    .borderless()
-                                    .style(components::ButtonStyle::Subtle)
-                                    .selected(search_options.regex)
-                                    .selected_bg(option_selected_bg)
-                                    .on_click(theme, cx, |this, _e, _w, cx| {
-                                        this.toggle_file_search_option(
-                                            |options| options.regex = !options.regex,
-                                            cx,
-                                        );
-                                    })
-                                    .w(scaled_px(24.0))
-                                    .h(scaled_px(24.0))
-                                    .gitcomet_tooltip(theme, "Use regular expression".into())
-                                    .debug_selector(|| "file_search_regex".to_string()),
-                            ),
-                    ),
-            )
+    ) -> gpui::Stateful<gpui::Div> {
+        self.render_sidebar_search(true, theme, cx)
     }
 
     fn render_file_browser_content(
@@ -1973,7 +2180,11 @@ impl SidebarPaneView {
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
-        let search_bar = self.render_file_browser_search_bar(theme, cx);
+        let ui_scale_percent = ui_scale::current(cx).percent;
+        let scaled_px = ui_scale::scaler(ui_scale_percent);
+        let search_bar = self
+            .file_search_open
+            .then(|| self.render_file_browser_search_bar(theme, cx));
 
         let visible_rows = self.file_browser_visible_rows(cx);
 
@@ -1989,7 +2200,7 @@ impl SidebarPaneView {
                     Loadable::Error(_) => "Error loading files.",
                 },
             };
-            components::empty_state(theme, "Files", message).into_any_element()
+            self.explorer_empty_state(theme, message)
         } else {
             let row_count = visible_rows.len();
             let list = uniform_list(
@@ -2005,9 +2216,9 @@ impl SidebarPaneView {
             let list = div()
                 .flex_1()
                 .min_h(px(0.0))
-                .pt(px(2.0))
-                .pl(px(components::ROW_HIGHLIGHT_INSET_PX))
-                .pr(px(components::ROW_HIGHLIGHT_INSET_PX))
+                .pt(scaled_px(2.0))
+                .pl(scaled_px(components::ROW_HIGHLIGHT_INSET_PX))
+                .pr(scaled_px(components::ROW_HIGHLIGHT_INSET_PX))
                 .child(list);
             div()
                 .id("file_browser_scroll_container")
@@ -2032,7 +2243,83 @@ impl SidebarPaneView {
         let browsing_commit = self
             .active_repo()
             .is_some_and(|r| r.browsing_commit().is_some());
+        let accepts_drops = self.active_repo().is_some_and(|repo| {
+            repo.file_browser.source == gitcomet_core::domain::FileSource::WorkingDirectory
+        });
         div()
+            .id("explorer_focus_scope")
+            .on_activate(
+                false,
+                controls::ControlActivation::Composite,
+                cx.listener(|this, _, window, cx| this.explorer_background_click(window, cx)),
+            )
+            .track_focus(&self.explorer_focus)
+            .capture_key_down(cx.listener(Self::explorer_key_down))
+            .on_pointer_click(
+                MouseButton::Right,
+                cx.listener(|this, event: &gpui::MouseDownEvent, window, cx| {
+                    if let Some(repo_id) = this.active_repo_id() {
+                        window.focus(&this.explorer_focus, cx);
+                        this.open_popover_at(
+                            PopoverKind::FileBrowserFolderMenu {
+                                repo_id,
+                                path: PathBuf::new(),
+                            },
+                            event.position,
+                            window,
+                            cx,
+                        );
+                    }
+                    cx.stop_propagation();
+                }),
+            )
+            // Drops are only meaningful against the working tree; while a
+            // commit is being browsed there is nothing to write to.
+            .when(accepts_drops, |scope| {
+                scope
+                    // One autoscroll driver for the whole tree rather than one
+                    // per row.
+                    .on_drag_move(cx.listener(
+                        |this,
+                         event: &gpui::DragMoveEvent<explorer_operations::ExplorerDrag>,
+                         window,
+                         cx| {
+                            this.explorer_drag_move(event.event.position, window, cx)
+                        },
+                    ))
+                    .on_drag_move(cx.listener(
+                        |this, event: &gpui::DragMoveEvent<gpui::ExternalPaths>, window, cx| {
+                            this.explorer_drag_move(event.event.position, window, cx)
+                        },
+                    ))
+                    .on_mouse_exit(cx.listener(|this, _: &gpui::MouseExitEvent, _window, cx| {
+                        this.clear_explorer_drag_state(cx)
+                    }))
+                    // Resolve drops from the same geometry as hover feedback;
+                    // controls, pinned buffers and scrollbars are excluded.
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            let Some(target) = this.explorer_pointer_target(window, cx) else {
+                                return;
+                            };
+                            this.explorer_drop(
+                                paths.paths().to_vec(),
+                                Some(target),
+                                true,
+                                window,
+                                cx,
+                            )
+                        }),
+                    )
+                    .on_drop(cx.listener(
+                        |this, drag: &explorer_operations::ExplorerDrag, window, cx| {
+                            let Some(target) = this.explorer_pointer_target(window, cx) else {
+                                return;
+                            };
+                            this.explorer_drop(drag.paths.to_vec(), Some(target), false, window, cx)
+                        },
+                    ))
+            })
             .relative()
             .flex()
             .flex_col()
@@ -2048,15 +2335,57 @@ impl SidebarPaneView {
                     theme.colors.surface.chrome,
                 ))
             })
-            .child(search_bar)
+            .children(search_bar)
             .child(body)
             .into_any()
     }
 
-    fn file_browser_visible_rows(&self, cx: &gpui::App) -> Vec<FileBrowserVisibleRow> {
+    /// Shared with the cache: the tree rows are read several times per frame
+    /// and were deep-copied on every read, hit or miss.
+    fn file_browser_visible_rows(&self, cx: &gpui::App) -> Rc<[FileBrowserVisibleRow]> {
         let Some(repo) = self.active_repo() else {
-            return Vec::new();
+            return Rc::from(Vec::new());
         };
+        if let Some(edit) = &self.explorer_name_edit
+            && edit.repo_id == repo.id
+        {
+            let mut rows =
+                self.compute_file_browser_visible_rows(repo, self.unsaved_file_edit_paths(cx));
+            let relative = edit
+                .path
+                .strip_prefix(&repo.spec.workdir)
+                .unwrap_or(&edit.path);
+            let ix = if let Loadable::Ready(entries) = &repo.file_browser.entries {
+                rows.iter().position(|row| {
+                    row.entry_index()
+                        .is_some_and(|ix| entries[ix].path.as_path() == relative)
+                })
+            } else {
+                None
+            };
+            if edit.action == explorer_operations::ExplorerAction::Rename {
+                if let Some(ix) = ix {
+                    rows[ix] = FileBrowserVisibleRow::NameEntry {
+                        depth: relative.components().count().saturating_sub(1),
+                    };
+                }
+            } else {
+                rows.insert(
+                    ix.map_or_else(
+                        || {
+                            rows.iter()
+                                .position(|row| row.entry_index().is_some())
+                                .unwrap_or(rows.len())
+                        },
+                        |i| i + 1,
+                    ),
+                    FileBrowserVisibleRow::NameEntry {
+                        depth: relative.components().count(),
+                    },
+                );
+            }
+            return rows.into();
+        }
 
         // Key on the repo id too: file_browser_rev is a per-repo counter, so two
         // repos can share a value and collide otherwise (stale rows for the wrong
@@ -2077,11 +2406,13 @@ impl SidebarPaneView {
         if let Some((cached_key, cached_rows)) = cache.as_ref()
             && *cached_key == cache_key
         {
-            return cached_rows.to_vec();
+            return Rc::clone(cached_rows);
         }
 
-        let rows = self.compute_file_browser_visible_rows(repo, self.unsaved_file_edit_paths(cx));
-        *cache = Some((cache_key, Rc::from(rows.clone())));
+        let rows: Rc<[FileBrowserVisibleRow]> = self
+            .compute_file_browser_visible_rows(repo, self.unsaved_file_edit_paths(cx))
+            .into();
+        *cache = Some((cache_key, Rc::clone(&rows)));
         rows
     }
 
@@ -2133,8 +2464,7 @@ impl SidebarPaneView {
             return self.unsaved_file_edit_rows(unsaved);
         };
 
-        let matchers =
-            file_search_matchers(&repo.file_browser.search_query, self.file_search_options);
+        let matchers = self.cached_file_matchers();
         let has_search = !matchers.is_empty();
 
         let mut tree_rows: Vec<FileBrowserVisibleRow> = if has_search {
@@ -2195,6 +2525,21 @@ impl SidebarPaneView {
         };
 
         let mut rows = self.unsaved_file_edit_rows(unsaved);
+        tree_rows.retain(|row| {
+            row.entry_index().is_none_or(|ix| {
+                let path = &entries[ix].path;
+                !path
+                    .components()
+                    .any(|c| c.as_os_str().eq_ignore_ascii_case(".git"))
+                    && (repo.file_browser.show_hidden
+                        || repo
+                            .file_browser
+                            .revealed_paths
+                            .iter()
+                            .any(|revealed| revealed.starts_with(path.as_ref()))
+                        || !gitcomet_state::explorer::is_hidden_path(path))
+            })
+        });
         rows.append(&mut tree_rows);
         rows
     }
@@ -2203,21 +2548,34 @@ impl SidebarPaneView {
     ///
     /// Empty when nothing is unsaved, so the section costs no vertical space in
     /// the common case, and header-only when it is collapsed.
-    fn unsaved_file_edit_rows(&self, unsaved: Vec<PathBuf>) -> Vec<FileBrowserVisibleRow> {
+    fn unsaved_file_edit_rows(&self, mut unsaved: Vec<PathBuf>) -> Vec<FileBrowserVisibleRow> {
+        let matchers = self.cached_file_matchers();
+        unsaved.retain(|path| file_search_matches(&matchers, &path.to_string_lossy()));
         if unsaved.is_empty() {
             return Vec::new();
         }
-        let mut rows = vec![FileBrowserVisibleRow::UnsavedHeader {
-            count: unsaved.len(),
+        let Some(repo_id) = self.active_repo_id() else {
+            return Vec::new();
+        };
+        let weak_store = Arc::downgrade(&self.store);
+        let files = gitcomet_extension_api::SidebarFileSet::new(unsaved, move |path, _| {
+            if let Some(store) = weak_store.upgrade() {
+                store.dispatch(Msg::OpenFileEditor {
+                    repo_id,
+                    path: path.clone(),
+                });
+            }
+        });
+        let mut rows = vec![FileBrowserVisibleRow::FileSetHeader {
+            count: files.paths.len(),
         }];
         if !self.unsaved_section_is_collapsed() {
-            rows.extend(
-                unsaved
-                    .into_iter()
-                    .map(|path| FileBrowserVisibleRow::UnsavedFile {
-                        path: Arc::new(path),
-                    }),
-            );
+            rows.extend(files.paths.iter().zip(files.rows()).map(|(path, row)| {
+                FileBrowserVisibleRow::FileSetFile {
+                    path: Arc::new(path.clone()),
+                    open: row.action,
+                }
+            }));
         }
         rows
     }
@@ -2266,12 +2624,17 @@ impl SidebarPaneView {
         const ICON_SLOT_PX: f32 = 16.0;
 
         let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value: f32| ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let scaled_px = ui_scale::scaler(ui_scale_percent);
 
+        #[cfg(test)]
+        {
+            this.rendered_rows += range.len();
+        }
         let Some(repo_id) = this.active_repo_id() else {
             return Vec::new();
         };
         let theme = this.theme;
+        let row_height = sidebar_list_row_height(theme, ui_scale_percent);
         let icon_muted = with_alpha(
             theme.colors.foreground.secondary,
             if theme.is_dark { 0.6 } else { 0.5 },
@@ -2279,7 +2642,6 @@ impl SidebarPaneView {
         // Zed renders file/folder icons in a neutral, muted tone rather than a
         // bright accent — match that so the tree reads the same way.
         let icon_color = theme.colors.foreground.secondary;
-        let text_color = theme.colors.foreground.primary;
         let row_surface = if matches!(
             this.collapsed_popover_section,
             Some(CollapsedSidebarSection::Files)
@@ -2288,17 +2650,29 @@ impl SidebarPaneView {
         } else {
             theme.colors.surface.chrome
         };
-        let row_style = components::InteractiveRowStyle::new(theme, row_surface);
+        // Match the Branches tree: both are continuous lists, and their
+        // hover/selection fills should have the same square row silhouette.
+        let row_style = components::InteractiveRowStyle::new(theme, row_surface).flat();
+        // GPUI hides ordinary hover styles during a drag, but their listeners
+        // still invalidate the sidebar when crossing rows. Drop highlighting
+        // below supplies the feedback and only changes when the target changes.
+        let row_style = if cx.has_active_drag() {
+            row_style.without_hover()
+        } else {
+            row_style
+        };
         let store = Arc::clone(&this.store);
-        let search_matchers = this
-            .active_repo()
-            .map(|repo| {
-                file_search_matchers(&repo.file_browser.search_query, this.file_search_options)
-            })
-            .unwrap_or_default();
+        let search_matchers = this.cached_file_matchers();
 
         let visible_rows = this.file_browser_visible_rows(cx);
+        let drop_region = this.explorer_drop_range(&visible_rows);
+        let cut_paths = this.explorer_cut_paths(cx);
+        // Every selected row drags the whole selection, so build it once rather
+        // than joining and cloning it per row per frame.
+        let selection_sources: Rc<[PathBuf]> = Rc::from(this.explorer_sources(None));
         let repo = this.active_repo();
+        let status_badges =
+            repo.and_then(|repo| this.file_browser_status_cache.borrow_mut().get(repo));
         // The file the main pane is showing, so the tree can mark it. Read
         // whatever the target names — a diff of a file is still "this file is
         // open", not only the read-only content view.
@@ -2380,7 +2754,27 @@ impl SidebarPaneView {
                 let (entry_index, depth, is_directory, is_expanded) = match row {
                     // The pinned section shares the list with the tree but not
                     // its shape, so both rows are built here and return early.
-                    FileBrowserVisibleRow::UnsavedHeader { count } => {
+                    FileBrowserVisibleRow::NameEntry { depth } => {
+                        let icon = this.explorer_name_edit.as_ref()?.icon;
+                        return this.explorer_name_entry(cx).map(|entry| {
+                            div()
+                                .debug_selector(|| "explorer_inline_row".into())
+                                .flex()
+                                .items_center()
+                                .w_full()
+                                .min_w(px(0.0))
+                                .flex_none()
+                                .h(row_height)
+                                .pl(scaled_px(6.0 + INDENT_STEP_PX * *depth as f32))
+                                .pr_2()
+                                .gap(scaled_px(4.0))
+                                .child(chevron_slot(false, false))
+                                .child(icon_slot(icon))
+                                .child(entry)
+                                .into_any_element()
+                        });
+                    }
+                    FileBrowserVisibleRow::FileSetHeader { count } => {
                         return Some(
                             div()
                                 .id(ElementId::Name(format!("file_browser_row_{ix}").into()))
@@ -2388,7 +2782,7 @@ impl SidebarPaneView {
                                 .flex()
                                 .flex_row()
                                 .items_center()
-                                .h(scaled_px(FILE_BROWSER_ROW_HEIGHT_PX))
+                                .h(row_height)
                                 .w_full()
                                 .pl(scaled_px(6.0))
                                 .pr_2()
@@ -2397,14 +2791,16 @@ impl SidebarPaneView {
                                     row_style,
                                     components::InteractiveRowState::default(),
                                 )
-                                .on_click(cx.listener(
-                                    move |this, _e: &gpui::ClickEvent, _window, cx| {
+                                .on_activate(
+                                    false,
+                                    controls::ControlActivation::Composite,
+                                    cx.listener(move |this, _e: &gpui::ClickEvent, _window, cx| {
                                         this.toggle_active_repo_collapse_key(
                                             SharedString::from(FILE_BROWSER_UNSAVED_SECTION_KEY),
                                             cx,
                                         );
-                                    },
-                                ))
+                                    }),
+                                )
                                 .child(chevron_slot(true, !unsaved_collapsed))
                                 .child(icon_slot_tinted(
                                     "icons/pencil.svg",
@@ -2414,14 +2810,14 @@ impl SidebarPaneView {
                                     div()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .text_xs()
+                                        .text_size(theme.ui_text(12.0))
                                         .text_color(theme.colors.foreground.secondary)
                                         .child(format!("Unsaved edits ({count})")),
                                 )
                                 .into_any_element(),
                         );
                     }
-                    FileBrowserVisibleRow::UnsavedFile { path } => {
+                    FileBrowserVisibleRow::FileSetFile { path, open } => {
                         return Some(unsaved_file_row(
                             UnsavedFileRowCtx {
                                 theme,
@@ -2433,9 +2829,9 @@ impl SidebarPaneView {
                             },
                             Arc::clone(path),
                             scaled_px(6.0 + INDENT_STEP_PX),
-                            scaled_px(FILE_BROWSER_ROW_HEIGHT_PX),
+                            row_height,
                             scaled_px(ICON_SLOT_PX),
-                            Arc::clone(&store),
+                            open.clone(),
                             cx,
                         ));
                     }
@@ -2463,13 +2859,50 @@ impl SidebarPaneView {
                         && open_path
                             .as_ref()
                             .is_some_and(|open| open.as_path() == entry.path.as_path());
+                    let selected = repo.is_some_and(|r| {
+                        r.file_browser.selection.paths.contains(entry.path.as_ref())
+                    });
+                    let focused = repo.is_some_and(|r| {
+                        r.file_browser.selection.focused.as_ref() == Some(entry.path.as_ref())
+                    });
+                    let cut = cut_paths.as_ref().is_some_and(|paths| {
+                        repo.is_some_and(|r| {
+                            paths
+                                .iter()
+                                .any(|p| r.spec.workdir.join(entry.path.as_ref()).starts_with(p))
+                        })
+                    });
+                    // A cut row dims even when selected: the selection is usually
+                    // what was just cut, and that is the feedback the user needs.
+                    let row_text_color = if cut {
+                        theme.colors.foreground.disabled
+                    } else if entry.ignored && !selected && !is_open_file {
+                        theme.colors.foreground.secondary
+                    } else {
+                        file_browser_row_label_color(theme, selected || is_open_file)
+                    };
+                    let row_style = row_style.tinted(crate::view::rows::explorer_row_tint(
+                        &theme,
+                        gitcomet_state::explorer::is_hidden_path(entry.path.as_path()),
+                        entry.ignored,
+                    ));
                     // The pen marks the file wherever it sits in the tree, so a user
                     // who navigated to it rather than to the pinned section still
                     // sees that it is holding unsaved text.
                     let has_unsaved_edits =
                         !is_directory && unsaved_paths.contains(entry.path.as_ref());
+                    let status = status_badges
+                        .as_ref()
+                        .and_then(|badges| badges.get(&entry.path, is_directory));
                     let row_state = components::InteractiveRowState::default()
-                        .selected(is_open_file, open_row_bg)
+                        .selected(
+                            selected
+                                || (is_open_file
+                                    && repo.is_some_and(|r| {
+                                        r.file_browser.selection.paths.is_empty()
+                                    })),
+                            row_style.selection_fill(open_row_bg),
+                        )
                         .open(context_menu_active);
 
                     let mut row_div = div()
@@ -2478,37 +2911,133 @@ impl SidebarPaneView {
                         .flex()
                         .flex_row()
                         .items_center()
-                        .h(scaled_px(FILE_BROWSER_ROW_HEIGHT_PX))
+                        .h(row_height)
                         .w_full()
                         .pl(left_pad)
                         .pr_2()
                         .gap(scaled_px(4.0))
-                        .interactive_row(row_style, row_state);
+                        .interactive_row(row_style, row_state)
+                        .when(focused, |row| {
+                            row.row_accent(theme.colors.accent.foreground)
+                        });
+
+                    let paths = if selected {
+                        Rc::clone(&selection_sources)
+                    } else {
+                        Rc::from(
+                            repo.map(|r| vec![r.spec.workdir.join(entry.path.as_ref())])
+                                .unwrap_or_default(),
+                        )
+                    };
+                    let native_root = this.root_view.clone();
+                    let drag_focus = this.explorer_focus.clone();
+                    row_div = row_div
+                        .when(
+                            repo.is_some_and(|r| {
+                                r.file_browser.source
+                                    == gitcomet_core::domain::FileSource::WorkingDirectory
+                            }),
+                            |row| {
+                                row.on_drag(
+                                    explorer_operations::ExplorerDrag { paths },
+                                    move |drag, offset, window, cx| {
+                                        window.focus(&drag_focus, cx);
+                                        cx.new(|_| {
+                                            explorer_operations::ExplorerDragPreview::new(
+                                                drag,
+                                                is_directory,
+                                                theme,
+                                                offset,
+                                            )
+                                        })
+                                    },
+                                )
+                                .drag_move_refresh(gpui::DragMoveRefresh::Preview)
+                                .external_drag_payload_async(
+                                    move |drag: &explorer_operations::ExplorerDrag, window, cx| {
+                                        let intent = if (cfg!(target_os = "macos")
+                                            && window.modifiers().alt)
+                                            || (!cfg!(target_os = "macos")
+                                                && window.modifiers().control)
+                                        {
+                                            gpui::FileTransferOperation::Copy
+                                        } else {
+                                            gpui::FileTransferOperation::Move
+                                        };
+                                        native_root
+                                            .update(cx, |root, cx| {
+                                                root.prepare_native_drag(
+                                                    drag.paths.to_vec(),
+                                                    intent,
+                                                    cx,
+                                                )
+                                            })
+                                            .unwrap_or_else(|_| gpui::Task::ready(None))
+                                    },
+                                )
+                            },
+                        )
+                        .when(drop_region.contains(&ix), |row| {
+                            let first = ix == drop_region.start;
+                            let last = ix + 1 == drop_region.end;
+                            let color = theme.colors.accent.foreground;
+                            row.relative().bg(with_alpha(color, 0.16)).child(
+                                gpui::canvas(
+                                    |_, _, _| {},
+                                    move |bounds, _, window, _| {
+                                        window.paint_quad(
+                                            gpui::outline(
+                                                bounds,
+                                                with_alpha(color, 0.7),
+                                                gpui::BorderStyle::default(),
+                                            )
+                                            .border_widths(gpui::Edges {
+                                                top: px(if first { 1.0 } else { 0.0 }),
+                                                bottom: px(if last { 1.0 } else { 0.0 }),
+                                                left: px(1.0),
+                                                right: px(1.0),
+                                            }),
+                                        );
+                                    },
+                                )
+                                .absolute()
+                                .inset_0(),
+                            )
+                        });
 
                     if is_directory {
                         let path = (*entry.path).clone();
                         let menu_path = path.clone();
                         row_div = row_div
-                            .when(!expansion_frozen, |row| {
-                                row.on_click(cx.listener(
-                                    move |_this, _e: &gpui::ClickEvent, _window, _cx| {
-                                        store.dispatch(Msg::ToggleFileBrowserDir {
-                                            repo_id,
-                                            path: path.clone(),
-                                        });
-                                    },
-                                ))
-                            })
-                            .on_mouse_down(
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                                    this.explorer_folder_click(
+                                        path.clone(),
+                                        e.modifiers(),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .on_pointer_click(
                                 MouseButton::Right,
                                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
-                                    this.activate_context_menu_invoker(menu_invoker.clone(), cx);
+                                    this.explorer_select(
+                                        menu_path.clone(),
+                                        e.modifiers,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
                                     this.open_popover_at(
-                                        PopoverKind::FileBrowserFolderMenu {
+                                        (PopoverKind::FileBrowserFolderMenu {
                                             repo_id,
                                             path: menu_path.clone(),
-                                        },
+                                        })
+                                        .invoked_by(menu_invoker.clone()),
                                         e.position,
                                         window,
                                         cx,
@@ -2522,8 +3051,22 @@ impl SidebarPaneView {
                             .map(|r| r.file_browser.source.clone())
                             .unwrap_or(gitcomet_core::domain::FileSource::WorkingDirectory);
                         row_div = row_div
-                            .on_click(cx.listener(
-                                move |_this, _e: &gpui::ClickEvent, _window, _cx| {
+                            .on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, e: &gpui::ClickEvent, window, cx| {
+                                    this.explorer_select(
+                                        path.clone(),
+                                        e.modifiers(),
+                                        false,
+                                        window,
+                                        cx,
+                                    );
+                                    let modifiers = e.modifiers();
+                                    if modifiers.control || modifiers.platform || modifiers.shift {
+                                        return;
+                                    }
+                                    this.show_repository_canvas(cx);
                                     // A file the editor is holding unsaved text for
                                     // opens straight back into the editor. Opening
                                     // the read-only view would show the text on
@@ -2540,18 +3083,25 @@ impl SidebarPaneView {
                                             path: path.clone(),
                                         });
                                     }
-                                },
-                            ))
-                            .on_mouse_down(
+                                }),
+                            )
+                            .on_pointer_click(
                                 MouseButton::Right,
                                 cx.listener(move |this, e: &gpui::MouseDownEvent, window, cx| {
                                     cx.stop_propagation();
-                                    this.activate_context_menu_invoker(menu_invoker.clone(), cx);
+                                    this.explorer_select(
+                                        menu_path.clone(),
+                                        e.modifiers,
+                                        true,
+                                        window,
+                                        cx,
+                                    );
                                     this.open_popover_at(
-                                        PopoverKind::FileBrowserFileMenu {
+                                        (PopoverKind::FileBrowserFileMenu {
                                             repo_id,
                                             path: menu_path.clone(),
-                                        },
+                                        })
+                                        .invoked_by(menu_invoker.clone()),
                                         e.position,
                                         window,
                                         cx,
@@ -2561,15 +3111,54 @@ impl SidebarPaneView {
                     }
 
                     row_div
-                        .child(chevron_slot(is_directory && !expansion_frozen, is_expanded))
-                        .child(icon_slot(file_or_folder_icon_path(entry, is_expanded)))
+                        .child({
+                            let path = (*entry.path).clone();
+                            chevron_slot(is_directory && !expansion_frozen, is_expanded)
+                                .id(("explorer_chevron", ix))
+                                .debug_selector(move || format!("explorer_chevron_{ix}"))
+                                .when(is_directory && !expansion_frozen, |d| {
+                                    // The innermost click target owns the click,
+                                    // so the row's own activation does not also run.
+                                    d.on_activate(
+                                        false,
+                                        controls::ControlActivation::Composite,
+                                        cx.listener(
+                                            move |this, _: &gpui::ClickEvent, window, cx| {
+                                                this.explorer_chevron_click(
+                                                    path.clone(),
+                                                    window,
+                                                    cx,
+                                                );
+                                            },
+                                        ),
+                                    )
+                                })
+                        })
+                        .child(if cut || entry.ignored {
+                            icon_slot_tinted(
+                                file_or_folder_icon_path(entry, is_expanded),
+                                icon_muted,
+                            )
+                        } else {
+                            icon_slot(file_or_folder_icon_path(entry, is_expanded))
+                        })
+                        .when(cut, |row| {
+                            row.child(
+                                div()
+                                    .debug_selector(move || format!("explorer_cut_marker_{ix}"))
+                                    .text_size(theme.ui_text(12.0))
+                                    .child("✂"),
+                            )
+                        })
                         .child({
                             let highlight_ranges =
                                 file_search_highlight_ranges(&search_matchers, entry.name.as_ref());
-                            let mut label = components::TruncatedText::new(entry.name.to_string())
-                                .profile(components::TextTruncationProfile::End)
-                                .text_color(text_color)
-                                .text_sm();
+                            let mut label = components::TruncatedText::new(
+                                entry.name.to_string(),
+                                theme.ui_text(14.0),
+                            )
+                            .profile(components::TextTruncationProfile::End)
+                            .text_color(row_text_color);
                             if !highlight_ranges.is_empty() {
                                 let style = gpui::HighlightStyle {
                                     color: Some(theme.colors.accent.foreground.into_color()),
@@ -2580,7 +3169,40 @@ impl SidebarPaneView {
                                     highlight_ranges.into_iter().map(|range| (range, style)),
                                 );
                             }
-                            div().flex_1().min_w(px(0.0)).child(label.render(cx))
+                            div()
+                                .debug_selector(move || format!("explorer_label_{ix}"))
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .child(label.render(cx))
+                        })
+                        .when_some(status, |row, status| {
+                            use gitcomet_core::domain::FileStatusKind;
+                            let (label, color) = match status {
+                                FileStatusKind::Untracked => {
+                                    ("?", theme.colors.status.success.foreground)
+                                }
+                                FileStatusKind::Added => {
+                                    ("A", theme.colors.status.success.foreground)
+                                }
+                                FileStatusKind::Deleted => {
+                                    ("D", theme.colors.status.danger.foreground)
+                                }
+                                FileStatusKind::Conflicted => {
+                                    ("!", theme.colors.status.danger.foreground)
+                                }
+                                FileStatusKind::Renamed => {
+                                    ("R", theme.colors.status.warning.foreground)
+                                }
+                                FileStatusKind::Modified => {
+                                    ("M", theme.colors.status.warning.foreground)
+                                }
+                            };
+                            row.child(
+                                div()
+                                    .text_size(theme.ui_text(12.0))
+                                    .text_color(color)
+                                    .child(label),
+                            )
                         })
                         .when(has_unsaved_edits, |row| {
                             row.child(div().flex_none().flex().items_center().child(svg_icon(
@@ -2598,23 +3220,14 @@ impl SidebarPaneView {
 
     pub(in super::super) fn open_popover_at(
         &mut self,
-        kind: PopoverKind,
+        kind: impl Into<PopoverRequest>,
         anchor: Point<Pixels>,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        let kind: PopoverRequest = kind.into();
         let _ = self.root_view.update(cx, |root, cx| {
             root.open_popover_at(kind, anchor, window, cx);
-        });
-    }
-
-    pub(in super::super) fn activate_context_menu_invoker(
-        &mut self,
-        invoker: SharedString,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        let _ = self.root_view.update(cx, move |root, cx| {
-            root.set_active_context_menu_invoker(Some(invoker), cx);
         });
     }
 
@@ -2660,21 +3273,18 @@ impl SidebarPaneView {
     pub(in super::super) fn reveal_branch_commit_in_history(
         &mut self,
         repo_id: RepoId,
-        section: BranchSection,
-        branch_name: &str,
+        target: BranchMenuTarget,
         commit_id: CommitId,
         fallback_scope: Option<LogScope>,
         cx: &mut gpui::Context<Self>,
     ) {
-        let branch_name = branch_name.to_string();
         let root_view = self.root_view.clone();
         cx.defer(move |cx| {
             let _ = root_view.update(cx, |root, cx| {
                 root.main_pane.update(cx, |pane, cx| {
                     pane.reveal_history_branch_commit(
                         repo_id,
-                        section,
-                        &branch_name,
+                        target,
                         commit_id,
                         fallback_scope,
                         cx,
@@ -2687,6 +3297,54 @@ impl SidebarPaneView {
 
 impl Render for SidebarPaneView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if self
+            .explorer_name_edit
+            .as_ref()
+            .is_some_and(|edit| Some(edit.repo_id) != self.active_repo_id())
+        {
+            self.explorer_name_edit = None;
+        }
+        if self.explorer_name_edit.is_some() {
+            let height = ui_scale::UiScale::current(cx).px(sidebar_list_row_height_px(self.theme));
+            self.explorer_name_input.update(cx, |input, cx| {
+                input.set_theme(self.theme, cx);
+                input.set_line_height(Some(height - px(4.0)), cx)
+            });
+            if self
+                .explorer_name_edit
+                .as_ref()
+                .is_some_and(|edit| edit.reveal)
+                && let Some(index) = self
+                    .file_browser_visible_rows(cx)
+                    .iter()
+                    .position(|row| matches!(row, FileBrowserVisibleRow::NameEntry { .. }))
+            {
+                // The rail popover shows the same list, so one scroll serves both.
+                self.file_browser_scroll
+                    .scroll_to_item(index, gpui::ScrollStrategy::Nearest);
+                if let Some(edit) = &mut self.explorer_name_edit {
+                    edit.reveal = false;
+                }
+            }
+        }
+        // A drop elsewhere (or cancellation) removes the preview and refreshes
+        // the window. Clear transient targeting while that frame is rendered.
+        if !cx.has_active_drag()
+            || self
+                .explorer_drag_repo
+                .is_some_and(|id| self.active_repo_id() != Some(id))
+        {
+            self.explorer_drag_repo = None;
+            self.explorer_drop_row = None;
+            self.explorer_drop_target = None;
+            self.explorer_hover_task = None;
+            self.explorer_scroll_task = None;
+        }
+        #[cfg(any(test, feature = "benchmarks"))]
+        {
+            self.render_count += 1;
+            self.rendered_rows = 0;
+        }
         match self.collapsed_popover_section {
             Some(section) => self.render_collapsed_popover(section, window, cx),
             None => self.sidebar(cx).into_any_element(),
@@ -2694,140 +3352,8 @@ impl Render for SidebarPaneView {
     }
 }
 
-/// True for any row that begins a top-level sidebar section, used to bound a
-/// single section's content when scoping rows for a collapsed-sidebar popover.
-fn is_section_header(row: &BranchSidebarRow) -> bool {
-    matches!(
-        row,
-        BranchSidebarRow::PinnedHeader { .. }
-            | BranchSidebarRow::SectionHeader { .. }
-            | BranchSidebarRow::WorktreesHeader { .. }
-            | BranchSidebarRow::SubmodulesHeader { .. }
-            | BranchSidebarRow::StashHeader { .. }
-    )
-}
-
-/// The rows of a single pinned section (header + pinned branches) for the given
-/// branch section, used to surface pins at the top of the matching branch
-/// popover in the collapsed sidebar.
-fn pinned_section_rows(
-    rows: &[BranchSidebarRow],
-    branch_section: BranchSection,
-) -> Vec<BranchSidebarRow> {
-    let Some(start) = rows.iter().position(|r| {
-        matches!(
-            r,
-            BranchSidebarRow::PinnedHeader { section, .. } if *section == branch_section
-        )
-    }) else {
-        return Vec::new();
-    };
-    let end = rows[start + 1..]
-        .iter()
-        .position(is_section_header)
-        .map(|pos| start + 1 + pos)
-        .unwrap_or(rows.len());
-    rows[start..end]
-        .iter()
-        .filter(|r| !matches!(r, BranchSidebarRow::SectionSpacer))
-        .cloned()
-        .collect()
-}
-
-fn matches_section_header(row: &BranchSidebarRow, section: CollapsedSidebarSection) -> bool {
-    matches!(
-        (row, section),
-        (
-            BranchSidebarRow::SectionHeader {
-                section: BranchSection::Local,
-                ..
-            },
-            CollapsedSidebarSection::Local,
-        ) | (
-            BranchSidebarRow::SectionHeader {
-                section: BranchSection::Remote,
-                ..
-            },
-            CollapsedSidebarSection::Remote,
-        ) | (
-            BranchSidebarRow::WorktreesHeader { .. },
-            CollapsedSidebarSection::Worktrees,
-        ) | (
-            BranchSidebarRow::SubmodulesHeader { .. },
-            CollapsedSidebarSection::Submodules,
-        ) | (
-            BranchSidebarRow::StashHeader { .. },
-            CollapsedSidebarSection::Stashes,
-        )
-    )
-}
-
-/// The content rows belonging to `section` (between its header and the next
-/// section header), with the header and inter-section spacers dropped — the
-/// popover supplies its own title.
-fn section_content_rows(
-    rows: &[BranchSidebarRow],
-    section: CollapsedSidebarSection,
-) -> Vec<BranchSidebarRow> {
-    // Each branch popover additionally surfaces its matching Pinned section at
-    // the top.
-    let mut out = match section {
-        CollapsedSidebarSection::Local => pinned_section_rows(rows, BranchSection::Local),
-        CollapsedSidebarSection::Remote => pinned_section_rows(rows, BranchSection::Remote),
-        _ => Vec::new(),
-    };
-
-    let Some(start) = rows.iter().position(|r| matches_section_header(r, section)) else {
-        return out;
-    };
-    let end = rows[start + 1..]
-        .iter()
-        .position(is_section_header)
-        .map(|pos| start + 1 + pos)
-        .unwrap_or(rows.len());
-    out.extend(
-        rows[start + 1..end]
-            .iter()
-            .filter(|r| !matches!(r, BranchSidebarRow::SectionSpacer))
-            .cloned(),
-    );
-    out
-}
-
-/// The rows a popover filter shows: the open section's matches first, followed
-/// by the other branch section's matches. A branch you are looking for is worth
-/// finding whichever list it lives in, so filtering Local also surfaces Remote
-/// hits (and vice versa); each half gets a group label once both are present.
-fn filter_result_rows(
-    rows: &[BranchSidebarRow],
-    section: CollapsedSidebarSection,
-) -> Vec<BranchSidebarRow> {
-    let primary = section_content_rows(rows, section);
-    let Some(other) = section.counterpart() else {
-        return primary;
-    };
-    let secondary = section_content_rows(rows, other);
-    if secondary.is_empty() {
-        return primary;
-    }
-
-    let mut out = Vec::with_capacity(primary.len() + secondary.len() + 3);
-    if !primary.is_empty()
-        && let Some(branch_section) = section.branch_section()
-    {
-        out.push(BranchSidebarRow::FilterGroupHeader {
-            section: branch_section,
-        });
-        out.extend(primary);
-        out.push(BranchSidebarRow::SectionSpacer);
-    }
-    if let Some(branch_section) = other.branch_section() {
-        out.push(BranchSidebarRow::FilterGroupHeader {
-            section: branch_section,
-        });
-    }
-    out.extend(secondary);
-    out
+fn repo_uses_annex(repo: &RepoState) -> bool {
+    matches!(&repo.large_file_support, Loadable::Ready(support) if support.annex.in_use())
 }
 
 fn open_repo_workdirs_fingerprint(state: &AppState) -> (usize, u64) {
@@ -2847,40 +3373,9 @@ fn open_repo_workdirs_fingerprint(state: &AppState) -> (usize, u64) {
     (state.repos.len(), hasher.finish())
 }
 
-fn active_workspace_badges_fingerprint(state: &AppState) -> (usize, u64) {
-    let Some(active_repo_id) = state.active_repo else {
-        return (0, 0);
-    };
-    let Some(active_repo) = state.repos.iter().find(|repo| repo.id == active_repo_id) else {
-        return (0, 0);
-    };
-
-    let mut badges =
-        crate::view::rows::active_workspace_paths_by_branch(active_repo, state.repos.as_slice())
-            .into_iter()
-            .collect::<Vec<_>>();
-    badges.sort_unstable_by(|(left_branch, left_path), (right_branch, right_path)| {
-        left_branch
-            .cmp(right_branch)
-            .then_with(|| left_path.as_os_str().cmp(right_path.as_os_str()))
-    });
-
-    let mut hasher = FxHasher::default();
-    badges.len().hash(&mut hasher);
-    for (branch, path) in &badges {
-        branch.hash(&mut hasher);
-        path.hash(&mut hasher);
-    }
-
-    (badges.len(), hasher.finish())
-}
-
-/// One matcher per non-empty query line: lines are OR-alternatives, so a
-/// multiline query (via the newline button / Shift+Enter) filters by any of
-/// several patterns at once.
-fn file_search_matchers(query: &str, options: DiffSearchOptions) -> Vec<DiffSearchMatcher> {
+fn file_search_matchers(query: &str, options: TextSearchOptions) -> Vec<TextSearchMatcher> {
     file_search_query_lines(query)
-        .map(|line| DiffSearchMatcher::new(line, options))
+        .map(|line| TextSearchMatcher::new(line, options))
         .collect()
 }
 
@@ -2899,12 +3394,13 @@ pub(in crate::view) fn file_browser_search_is_active(query: &str) -> bool {
     file_search_query_lines(query).next().is_some()
 }
 
-fn file_search_matches(matchers: &[DiffSearchMatcher], haystack: &str) -> bool {
-    matchers.iter().any(|matcher| matcher.is_match(haystack))
+fn file_search_matches(matchers: &[TextSearchMatcher], haystack: &str) -> bool {
+    !matchers
+        .iter()
+        .any(|matcher| matcher.regex_error().is_some())
+        && (matchers.is_empty() || matchers.iter().any(|matcher| matcher.is_match(haystack)))
 }
 
-/// Sorted, de-overlapped match ranges across all query lines, for label
-/// highlighting in the results.
 /// The row-invariant half of an unsaved-edits row, so the builder below stays
 /// under a readable argument count.
 struct UnsavedFileRowCtx {
@@ -2931,7 +3427,7 @@ fn unsaved_file_row(
     left_pad: Pixels,
     row_height: Pixels,
     icon_slot_px: Pixels,
-    store: Arc<AppStore>,
+    open: gitcomet_extension_api::HostedAction,
     cx: &mut gpui::Context<SidebarPaneView>,
 ) -> AnyElement {
     let UnsavedFileRowCtx {
@@ -2942,12 +3438,13 @@ fn unsaved_file_row(
         ix,
         is_open,
     } = ctx;
-    let icon_px = crate::ui_scale::design_px_from_percent(12.0, 100);
+    let ui_scale_percent = crate::ui_scale::current(cx).percent;
+    let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
+    let icon_px = scaled_px(12.0);
     // The full repo-relative path, not just the file name: two `mod.rs` under
     // different folders are indistinguishable here, and this row is the only
     // place they appear side by side.
     let label = path.display().to_string();
-    let open_path = (*path).clone();
 
     div()
         .id(ElementId::Name(format!("file_browser_row_{ix}").into()))
@@ -2959,7 +3456,7 @@ fn unsaved_file_row(
         .w_full()
         .pl(left_pad)
         .pr_2()
-        .gap(px(4.0))
+        .gap(scaled_px(4.0))
         .interactive_row(
             row_style,
             components::InteractiveRowState::default().selected(is_open, open_row_bg),
@@ -2967,12 +3464,12 @@ fn unsaved_file_row(
         // Straight into the editor, not the read-only view: every row in this
         // section has unsaved text, and the read-only view would show the file
         // on disk instead of what the user was in the middle of writing.
-        .on_click(
-            cx.listener(move |_this, _e: &gpui::ClickEvent, _window, _cx| {
-                store.dispatch(Msg::OpenFileEditor {
-                    repo_id,
-                    path: open_path.clone(),
-                });
+        .on_activate(
+            false,
+            controls::ControlActivation::Composite,
+            cx.listener(move |this, _e: &gpui::ClickEvent, _window, cx| {
+                this.show_repository_canvas(cx);
+                open.invoke(cx);
             }),
         )
         .child(
@@ -2990,12 +3487,11 @@ fn unsaved_file_row(
         )
         .child(
             div().flex_1().min_w(px(0.0)).child(
-                components::TruncatedText::new(label)
-                    // Path elision keeps the file name, which is what identifies
-                    // the row, and drops the folders in the middle.
+                components::TruncatedText::new(label, theme.ui_text(14.0))
+                    // Path elision keeps the file name, which identifies the
+                    // row, and drops the folders in the middle.
                     .profile(components::TextTruncationProfile::Path)
-                    .text_color(theme.colors.foreground.primary)
-                    .text_sm()
+                    .text_color(file_browser_row_label_color(theme, is_open))
                     .render(cx),
             ),
         )
@@ -3031,10 +3527,16 @@ fn unsaved_file_row(
 }
 
 fn file_search_highlight_ranges(
-    matchers: &[DiffSearchMatcher],
+    matchers: &[TextSearchMatcher],
     name: &str,
 ) -> Vec<std::ops::Range<usize>> {
     const MAX_NAME_HIGHLIGHTS: usize = 16;
+    if matchers
+        .iter()
+        .any(|matcher| matcher.regex_error().is_some())
+    {
+        return Vec::new();
+    }
     let mut ranges = Vec::new();
     let mut buf = Vec::new();
     for matcher in matchers {
@@ -3059,8 +3561,8 @@ fn file_search_highlight_ranges(
 mod file_search_tests {
     use super::*;
 
-    fn options(match_case: bool, whole_word: bool, regex: bool) -> DiffSearchOptions {
-        DiffSearchOptions {
+    fn options(match_case: bool, whole_word: bool, regex: bool) -> TextSearchOptions {
+        TextSearchOptions {
             match_case,
             whole_word,
             regex,
@@ -3124,6 +3626,7 @@ mod file_search_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gitcomet_core::domain::Branch;
     use std::path::PathBuf;
 
     /// Three copies of "is the tree filtered" exist: this one, the reducer's
@@ -3131,7 +3634,7 @@ mod tests {
     /// They have to agree or the reducer freezes toggles the tree still honours.
     #[test]
     fn file_browser_search_predicate_agrees_with_the_renderers_matchers() {
-        let options = DiffSearchOptions::default();
+        let options = TextSearchOptions::default();
         for query in [
             "", " ", "\n", "  \n \t ", "a", " a ", "a\nb", "\na", "#comment",
         ] {
@@ -3139,6 +3642,75 @@ mod tests {
                 file_browser_search_is_active(query),
                 !file_search_matchers(query, options).is_empty(),
                 "predicates disagree for {query:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn active_local_branch_target_requires_matching_ready_branch_data() {
+        let mut repo = repo_state(RepoId(1), "/tmp/repo");
+        repo.head_branch = Loadable::Ready("feature/current".to_string());
+        repo.branches = Loadable::Ready(Arc::new(vec![Branch {
+            name: "feature/current".to_string(),
+            target: CommitId("current-tip".into()),
+            upstream: None,
+            divergence: None,
+        }]));
+
+        assert_eq!(
+            active_local_branch_target(&repo).map(|(name, tip)| (name, tip.0.as_ref())),
+            Some(("feature/current", "current-tip"))
+        );
+
+        repo.head_branch = Loadable::Ready("HEAD".to_string());
+        assert_eq!(active_local_branch_target(&repo), None);
+
+        repo.head_branch = Loadable::Ready("missing".to_string());
+        assert_eq!(active_local_branch_target(&repo), None);
+    }
+
+    #[test]
+    fn expanding_a_local_branch_path_preserves_unrelated_collapsed_groups() {
+        let local_section = branch_sidebar::local_section_storage_key().to_string();
+        let feature = branch_sidebar::local_group_storage_key("feature");
+        let feature_deep = branch_sidebar::local_group_storage_key("feature/deep");
+        let feature_deep_topic = branch_sidebar::local_group_storage_key("feature/deep/topic");
+        let unrelated = branch_sidebar::local_group_storage_key("release");
+        let mut collapsed = BTreeSet::from([
+            local_section.clone(),
+            feature.clone(),
+            feature_deep.clone(),
+            feature_deep_topic.clone(),
+            unrelated.clone(),
+        ]);
+
+        assert!(expand_local_branch_path(
+            &mut collapsed,
+            "feature/deep/topic"
+        ));
+        for expanded in [local_section, feature, feature_deep, feature_deep_topic] {
+            assert!(
+                !collapsed.contains(&expanded),
+                "{expanded} stayed collapsed"
+            );
+        }
+        assert!(collapsed.contains(&unrelated));
+        assert!(!expand_local_branch_path(
+            &mut collapsed,
+            "feature/deep/topic"
+        ));
+    }
+
+    #[test]
+    fn selected_file_rows_use_the_branch_selection_foreground() {
+        for theme in [AppTheme::gitcomet_light(), AppTheme::gitcomet_dark()] {
+            assert_eq!(
+                file_browser_row_label_color(theme, true),
+                selected_branch_label_color(theme)
+            );
+            assert_eq!(
+                file_browser_row_label_color(theme, false),
+                theme.colors.foreground.primary
             );
         }
     }
@@ -3153,11 +3725,27 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_repaints_when_either_status_lane_changes() {
+        let mut state = AppState {
+            repos: vec![repo_state(RepoId(1), "/tmp/repo")],
+            active_repo: Some(RepoId(1)),
+            sidebar_mode: SidebarMode::Files,
+            ..AppState::test_default()
+        };
+        let initial = SidebarNotifyFingerprint::from_state(&state);
+        state.repos[0].worktree_status_rev += 1;
+        let worktree = SidebarNotifyFingerprint::from_state(&state);
+        assert_ne!(initial, worktree);
+        state.repos[0].staged_status_rev += 1;
+        assert_ne!(worktree, SidebarNotifyFingerprint::from_state(&state));
+    }
+
+    #[test]
     fn sidebar_notify_fingerprint_tracks_open_repo_workdirs() {
         let mut state = AppState {
             repos: vec![repo_state(RepoId(1), "/tmp/repo")],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3168,7 +3756,17 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_notify_fingerprint_tracks_live_workspace_badge_branch_changes() {
+    fn sidebar_notify_fingerprint_tracks_sidebar_mode() {
+        let mut state = AppState::test_default();
+        let initial = SidebarNotifyFingerprint::from_state(&state);
+
+        state.sidebar_mode = SidebarMode::Files;
+
+        assert_ne!(SidebarNotifyFingerprint::from_state(&state), initial);
+    }
+
+    #[test]
+    fn sidebar_notify_fingerprint_tracks_live_worktree_badge_branch_changes() {
         let mut active = repo_state(RepoId(1), "/tmp/repo");
         active.worktrees = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Worktree {
             path: PathBuf::from("/tmp/repo-feature"),
@@ -3182,7 +3780,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![active, worktree_repo],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3194,7 +3792,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_notify_fingerprint_tracks_workspace_badge_removal_when_tab_closes() {
+    fn sidebar_notify_fingerprint_tracks_worktree_badge_removal_when_tab_closes() {
         let mut active = repo_state(RepoId(1), "/tmp/repo");
         active.worktrees = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Worktree {
             path: PathBuf::from("/tmp/repo-feature"),
@@ -3208,7 +3806,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![active, worktree_repo],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3219,7 +3817,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_notify_fingerprint_tracks_workspace_badge_removal_when_worktree_detaches() {
+    fn sidebar_notify_fingerprint_tracks_worktree_badge_removal_when_worktree_detaches() {
         let mut active = repo_state(RepoId(1), "/tmp/repo");
         active.worktrees = Loadable::Ready(Arc::new(vec![gitcomet_core::domain::Worktree {
             path: PathBuf::from("/tmp/repo-feature"),
@@ -3233,7 +3831,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![active, worktree_repo],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3253,7 +3851,7 @@ mod tests {
                 repo_state(RepoId(2), "/tmp/repo-wt"),
             ],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let state_b = AppState {
@@ -3262,7 +3860,7 @@ mod tests {
                 repo_state(RepoId(1), "/tmp/repo"),
             ],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         assert_eq!(
@@ -3317,7 +3915,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![active, inactive],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3347,7 +3945,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![active, related, unrelated],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3363,7 +3961,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![repo_state(RepoId(1), "/tmp/repo")],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3385,7 +3983,7 @@ mod tests {
         let mut state = AppState {
             repos: vec![repo_state(RepoId(1), "/tmp/repo")],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3406,7 +4004,7 @@ mod tests {
                 repo_state(RepoId(2), "/tmp/inactive"),
             ],
             active_repo: Some(RepoId(1)),
-            ..AppState::default()
+            ..AppState::test_default()
         };
 
         let initial = SidebarNotifyFingerprint::from_state(&state);
@@ -3449,9 +4047,23 @@ mod tests {
 
     fn filter_rows(query: &str, section: CollapsedSidebarSection) -> Vec<BranchSidebarRow> {
         let repo = repo_with_local_and_remote_branches();
-        let full =
-            branch_sidebar::branch_sidebar_rows(&repo, &BTreeSet::new(), &BTreeSet::new(), query);
-        filter_result_rows(&full, section)
+        let state = AppState {
+            active_repo: Some(repo.id),
+            repos: vec![repo],
+            ..AppState::test_default()
+        };
+        sidebar_presentation::build_sidebar_presentation_scoped(
+            &mut SidebarPresentationCache::default(),
+            &state,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            query,
+            Default::default(),
+            section.storage_key(),
+        )
+        .unwrap()
+        .rows
+        .to_vec()
     }
 
     fn branch_names(rows: &[BranchSidebarRow]) -> Vec<String> {
@@ -3463,68 +4075,43 @@ mod tests {
             .collect()
     }
 
-    fn group_header_sections(rows: &[BranchSidebarRow]) -> Vec<BranchSection> {
-        rows.iter()
-            .filter_map(|row| match row {
-                BranchSidebarRow::FilterGroupHeader { section } => Some(*section),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
-    fn collapsed_popover_filter_surfaces_the_other_branch_section() {
-        let rows = filter_rows("feature", CollapsedSidebarSection::Local);
-
+    fn collapsed_popover_search_stays_within_the_open_section() {
         assert_eq!(
-            group_header_sections(&rows),
-            vec![BranchSection::Local, BranchSection::Remote],
-            "a cross-section match should label the open section then the other one"
+            branch_names(&filter_rows("feature", CollapsedSidebarSection::Local)),
+            ["feature/alpha"]
         );
         assert_eq!(
-            branch_names(&rows),
-            vec![
-                "feature/alpha".to_string(),
-                "origin/feature/beta".to_string()
-            ],
-            "local matches lead, remote matches follow"
-        );
-
-        // Symmetric: the Remote popover surfaces local matches the same way.
-        let rows = filter_rows("feature", CollapsedSidebarSection::Remote);
-        assert_eq!(
-            group_header_sections(&rows),
-            vec![BranchSection::Remote, BranchSection::Local]
+            branch_names(&filter_rows("feature", CollapsedSidebarSection::Remote)),
+            ["origin/feature/beta"]
         );
         assert_eq!(
-            branch_names(&rows),
-            vec![
-                "origin/feature/beta".to_string(),
-                "feature/alpha".to_string()
-            ]
+            branch_names(&filter_rows("main", CollapsedSidebarSection::Local)),
+            ["main"]
         );
-    }
-
-    #[test]
-    fn collapsed_popover_filter_stays_unlabelled_when_only_one_section_matches() {
-        let rows = filter_rows("main", CollapsedSidebarSection::Local);
-
-        assert!(
-            group_header_sections(&rows).is_empty(),
-            "a single-section result needs no group labels; the popover title says it"
-        );
-        assert_eq!(branch_names(&rows), vec!["main".to_string()]);
-    }
-
-    #[test]
-    fn collapsed_popover_filter_shows_only_the_other_section_when_the_open_one_misses() {
-        let rows = filter_rows("release", CollapsedSidebarSection::Local);
-
-        assert_eq!(
-            group_header_sections(&rows),
-            vec![BranchSection::Remote],
-            "with no local matches only the remote half is labelled"
-        );
-        assert_eq!(branch_names(&rows), vec!["origin/release".to_string()]);
+        assert!(branch_names(&filter_rows("release", CollapsedSidebarSection::Local)).is_empty());
     }
 }
+
+#[cfg(test)]
+mod long_list_tests;
+
+mod search;
+mod sticky;
+
+#[cfg(test)]
+mod sticky_tests;
+
+#[cfg(feature = "benchmarks")]
+mod sticky_benchmark;
+#[cfg(feature = "benchmarks")]
+pub use sticky_benchmark::SidebarStickyFrameFixture;
+
+#[cfg(test)]
+mod explorer_drag_tests;
+
+#[cfg(test)]
+mod explorer_settings_tests;
+
+#[cfg(test)]
+mod repository_preferences_tests;

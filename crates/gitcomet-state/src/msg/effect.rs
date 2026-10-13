@@ -2,16 +2,78 @@ use crate::model::{ConflictFileLoadMode, RepoId};
 use gitcomet_core::auth::StagedGitAuth;
 use gitcomet_core::domain::*;
 use gitcomet_core::git_operation::GitOperationId;
+use gitcomet_core::remote_url::RemoteUrlPolicy;
 use gitcomet_core::services::{
-    ConflictSide, ForcePushLease, InteractiveRebaseEntry, PullMode, RemoteUrlKind, ResetMode,
-    SafePushAfterCommitContext, SafePushAfterCommitTarget, SubmoduleTrustTarget,
+    CheckoutRemoteBranchMode, ConflictSide, ForcePushLease, InteractiveRebaseEntry, PullMode,
+    RemoteUrlKind, ResetMode, SafePushAfterCommitContext, SafePushAfterCommitTarget,
+    SubmoduleTrustTarget,
 };
 use std::path::PathBuf;
 
 use super::RepoPathList;
 
-#[derive(Clone, Debug)]
+/// Matches every effect that runs a command with staged credentials,
+/// binding its `auth` slot, so both accessors list them once.
+macro_rules! match_git_auth {
+    ($effect:expr, $auth:ident => $then:expr) => {
+        match $effect {
+            Effect::RunLargeFileCommand { auth: $auth, .. }
+            | Effect::RevertCommit { auth: $auth, .. }
+            | Effect::CherryPickCommit { auth: $auth, .. }
+            | Effect::ApplyFileChange { auth: $auth, .. }
+            | Effect::CloneRepo { auth: $auth, .. }
+            | Effect::AddSubmodule { auth: $auth, .. }
+            | Effect::UpdateSubmodules { auth: $auth, .. }
+            | Effect::LoadSubmodule { auth: $auth, .. }
+            | Effect::Commit { auth: $auth, .. }
+            | Effect::CommitAmend { auth: $auth, .. }
+            | Effect::SafePushAfterCommit { auth: $auth, .. }
+            | Effect::FetchAll { auth: $auth, .. }
+            | Effect::FetchRefspecs { auth: $auth, .. }
+            | Effect::Pull { auth: $auth, .. }
+            | Effect::PullBranch { auth: $auth, .. }
+            | Effect::PushWithTags { auth: $auth, .. }
+            | Effect::Push { auth: $auth, .. }
+            | Effect::PushAfterCommit { auth: $auth, .. }
+            | Effect::ForcePush { auth: $auth, .. }
+            | Effect::ForcePushWithLease { auth: $auth, .. }
+            | Effect::PushSetUpstream { auth: $auth, .. }
+            | Effect::DeleteRemoteBranch { auth: $auth, .. }
+            | Effect::DeleteRemoteBranches { auth: $auth, .. }
+            | Effect::RebaseContinue { auth: $auth, .. }
+            | Effect::PushTag { auth: $auth, .. }
+            | Effect::DeleteRemoteTag { auth: $auth, .. } => $then,
+            _ => None,
+        }
+    };
+}
+
+impl Effect {
+    /// Credentials an auth-prompt retry attached to this command.
+    #[cfg(test)]
+    pub(crate) fn git_auth(&self) -> Option<&StagedGitAuth> {
+        match_git_auth!(self, auth => auth.as_ref())
+    }
+
+    /// Where an auth-prompt retry attaches credentials; `None` for effects
+    /// that never need them.
+    pub(crate) fn git_auth_slot(&mut self) -> Option<&mut Option<StagedGitAuth>> {
+        match_git_auth!(self, auth => Some(auth))
+    }
+}
+
+#[derive(Clone, Debug, strum::IntoStaticStr)]
 pub enum Effect {
+    Filesystem(gitcomet_core::filesystem::Request),
+    IndexedHistory(crate::indexed_history::IndexedHistoryEffect),
+    DiffSession(crate::diff_session::DiffSessionEffect),
+    HistoryAuthors(crate::history_authors::HistoryAuthorsEffect),
+    HistoryFind(crate::history_find::HistoryFindEffect),
+    UpdateRepositoryPreferences {
+        repo_id: RepoId,
+        key: crate::model::RepositoryKey,
+        update: crate::model::RepositoryPreferenceUpdate,
+    },
     PersistSession {
         repo_id: Option<RepoId>,
         action: &'static str,
@@ -65,6 +127,13 @@ pub enum Effect {
     LoadStagedStatus {
         repo_id: RepoId,
     },
+    LoadUncommittedLineStats {
+        repo_id: RepoId,
+        generation: crate::model::LineStatsGeneration,
+        status: std::sync::Arc<RepoStatus>,
+        /// Also classify rows for Git LFS / git-annex in the same pass.
+        large_files: bool,
+    },
     LoadStatus {
         repo_id: RepoId,
     },
@@ -104,10 +173,14 @@ pub enum Effect {
         limit: usize,
         request_rev: u64,
     },
+    /// One page of a file's history. `cursor: None` is the bounded first
+    /// page; a cursor page resumes after it and is served from the backend's
+    /// cached full follow walk, so one such request can ask for everything.
     LoadFileHistory {
         repo_id: RepoId,
         path: PathBuf,
         limit: usize,
+        cursor: Option<LogCursor>,
     },
     LoadBlame {
         repo_id: RepoId,
@@ -120,6 +193,7 @@ pub enum Effect {
     LoadWorktreeDirty {
         repo_id: RepoId,
         workdir: PathBuf,
+        scope: crate::model::WorktreeDirtyScope,
         /// Worktree whose changed-file lists the scan should carry back; every
         /// other worktree reports counts alone. `None` while no worktree row is
         /// selected. See [`gitcomet_core::domain::WorktreeDirtySummary`].
@@ -129,6 +203,19 @@ pub enum Effect {
         repo_id: RepoId,
     },
     LoadSubmodules {
+        repo_id: RepoId,
+    },
+    LoadLargeFileSupport {
+        repo_id: RepoId,
+    },
+    LoadLfsLocks {
+        repo_id: RepoId,
+    },
+    LoadAnnexWhereis {
+        repo_id: RepoId,
+        key: String,
+    },
+    LoadAnnexUnused {
         repo_id: RepoId,
     },
     LoadFileBrowser {
@@ -148,6 +235,18 @@ pub enum Effect {
         repo_id: RepoId,
         commit_id: CommitId,
     },
+    /// Verify the signatures of `commit_ids`. Batched because verification
+    /// shells out to `git`; the backend drops unsigned commits for free.
+    VerifyCommitSignatures {
+        repo_id: RepoId,
+        epoch: u64,
+        batch: u64,
+        cancellation: gitcomet_core::services::CancellationToken,
+        commit_ids: std::sync::Arc<[CommitId]>,
+        /// Only signatures in these formats are checked: the others have no
+        /// verifier installed.
+        formats: gitcomet_core::domain::SignatureFormats,
+    },
     LoadHoverCommitMessage {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -158,11 +257,23 @@ pub enum Effect {
         repo_id: RepoId,
         reference: CommitId,
     },
+    /// Resolve a commit reference for the Reveal Commit dialog's preview row.
+    /// Lighter than `ResolveCommitForReveal` — no parent diff — because it runs
+    /// while the user is still typing.
+    ResolveCommitLookup {
+        repo_id: RepoId,
+        reference: CommitId,
+        purpose: crate::model::CommitLookupPurpose,
+        /// Echoed back on the reply so a completion that lost a race against a
+        /// newer lookup can be dropped. See `CommitLookup::request`.
+        request: u64,
+    },
     LoadRangeFiles {
         repo_id: RepoId,
         from: CommitId,
         /// `None` lists files between `from` and the working tree.
         to: Option<CommitId>,
+        options: gitcomet_core::services::ComparisonOptions,
         /// Echoed back on the reply so a completion that lost a race against a
         /// newer load can be dropped. See `HistoryState::range_files_request`.
         request: u64,
@@ -193,6 +304,7 @@ pub enum Effect {
         repo_id: RepoId,
         commit_id: CommitId,
         path: PathBuf,
+        content_preview: bool,
     },
     LoadDiff {
         repo_id: RepoId,
@@ -247,12 +359,23 @@ pub enum Effect {
     SaveWorktreeFile {
         repo_id: RepoId,
         path: PathBuf,
-        contents: String,
+        contents: super::message::ContentBytes,
+        expected_contents: Option<std::sync::Arc<[u8]>>,
         stage: bool,
+        completion: Option<smol::channel::Sender<bool>>,
     },
     AppendGitignorePatterns {
         repo_id: RepoId,
         patterns: Vec<String>,
+    },
+    RunLargeFileCommand {
+        repo_id: RepoId,
+        command: gitcomet_core::large_files::LargeFileCommand,
+        auth: Option<StagedGitAuth>,
+    },
+    AppendGitattributesRule {
+        repo_id: RepoId,
+        rule: String,
     },
 
     CheckoutBranch {
@@ -264,6 +387,7 @@ pub enum Effect {
         remote: String,
         branch: String,
         local_branch: String,
+        mode: CheckoutRemoteBranchMode,
     },
     CheckoutCommit {
         repo_id: RepoId,
@@ -275,10 +399,25 @@ pub enum Effect {
         commit: bool,
         mainline: Option<usize>,
         summary: String,
+        /// Signing or fetch auth staged when a failed pick is replayed.
+        auth: Option<StagedGitAuth>,
     },
     RevertCommit {
         repo_id: RepoId,
         commit_id: CommitId,
+        commit: bool,
+        mainline: Option<usize>,
+        summary: String,
+        /// Signing or fetch auth staged when a failed revert is replayed.
+        auth: Option<StagedGitAuth>,
+    },
+    ApplyFileChange {
+        repo_id: RepoId,
+        target: gitcomet_core::domain::ApplyChangeTarget,
+        commit: bool,
+        commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
+        /// Signing auth staged when a failed commit step is replayed.
+        auth: Option<StagedGitAuth>,
     },
     CreateBranch {
         repo_id: RepoId,
@@ -289,11 +428,15 @@ pub enum Effect {
         repo_id: RepoId,
         name: String,
         target: String,
+        /// Reset the branch to `target` first when a branch with this name
+        /// already exists, instead of failing with "already exists".
+        force: bool,
     },
     RenameBranch {
         repo_id: RepoId,
         old_name: String,
         new_name: String,
+        force: bool,
     },
     DeleteBranch {
         repo_id: RepoId,
@@ -311,6 +454,7 @@ pub enum Effect {
     CloneRepo {
         url: String,
         dest: PathBuf,
+        remote_url_policy: RemoteUrlPolicy,
         auth: Option<StagedGitAuth>,
     },
     AbortCloneRepo {
@@ -345,9 +489,11 @@ pub enum Effect {
         branch: Option<String>,
         name: Option<String>,
         force: bool,
+        remote_url_policy: RemoteUrlPolicy,
     },
     CheckSubmoduleUpdateTrust {
         repo_id: RepoId,
+        remote_url_policy: RemoteUrlPolicy,
     },
     AddSubmodule {
         repo_id: RepoId,
@@ -357,21 +503,25 @@ pub enum Effect {
         name: Option<String>,
         force: bool,
         approved_sources: Vec<SubmoduleTrustTarget>,
+        remote_url_policy: RemoteUrlPolicy,
         auth: Option<StagedGitAuth>,
     },
     UpdateSubmodules {
         repo_id: RepoId,
         approved_sources: Vec<SubmoduleTrustTarget>,
+        remote_url_policy: RemoteUrlPolicy,
         auth: Option<StagedGitAuth>,
     },
     CheckSubmoduleLoadTrust {
         repo_id: RepoId,
         path: PathBuf,
+        remote_url_policy: RemoteUrlPolicy,
     },
     LoadSubmodule {
         repo_id: RepoId,
         path: PathBuf,
         approved_sources: Vec<SubmoduleTrustTarget>,
+        remote_url_policy: RemoteUrlPolicy,
         auth: Option<StagedGitAuth>,
     },
     ChangeSubmodulePointer {
@@ -385,15 +535,15 @@ pub enum Effect {
     },
     StageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
     },
     UnstageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
     },
     ApplyWorktreePatch {
         repo_id: RepoId,
-        patch: String,
+        patch: super::ContentBytes,
         reverse: bool,
     },
     StagePath {
@@ -423,11 +573,13 @@ pub enum Effect {
     Commit {
         repo_id: RepoId,
         message: String,
+        identity: Option<gitcomet_core::commit_identity::CommitIdentity>,
         auth: Option<StagedGitAuth>,
     },
     CommitAmend {
         repo_id: RepoId,
         message: String,
+        identity: Option<gitcomet_core::commit_identity::CommitIdentity>,
         auth: Option<StagedGitAuth>,
     },
     SafePushAfterCommit {
@@ -440,21 +592,38 @@ pub enum Effect {
         prune: bool,
         auth: Option<StagedGitAuth>,
     },
+    FetchRefspecs {
+        repo_id: RepoId,
+        remote: String,
+        refspecs: Vec<String>,
+        auth: Option<StagedGitAuth>,
+    },
     PruneMergedBranches {
         repo_id: RepoId,
     },
     PruneLocalTags {
         repo_id: RepoId,
     },
+    CheckRepoMaintenance {
+        repo_id: RepoId,
+    },
+    PersistRepoMaintenanceSnooze {
+        common_dir: std::path::PathBuf,
+    },
+    RunMaintenance {
+        repo_id: RepoId,
+    },
     Pull {
         repo_id: RepoId,
         mode: PullMode,
+        prune: bool,
         auth: Option<StagedGitAuth>,
     },
     PullBranch {
         repo_id: RepoId,
         remote: String,
         branch: String,
+        prune: bool,
         auth: Option<StagedGitAuth>,
     },
     MergeRef {
@@ -464,6 +633,17 @@ pub enum Effect {
     SquashRef {
         repo_id: RepoId,
         reference: String,
+    },
+    PushWithTags {
+        repo_id: RepoId,
+        request: gitcomet_core::tag_push::TagPushRequest,
+        auth: Option<StagedGitAuth>,
+    },
+    PreviewTagPush {
+        repo_id: RepoId,
+        request: gitcomet_core::tag_push::TagPushRequest,
+        cancellation: gitcomet_core::services::CancellationToken,
+        generation: u64,
     },
     Push {
         repo_id: RepoId,
@@ -493,7 +673,7 @@ pub enum Effect {
     SetUpstreamBranch {
         repo_id: RepoId,
         branch: String,
-        upstream: String,
+        upstream: Upstream,
     },
     UnsetUpstreamBranch {
         repo_id: RepoId,
@@ -552,6 +732,7 @@ pub enum Effect {
     InteractiveCherryPick {
         repo_id: RepoId,
         entries: Vec<InteractiveRebaseEntry>,
+        commit: bool,
     },
     /// Load the full `%B` messages of the commits selected for an
     /// interactive cherry-pick: the log page only carries subjects, and a
@@ -590,6 +771,7 @@ pub enum Effect {
         repo_id: RepoId,
         name: String,
         url: String,
+        remote_url_policy: RemoteUrlPolicy,
     },
     RemoveRemote {
         repo_id: RepoId,
@@ -600,6 +782,7 @@ pub enum Effect {
         name: String,
         url: String,
         kind: RemoteUrlKind,
+        remote_url_policy: RemoteUrlPolicy,
     },
     CheckoutConflictSide {
         repo_id: RepoId,

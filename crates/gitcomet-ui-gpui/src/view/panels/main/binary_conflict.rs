@@ -1,6 +1,14 @@
 use super::*;
 use gitcomet_core::services::ConflictSide;
 
+/// Same units as the binary diff placeholder and the large-file card.
+fn side_size_label(size: Option<usize>) -> SharedString {
+    match size {
+        None => "absent".into(),
+        Some(n) => gitcomet_core::text_utils::human_readable_bytes(n as u64).into(),
+    }
+}
+
 impl MainPaneView {
     /// Render the binary/non-UTF8 conflict resolver panel.
     ///
@@ -14,19 +22,12 @@ impl MainPaneView {
         file: &gitcomet_state::model::ConflictFile,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        let ui_scale_percent = crate::ui_scale::current(cx).percent;
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
         let [base_size, ours_size, theirs_size] = self.conflict_resolver.binary_side_sizes;
 
-        let format_size = |size: Option<usize>| -> SharedString {
-            match size {
-                None => "absent".into(),
-                Some(n) if n < 1024 => format!("{} B", n).into(),
-                Some(n) if n < 1024 * 1024 => format!("{:.1} KiB", n as f64 / 1024.0).into(),
-                Some(n) => format!("{:.1} MiB", n as f64 / (1024.0 * 1024.0)).into(),
-            }
-        };
-
         let side_row = |label: &'static str, size: Option<usize>, has_text: bool| -> gpui::Div {
-            let size_label = format_size(size);
+            let size_label = side_size_label(size);
             let kind_label: SharedString = if has_text {
                 "text (valid UTF-8)".into()
             } else if size.is_some() {
@@ -43,21 +44,21 @@ impl MainPaneView {
                 .py_1()
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(theme.ui_text(14.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.colors.foreground.primary)
-                        .w(px(80.0))
+                        .w(scaled_px(80.0))
                         .child(label),
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(theme.ui_text(14.0))
                         .text_color(theme.colors.foreground.secondary)
                         .child(size_label),
                 )
                 .child(
                     div()
-                        .text_xs()
+                        .text_size(theme.ui_text(12.0))
                         .text_color(if has_text {
                             theme.colors.foreground.secondary
                         } else if size.is_some() {
@@ -183,17 +184,22 @@ impl MainPaneView {
                 }),
             )
             .when(show_external_mergetool_actions(self.view_mode), |d| {
-                d.child(div().w(px(1.0)).h(px(16.0)).bg(theme.colors.stroke.default))
-                    .child(
-                        components::Button::new("binary_launch_mergetool", "External Mergetool")
-                            .style(components::ButtonStyle::Outlined)
-                            .on_click(theme, cx, move |this, _e, _w, _cx| {
-                                this.store.dispatch(Msg::LaunchMergetool {
-                                    repo_id,
-                                    path: mergetool_path.clone(),
-                                });
-                            }),
-                    )
+                d.child(
+                    div()
+                        .w(px(1.0))
+                        .h(scaled_px(16.0))
+                        .bg(theme.colors.stroke.default),
+                )
+                .child(
+                    components::Button::new("binary_launch_mergetool", "External Mergetool")
+                        .style(components::ButtonStyle::Outlined)
+                        .on_click(theme, cx, move |this, _e, _w, _cx| {
+                            this.store.dispatch(Msg::LaunchMergetool {
+                                repo_id,
+                                path: mergetool_path.clone(),
+                            });
+                        }),
+                )
             });
 
         let image_preview = has_image_preview.then(|| {
@@ -231,13 +237,13 @@ impl MainPaneView {
                     .flex_col()
                     .child(
                         div()
-                            .h(px(24.0))
+                            .h(scaled_px(24.0))
                             .px_2()
                             .flex()
                             .items_center()
                             .justify_between()
                             .bg(theme.colors.surface.raised)
-                            .text_xs()
+                            .text_size(theme.ui_text(12.0))
                             .text_color(theme.colors.foreground.secondary)
                             .child(label),
                     )
@@ -264,22 +270,22 @@ impl MainPaneView {
                                         .into_any_element()
                                 }
                                 Loadable::NotLoaded | Loadable::Loading if has_source => div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child("Processing image...")
                                     .into_any_element(),
                                 Loadable::Error(error) => div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child(error)
                                     .into_any_element(),
                                 Loadable::Ready(None) if has_source => div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child("Preview unavailable.")
                                     .into_any_element(),
                                 _ => div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child("No image")
                                     .into_any_element(),
@@ -292,14 +298,14 @@ impl MainPaneView {
                 .px_3()
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(theme.ui_text(14.0))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme.colors.foreground.primary)
                         .child("Image preview"),
                 )
                 .child(
                     div()
-                        .h(px(180.0))
+                        .h(scaled_px(180.0))
                         .w_full()
                         .mt_2()
                         .flex()
@@ -343,7 +349,7 @@ impl MainPaneView {
             .child(
                 div().flex().items_center().gap_2().child(
                     div()
-                        .text_sm()
+                        .text_size(theme.ui_text(14.0))
                         .font_weight(FontWeight::BOLD)
                         .text_color(theme.colors.foreground.primary)
                         .child(title),
@@ -367,12 +373,12 @@ impl MainPaneView {
                     // Icon/label
                     .child(
                         div()
-                            .text_lg()
+                            .text_size(theme.ui_text(18.0))
                             .font_weight(FontWeight::BOLD)
                             .text_color(theme.colors.status.warning.foreground)
                             .child("Binary file conflict"),
                     )
-                    .child(div().text_sm().text_color(theme.colors.foreground.secondary).child(
+                    .child(div().text_size(theme.ui_text(14.0)).text_color(theme.colors.foreground.secondary).child(
                         "This file contains binary or non-UTF8 data and cannot be merged as text.",
                     ))
                     .when_some(image_preview, |d, preview| d.child(preview))
@@ -389,5 +395,18 @@ impl MainPaneView {
                     .child(action_section),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::side_size_label;
+
+    #[test]
+    fn side_sizes_use_the_shared_decimal_units() {
+        assert_eq!(side_size_label(None).as_ref(), "absent");
+        assert_eq!(side_size_label(Some(512)).as_ref(), "512 B");
+        assert_eq!(side_size_label(Some(1_536)).as_ref(), "1.5 KB");
+        assert_eq!(side_size_label(Some(12_345_678)).as_ref(), "12.3 MB");
     }
 }

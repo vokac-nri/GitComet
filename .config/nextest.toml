@@ -1,0 +1,81 @@
+[profile.ci]
+fail-fast = false
+retries = 0
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "10s" }
+leak-timeout = { period = "500ms", result = "fail" }
+success-output = "never"
+failure-output = "immediate-final"
+
+[profile.ci.junit]
+path = "junit.xml"
+store-success-output = true
+report-skipped = "ignored"
+
+# Opt-in repetitions must not overwrite the inventory-checked CI report.
+[profile.ci-watch-stress]
+fail-fast = false
+retries = 0
+test-threads = "num-cpus"
+slow-timeout = { period = "60s", terminate-after = 3, grace-period = "10s" }
+leak-timeout = { period = "500ms", result = "fail" }
+failure-output = "immediate-final"
+
+[profile.ci-watch-stress.junit]
+path = "junit.xml"
+store-success-output = true
+
+[[profile.ci.overrides]]
+filter = 'binary(git_cli_scoreboard)'
+success-output = "immediate"
+
+# Optional experiment: leave watcher waits room to run while limiting the
+# CLI/backend suites to four concurrent tests. Inherit every CI safety check.
+[test-groups.git-heavy]
+max-threads = 4
+
+# Measurement candidates; the ordinary CI profile remains unchanged.
+[test-groups.native-watch-4]
+max-threads = 4
+
+[test-groups.native-watch-8]
+max-threads = 8
+
+[profile.ci-watch-limited-4]
+inherits = "ci"
+
+[[profile.ci-watch-limited-4.overrides]]
+filter = 'package(=gitcomet-fs-watch) | (package(=gitcomet-state) & (test(native_sync_) | test(native_barrier_) | test(::selective::) | test(::worktree_redirect::)))'
+test-group = 'native-watch-4'
+
+[profile.ci-watch-limited-8]
+inherits = "ci"
+
+[[profile.ci-watch-limited-8.overrides]]
+filter = 'package(=gitcomet-fs-watch) | (package(=gitcomet-state) & (test(native_sync_) | test(native_barrier_) | test(::selective::) | test(::worktree_redirect::)))'
+test-group = 'native-watch-8'
+
+[profile.ci-git-limited]
+inherits = "ci"
+
+[[profile.ci-git-limited.overrides]]
+filter = 'package(=gitcomet-git-gix) | binary(=difftool_git_integration) | binary(=mergetool_git_integration) | binary(=standalone_tool_mode_integration)'
+test-group = 'git-heavy'
+
+# Local scheduling experiment: start the six longest measured watcher cases
+# early, leaving other slots for CPU/process-heavy tests while these await OS
+# events. Keep their settling and negative quiet windows unchanged.
+[profile.ci-watch-first]
+inherits = "ci"
+
+[[profile.ci-watch-first.overrides]]
+filter = 'package(=gitcomet-state) & (test(=store::repo_monitor::tests::selective::native_lifecycle::repeated_directory_recreation_stops_stale_callbacks_and_keeps_crud_visible) | test(=store::repo_monitor::tests::selective::efficiency::ignored_directory_replaced_by_file_keeps_creation_and_edits_visible) | test(=store::repo_monitor::tests::selective::native_monitor_rebuilds_after_ignore_edits_moves_and_atomic_saves) | test(=store::repo_monitor::tests::selective::native_lifecycle::replacing_repository_root_detaches_old_tree_and_watches_replacement) | test(=store::repo_monitor::tests::selective::native_lifecycle::recreated_external_policy_parent_is_revalidated_without_native_watches) | test(=store::repo_monitor::tests::selective::native_lifecycle::repeated_atomic_file_replacement_keeps_later_in_place_edits_visible))'
+priority = 100
+
+# Combine the existing limits and priority policy without changing coverage.
+[profile.ci-throughput]
+inherits = "ci-git-limited"
+
+[[profile.ci-throughput.overrides]]
+filter = 'package(=gitcomet-state) & (test(=store::repo_monitor::tests::selective::native_lifecycle::repeated_directory_recreation_stops_stale_callbacks_and_keeps_crud_visible) | test(=store::repo_monitor::tests::selective::efficiency::ignored_directory_replaced_by_file_keeps_creation_and_edits_visible) | test(=store::repo_monitor::tests::selective::native_monitor_rebuilds_after_ignore_edits_moves_and_atomic_saves) | test(=store::repo_monitor::tests::selective::native_lifecycle::replacing_repository_root_detaches_old_tree_and_watches_replacement) | test(=store::repo_monitor::tests::selective::native_lifecycle::recreated_external_policy_parent_is_revalidated_without_native_watches) | test(=store::repo_monitor::tests::selective::native_lifecycle::repeated_atomic_file_replacement_keeps_later_in_place_edits_visible))'
+priority = 100

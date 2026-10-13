@@ -100,25 +100,12 @@ fn config() -> &'static StartupProbeConfig {
     })
 }
 
-fn env_flag(key: &str) -> bool {
-    env::var(key)
-        .ok()
-        .as_deref()
-        .map(parse_bool_flag)
-        .unwrap_or(false)
-}
+pub(crate) use gitcomet_ui_kit::ui_probe::env_flag;
 
 fn env_usize(key: &str) -> Option<usize> {
     env::var(key)
         .ok()
         .and_then(|value| value.trim().parse::<usize>().ok())
-}
-
-fn parse_bool_flag(value: &str) -> bool {
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
 }
 
 fn mark_once(event: StartupProbeEvent, emitted: &AtomicBool) -> bool {
@@ -185,9 +172,10 @@ fn current_rss_kib() -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_ready_repos, pack_repo_progress, parse_bool_flag};
+    use super::{count_ready_repos, pack_repo_progress};
     use gitcomet_core::domain::RepoSpec;
     use gitcomet_state::model::{AppState, Loadable, RepoId, RepoState};
+    use gitcomet_ui_kit::ui_probe::parse_bool_flag;
     use std::path::PathBuf;
 
     #[test]
@@ -199,14 +187,14 @@ mod tests {
 
     #[test]
     fn parse_bool_flag_rejects_other_values() {
-        for value in ["0", "false", "no", "", "maybe"] {
+        for value in ["0", "false", "no", "off", "", "maybe"] {
             assert!(!parse_bool_flag(value), "expected {value:?} to be falsy");
         }
     }
 
     #[test]
     fn count_ready_repos_only_counts_opened_repositories() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let mut ready = RepoState::new_opening(
             RepoId(1),
             RepoSpec {

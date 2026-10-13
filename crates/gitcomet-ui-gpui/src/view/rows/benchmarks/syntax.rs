@@ -10,9 +10,9 @@ use super::diff_text::{
 };
 use super::*;
 use crate::view::markdown_preview::{
-    self, MarkdownChangeHint, MarkdownInlineSpan, MarkdownInlineStyle, MarkdownPreviewDiff,
-    MarkdownPreviewDocument, MarkdownPreviewRow, MarkdownPreviewRowKind,
-    MarkdownPreviewRowStyledTextCache, MarkdownPreviewRowWidthCache,
+    self, MarkdownBlock, MarkdownChangeHint, MarkdownInlineSpan, MarkdownInlineStyle,
+    MarkdownPreviewDiff, MarkdownPreviewDocument, MarkdownPreviewRow, MarkdownPreviewRowKind,
+    MarkdownPreviewRowStyledTextCache, markdown_document_blocks,
 };
 use crate::view::panes::main::diff_cache::render_svg_image_diff_preview;
 pub struct FileDiffSyntaxPrepareSource {
@@ -102,8 +102,11 @@ impl SyntaxPairLookupFixture {
     }
 
     pub fn run_lookup(&self) -> u64 {
+        let tab_width = 4;
+
         let mut h = FxHasher::default();
         let pair = prepared_diff_syntax_pair_at_display_offset(
+            tab_width,
             self.document,
             self.line_ix,
             self.display_offset,
@@ -252,11 +255,11 @@ impl FileDiffSyntaxPrepareFixture {
 
         let metrics = benchmark_diff_syntax_prepared_cache_metrics();
         let total = metrics.hit.saturating_add(metrics.miss);
-        let hit_rate_per_mille = if total == 0 {
-            0
-        } else {
-            metrics.hit.saturating_mul(1000) / total
-        };
+        let hit_rate_per_mille = metrics
+            .hit
+            .saturating_mul(1000)
+            .checked_div(total)
+            .unwrap_or(0);
 
         let mut h = FxHasher::default();
         prepared.len().hash(&mut h);
@@ -369,10 +372,13 @@ impl FileDiffSyntaxPrepareFixture {
         document: Option<super::diff_text::PreparedDiffSyntaxDocument>,
         line_ix: usize,
     ) -> u64 {
+        let tab_width = 4;
+
         let line_ix = line_ix.min(lines.len().saturating_sub(1));
         let text = lines.get(line_ix).map(String::as_str).unwrap_or("");
         let styled =
             super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking(
+                tab_width,
                 self.theme,
                 text,
                 &[],
@@ -402,10 +408,13 @@ impl FileDiffSyntaxPrepareFixture {
         document: Option<super::diff_text::PreparedDiffSyntaxDocument>,
         line_ix: usize,
     ) -> u64 {
+        let tab_width = 4;
+
         let line_ix = line_ix.min(line_count.saturating_sub(1));
         let text = super::diff_text::resolved_output_line_text(text, line_starts, line_ix);
         let styled =
             super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking(
+                tab_width,
                 self.theme,
                 text,
                 &[],
@@ -560,9 +569,12 @@ impl FileDiffSyntaxReparseFixture {
         lines: &[String],
         document: Option<super::diff_text::PreparedDiffSyntaxDocument>,
     ) -> u64 {
+        let tab_width = 4;
+
         let text = lines.first().map(String::as_str).unwrap_or("");
         let styled =
             super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking(
+                tab_width,
                 self.theme,
                 text,
                 &[],
@@ -738,6 +750,8 @@ impl FileDiffInlineSyntaxProjectionFixture {
     }
 
     fn hash_window_step(&self, start: usize, window: usize) -> (u64, bool) {
+        let tab_width = 4;
+
         if self.inline_rows.is_empty() || window == 0 {
             return (0, false);
         }
@@ -753,6 +767,7 @@ impl FileDiffInlineSyntaxProjectionFixture {
             .collect::<Vec<_>>();
         let styled_rows =
             super::diff_text::build_cached_diff_styled_text_for_inline_syntax_only_rows_nonblocking(
+                tab_width,
                 self.theme,
                 Some(self.language),
                 super::diff_text::PreparedDiffSyntaxTextSource {
@@ -1249,6 +1264,8 @@ impl WorktreePreviewRenderFixture {
         window: usize,
         prepared_document: Option<super::diff_text::PreparedDiffSyntaxDocument>,
     ) -> u64 {
+        let tab_width = 4;
+
         if self.lines.is_empty() || window == 0 {
             return 0;
         }
@@ -1263,7 +1280,7 @@ impl WorktreePreviewRenderFixture {
                 &self.line_starts,
                 line_ix,
             );
-            let styled = super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking_with_palette(
+            let styled = super::diff_text::build_cached_diff_styled_text_for_prepared_document_line_nonblocking_with_palette(tab_width,
                 self.theme,
                 &highlight_palette,
                 super::diff_text::PreparedDiffTextBuildRequest {
@@ -1494,7 +1511,8 @@ impl ImagePreviewFirstPaintFixture {
 /// model a rendered 5k-row document with 500 2k-character rows without being
 /// constrained by the production single-document 1 MiB source-size guard.
 pub struct MarkdownPreviewScrollFixture {
-    document: MarkdownPreviewDocument,
+    document: MarkdownBenchDocument,
+    host: MarkdownElementHost,
     theme: AppTheme,
     profile: MarkdownPreviewScrollProfile,
 }
@@ -1509,7 +1527,8 @@ impl MarkdownPreviewScrollFixture {
         );
         let profile = profile_markdown_preview_scroll_document(&document, 0);
         Self {
-            document,
+            document: MarkdownBenchDocument::new(document),
+            host: MarkdownElementHost::new(),
             theme: AppTheme::gitcomet_dark(),
             profile,
         }
@@ -1528,14 +1547,24 @@ impl MarkdownPreviewScrollFixture {
             RICH_MARKDOWN_SCROLL_LONG_ROW_BYTES as u64
         );
         Self {
-            document,
+            document: MarkdownBenchDocument::new(document),
+            host: MarkdownElementHost::new(),
             theme: AppTheme::gitcomet_dark(),
             profile,
         }
     }
 
     pub fn run_scroll_step(&self, start: usize, window: usize) -> u64 {
-        hash_markdown_preview_window(self.theme, &self.document, start, window)
+        let tab_width = 4;
+
+        hash_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.document,
+            start,
+            window,
+        )
     }
 
     pub fn run_scroll_step_with_metrics(
@@ -1546,7 +1575,7 @@ impl MarkdownPreviewScrollFixture {
     ) -> (u64, MarkdownPreviewScrollMetrics) {
         let hash = self.run_scroll_step(start, window);
         let (actual_start, actual_end) =
-            markdown_preview_document_window_bounds(&self.document, start, window);
+            markdown_preview_document_window_bounds(&self.document.document, start, window);
         let rows_rendered = actual_end.saturating_sub(actual_start);
         let metrics = MarkdownPreviewScrollMetrics {
             total_rows: self.profile.total_rows,
@@ -1571,8 +1600,11 @@ pub struct MarkdownPreviewFixture {
     single_source: String,
     old_source: String,
     new_source: String,
-    single_document: MarkdownPreviewDocument,
+    single: MarkdownBenchDocument,
     diff_preview: MarkdownPreviewDiff,
+    diff_old: MarkdownBenchDocument,
+    diff_new: MarkdownBenchDocument,
+    host: MarkdownElementHost,
     theme: AppTheme,
 }
 
@@ -1592,8 +1624,17 @@ impl MarkdownPreviewFixture {
             single_source,
             old_source,
             new_source,
-            single_document,
+            single: MarkdownBenchDocument::new(single_document),
+            diff_old: MarkdownBenchDocument::with_blocks(
+                diff_preview.old.clone(),
+                &diff_preview.old_blocks,
+            ),
+            diff_new: MarkdownBenchDocument::with_blocks(
+                diff_preview.new.clone(),
+                &diff_preview.new_blocks,
+            ),
             diff_preview,
+            host: MarkdownElementHost::new(),
             theme: AppTheme::gitcomet_dark(),
         }
     }
@@ -1618,26 +1659,49 @@ impl MarkdownPreviewFixture {
     }
 
     pub fn run_render_single_step(&self, start: usize, window: usize) -> u64 {
-        hash_markdown_preview_window(self.theme, &self.single_document, start, window)
+        let tab_width = 4;
+
+        hash_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.single,
+            start,
+            window,
+        )
     }
 
     /// Measure first-window diff rendering metrics (used for sidecar emission).
     pub fn measure_first_window_diff(&self, window: usize) -> MarkdownPreviewFirstWindowMetrics {
+        let tab_width = 4;
+
         let old_total = self.diff_preview.old.rows.len();
         let new_total = self.diff_preview.new.rows.len();
         let old_end = window.min(old_total);
         let new_end = window.min(new_total);
 
-        let old_rendered =
-            render_markdown_preview_window(self.theme, &self.diff_preview.old, 0, old_end);
-        let new_rendered =
-            render_markdown_preview_window(self.theme, &self.diff_preview.new, 0, new_end);
+        let old_rows_rendered = render_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.diff_old,
+            0,
+            old_end,
+        );
+        let new_rows_rendered = render_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.diff_new,
+            0,
+            new_end,
+        );
 
         MarkdownPreviewFirstWindowMetrics {
             old_total_rows: old_total as u64,
             new_total_rows: new_total as u64,
-            old_rows_rendered: old_rendered.len() as u64,
-            new_rows_rendered: new_rendered.len() as u64,
+            old_rows_rendered: old_rows_rendered as u64,
+            new_rows_rendered: new_rows_rendered as u64,
         }
     }
 
@@ -1647,27 +1711,113 @@ impl MarkdownPreviewFixture {
     }
 
     pub fn run_render_diff_step(&self, start: usize, window: usize) -> u64 {
+        let tab_width = 4;
+
         if window == 0 {
             return 0;
         }
 
-        let left =
-            render_markdown_preview_window(self.theme, &self.diff_preview.old, start, window);
-        let right =
-            render_markdown_preview_window(self.theme, &self.diff_preview.new, start, window);
+        let left_rows = render_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.diff_old,
+            start,
+            window,
+        );
+        let right_rows = render_markdown_preview_window(
+            tab_width,
+            &self.host,
+            self.theme,
+            &self.diff_new,
+            start,
+            window,
+        );
 
         let mut h = FxHasher::default();
         start.hash(&mut h);
         window.hash(&mut h);
-        std::hint::black_box(left).len().hash(&mut h);
-        std::hint::black_box(right).len().hash(&mut h);
+        left_rows.hash(&mut h);
+        right_rows.hash(&mut h);
         h.finish()
     }
 }
 
+/// A document ready to render in a benchmark frame: shared, with its blocks
+/// grouped once, as the pane's block cache keeps them.
+struct MarkdownBenchDocument {
+    document: Arc<MarkdownPreviewDocument>,
+    blocks: Rc<[MarkdownBlock]>,
+}
+
+impl MarkdownBenchDocument {
+    fn new(document: MarkdownPreviewDocument) -> Self {
+        let blocks = markdown_document_blocks(&document);
+        Self::with_blocks(document, &blocks)
+    }
+
+    fn with_blocks(document: MarkdownPreviewDocument, blocks: &[MarkdownBlock]) -> Self {
+        Self {
+            document: Arc::new(document),
+            blocks: Rc::from(blocks),
+        }
+    }
+}
+
+/// Builds a benchmark's elements inside a window draw. Outside one, gpui puts
+/// every element in a thread-local arena nothing clears, so building them
+/// directly grew the process by the size of each frame, every iteration.
+struct MarkdownElementHost {
+    cx: RefCell<gpui::TestAppContext>,
+    window: gpui::WindowHandle<MarkdownElementHostView>,
+}
+
+#[derive(Default)]
+struct MarkdownElementHostView {
+    build: Option<Box<dyn FnOnce() -> AnyElement>>,
+}
+
+impl Render for MarkdownElementHostView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        // Built and dropped: the benchmark measures building a window of
+        // blocks, not laying them out.
+        if let Some(build) = self.build.take() {
+            drop(std::hint::black_box(build()));
+        }
+        div()
+    }
+}
+
+impl MarkdownElementHost {
+    fn new() -> Self {
+        let mut cx = gpui::TestAppContext::single();
+        let window = cx.add_window(|_, _| MarkdownElementHostView::default());
+        Self {
+            cx: RefCell::new(cx),
+            window,
+        }
+    }
+
+    fn build(&self, build: impl FnOnce() -> AnyElement + 'static) {
+        let mut cx = self.cx.borrow_mut();
+        self.window
+            .update(&mut *cx, |view, window, _cx| {
+                view.build = Some(Box::new(build));
+                window.refresh();
+            })
+            .expect("markdown benchmark window should stay open");
+        cx.update_window(self.window.into(), |_, window, app| {
+            let _ = window.draw(app);
+        })
+        .expect("markdown benchmark window should stay open");
+    }
+}
+
 fn hash_markdown_preview_window(
+    tab_width: usize,
+    host: &MarkdownElementHost,
     theme: AppTheme,
-    document: &MarkdownPreviewDocument,
+    document: &MarkdownBenchDocument,
     start: usize,
     window: usize,
 ) -> u64 {
@@ -1675,42 +1825,65 @@ fn hash_markdown_preview_window(
         return 0;
     }
 
-    let rows = render_markdown_preview_window(theme, document, start, window);
+    let rows = render_markdown_preview_window(tab_width, host, theme, document, start, window);
     let mut h = FxHasher::default();
     start.hash(&mut h);
     window.hash(&mut h);
-    std::hint::black_box(rows).len().hash(&mut h);
+    rows.hash(&mut h);
     h.finish()
 }
 
+/// Build the preview's elements for the blocks holding rows `start..start +
+/// window`, as a frame builds the blocks near the viewport, and return how
+/// many rows those blocks hold.
 fn render_markdown_preview_window(
+    tab_width: usize,
+    host: &MarkdownElementHost,
     theme: AppTheme,
-    document: &MarkdownPreviewDocument,
+    document: &MarkdownBenchDocument,
     start: usize,
     window: usize,
-) -> Vec<AnyElement> {
-    let (start, end) = markdown_preview_document_window_bounds(document, start, window);
-    if start == end {
-        return Vec::new();
-    }
-
-    super::history::render_markdown_preview_document_rows(
-        document,
-        start..end,
-        &super::history::MarkdownPreviewRenderContext {
+) -> usize {
+    let (start, end) = markdown_preview_document_window_bounds(&document.document, start, window);
+    let blocks = &document.blocks;
+    let first = blocks.partition_point(|block| block.row_range().end <= start);
+    let last = first + blocks[first..].partition_point(|block| block.row_range().start < end);
+    let rows = blocks[first..last]
+        .iter()
+        .map(|block| block.row_range().len())
+        .sum();
+    let (shared, blocks) = (Arc::clone(&document.document), Rc::clone(blocks));
+    host.build(move || {
+        let context = super::MarkdownDocumentContext {
             theme,
-            min_width: px(0.0),
-            editor_font_family: crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY.into(),
             ui_scale_percent: crate::ui_scale::DEFAULT_UI_SCALE_PERCENT,
+            editor_font_family: crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY.into(),
+            image_root: None,
+            remote_image_access: Default::default(),
+            picture_sizes: Default::default(),
+            drawn_pictures: None,
+            row_boxes: Default::default(),
+            block_scrolls: Default::default(),
+            blocks: Default::default(),
+            layout: Default::default(),
             view: None,
             text_region: DiffTextRegion::Inline,
-            wrap_plan: None,
-            image_base_dir: None,
-            // A benchmark must never reach the network.
-            load_remote_images: false,
+            change_bar_color: None,
             query: None,
-        },
-    )
+            reveal: Default::default(),
+            scroll: None,
+            hovered_link: None,
+            change_extents: None,
+            tasks_editable: false,
+        };
+        super::render_markdown_document_with_blocks(
+            tab_width,
+            &shared,
+            &blocks[first..last],
+            &context,
+        )
+    });
+    rows
 }
 
 fn markdown_preview_document_window_bounds(
@@ -1951,7 +2124,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base,
             None,
-            false,
             0,
             0,
             true,
@@ -1967,11 +2139,9 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 1,
             None,
-            false,
             0,
             0,
-            true,
-        ));
+            true,));
         rows.push(build_markdown_preview_row(
             MarkdownPreviewRowKind::Paragraph,
             padded_markdown_preview_text(
@@ -1981,7 +2151,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 2,
             None,
-            false,
             0,
             0,
             true,
@@ -1995,7 +2164,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 3,
             None,
-            false,
             0,
             0,
             true,
@@ -2009,7 +2177,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 4,
             None,
-            false,
             1,
             0,
             true,
@@ -2025,7 +2192,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 5,
             None,
-            false,
             1,
             0,
             true,
@@ -2039,7 +2205,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 6,
             None,
-            false,
             0,
             1,
             true,
@@ -2056,7 +2221,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 7,
             Some(DiffSyntaxLanguage::Rust),
-            false,
             0,
             0,
             false,
@@ -2075,11 +2239,9 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 8,
             Some(DiffSyntaxLanguage::Rust),
-            true,
             0,
             0,
-            false,
-        ));
+            false,));
         rows.push(build_markdown_preview_row(
             MarkdownPreviewRowKind::TableRow { is_header: true },
             padded_markdown_preview_text(
@@ -2089,7 +2251,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 9,
             None,
-            false,
             0,
             0,
             true,
@@ -2103,7 +2264,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 10,
             None,
-            false,
             0,
             0,
             true,
@@ -2117,7 +2277,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 11,
             None,
-            false,
             0,
             0,
             true,
@@ -2131,7 +2290,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 12,
             None,
-            false,
             0,
             0,
             true,
@@ -2145,7 +2303,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 13,
             None,
-            false,
             2,
             0,
             true,
@@ -2161,7 +2318,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 14,
             None,
-            false,
             2,
             0,
             true,
@@ -2175,7 +2331,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 15,
             None,
-            false,
             0,
             1,
             true,
@@ -2192,7 +2347,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 16,
             Some(DiffSyntaxLanguage::Rust),
-            false,
             0,
             0,
             false,
@@ -2209,7 +2363,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 17,
             Some(DiffSyntaxLanguage::Rust),
-            false,
             0,
             0,
             false,
@@ -2219,7 +2372,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             String::new(),
             row_base + 18,
             None,
-            false,
             0,
             0,
             false,
@@ -2233,7 +2385,6 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
             ),
             row_base + 19,
             None,
-            false,
             0,
             0,
             true,
@@ -2241,7 +2392,7 @@ fn build_synthetic_rich_markdown_scroll_document() -> MarkdownPreviewDocument {
     }
 
     debug_assert_eq!(rows.len(), RICH_MARKDOWN_SCROLL_TOTAL_ROWS);
-    MarkdownPreviewDocument { rows }
+    MarkdownPreviewDocument::new(rows)
 }
 
 fn build_markdown_preview_row(
@@ -2249,7 +2400,6 @@ fn build_markdown_preview_row(
     text: String,
     source_line: usize,
     code_language: Option<DiffSyntaxLanguage>,
-    code_block_horizontal_scroll_hint: bool,
     indent_level: u8,
     blockquote_level: u8,
     styled_inline: bool,
@@ -2261,11 +2411,11 @@ fn build_markdown_preview_row(
     };
 
     MarkdownPreviewRow {
+        diagram: None,
         kind,
         text: text.into(),
         inline_spans,
         code_language,
-        code_block_horizontal_scroll_hint,
         source_line_range: source_line..source_line.saturating_add(1),
         change_hint: MarkdownChangeHint::None,
         indent_level,
@@ -2276,7 +2426,10 @@ fn build_markdown_preview_row(
         image: None,
         inline_images: Arc::from(Vec::new()),
         styled_text_cache: MarkdownPreviewRowStyledTextCache::default(),
-        measured_width_px: MarkdownPreviewRowWidthCache::default(),
+        table: None,
+        task: None,
+        continues_item: false,
+        align: Default::default(),
     }
 }
 

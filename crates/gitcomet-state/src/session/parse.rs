@@ -170,6 +170,28 @@ pub(super) fn migrate_scaled_dimension_to_design_units(
     (design_units.is_finite() && design_units >= 1.0).then_some(design_units as u32)
 }
 
+pub(super) fn migrate_legacy_repo_fetch_prune_setting(mut file: UiSessionFile) -> UiSessionFile {
+    if file.fetch_prune_deleted_remote_branches.is_none() {
+        file.fetch_prune_deleted_remote_branches = file
+            .repo_fetch_prune_deleted_remote_tracking_branches
+            .as_ref()
+            .filter(|settings| !settings.is_empty())
+            // The setting is global now, so preserve every prior opt-out.
+            .map(|settings| settings.values().all(|enabled| *enabled));
+    }
+    file.repo_fetch_prune_deleted_remote_tracking_branches = None;
+    file
+}
+
+/// Pre-v5 builds defaulted to Compact and wrote it back on every settings save,
+/// and they discard newer files, so their "compact" is not a user choice.
+pub(super) fn migrate_pre_v5_default_density(mut file: UiSessionFile) -> UiSessionFile {
+    if file.ui_density.as_deref() == Some("compact") {
+        file.ui_density = None;
+    }
+    file
+}
+
 pub(super) fn migrate_v2_file(mut file: UiSessionFile) -> UiSessionFile {
     let ui_scale_percent = file.ui_scale_percent;
     file.version = CURRENT_SESSION_FILE_VERSION;

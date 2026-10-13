@@ -1,4 +1,5 @@
 use super::*;
+use crate::kit::click::PointerClickExt as _;
 
 impl PopoverHost {
     pub(in crate::view) fn popover_view(
@@ -10,20 +11,23 @@ impl PopoverHost {
         let theme = self.theme;
         let ui_scale = popover_ui_scale(cx);
         let ui_scale_percent = ui_scale.percent();
-        let scaled_px = |value: f32| popover_scaled_px(value, ui_scale);
+        let scaled_px = crate::ui_scale::scaler(ui_scale);
         let anchor_source = self
             .popover_anchor
             .clone()
             .unwrap_or_else(|| PopoverAnchor::Point(point(px(64.0), px(64.0))));
         let anchor_is_bounds = matches!(&anchor_source, PopoverAnchor::Bounds(_));
-        let window_bounds = window.window_bounds().get_bounds();
-        let window_w = window_bounds.size.width;
-        let window_h = window_bounds.size.height;
+        let surface = crate::view::chrome::window_surface_bounds(window);
         let margin_x = scaled_px(16.0);
-        let margin_y = scaled_px(16.0);
 
-        let is_app_menu = matches!(&kind, PopoverKind::AppMenu);
         let is_context_menu = popover_is_context_menu(&kind);
+        if is_context_menu {
+            let now = cx.background_executor().now();
+            self.context_menu_arrows
+                .drive(&self.context_menu_scroll, window, ui_scale, now);
+        }
+        let menu_layout =
+            is_context_menu.then(|| self.context_menu_layout(&kind, window, ui_scale));
         let center_hook_workflow = matches!(&kind, PopoverKind::HookActivity { .. });
         let mut anchor_corner = popover_anchor_corner(&kind);
 
@@ -43,19 +47,28 @@ impl PopoverHost {
         // side with more horizontal space in those cases.
         let mut anchor = anchor_for_corner(anchor_corner);
         let preferred_width = popover_preferred_anchor_width(&kind, ui_scale);
-        let space_left = (anchor.x - margin_x).max(px(0.0));
-        let space_right = (window_w - margin_x - anchor.x).max(px(0.0));
+        let space_left = (anchor.x - surface.left() - margin_x).max(px(0.0));
+        let space_right = (surface.right() - margin_x - anchor.x).max(px(0.0));
         anchor_corner =
             choose_popover_anchor_corner(anchor_corner, space_left, space_right, preferred_width);
         anchor = anchor_for_corner(anchor_corner);
 
         let panel = match kind {
+            // An extension's menu is a context menu; its dialogs are panels.
+            kind @ PopoverKind::Hosted { menu: true, .. } => self.context_menu_view(kind, cx),
+            PopoverKind::Hosted { id, .. } => extension_dialog::panel(self, id, cx),
             PopoverKind::HookActivity {
                 repo_id,
                 operation_id,
             } => hook_activity::panel(self, repo_id, operation_id, window, cx),
-            PopoverKind::RepoPicker => repo_picker::panel(self, cx),
+            PopoverKind::ErrorDetails { toast_id } => {
+                error_details::panel(self, toast_id, window, cx)
+            }
+            PopoverKind::RepoPicker { .. } => repo_picker::panel(self, cx),
             PopoverKind::BranchPicker { .. } => branch_picker::panel(self, cx),
+            PopoverKind::UpstreamPicker { repo_id, branch } => {
+                upstream_picker::panel(self, repo_id, branch, cx)
+            }
             PopoverKind::CreateBranchFromRefPrompt {
                 repo_id,
                 target,
@@ -80,6 +93,12 @@ impl PopoverHost {
                 remote,
                 branch,
             } => checkout_remote_branch_prompt::panel(self, repo_id, remote, branch, cx),
+            PopoverKind::BranchExistsPrompt {
+                repo_id,
+                name,
+                target,
+                operation,
+            } => branch_exists_prompt::panel(self, repo_id, name, target, operation, cx),
             PopoverKind::StashPrompt => stash_prompt::panel(self, cx),
             PopoverKind::CommitPrompt { repo_id } => commit_prompt::panel(self, repo_id, cx),
             PopoverKind::StashPickerPrompt { repo_id, purpose } => {
@@ -116,6 +135,10 @@ impl PopoverHost {
                         PopoverKind::remote(repo_id, RemotePopoverKind::Menu { name }),
                         cx,
                     ),
+                    RemotePopoverKind::OpenInBrowserMenu => self.context_menu_view(
+                        PopoverKind::remote(repo_id, RemotePopoverKind::OpenInBrowserMenu),
+                        cx,
+                    ),
                 },
                 RepoPopoverKind::Worktree(worktree_kind) => match worktree_kind {
                     WorktreePopoverKind::SectionMenu => self.context_menu_view(
@@ -135,9 +158,19 @@ impl PopoverHost {
                     WorktreePopoverKind::RemovePicker => {
                         worktree_picker::panel(self, repo_id, true, cx)
                     }
-                    WorktreePopoverKind::BadgePicker => workspace_picker::panel(self, repo_id, cx),
+                    WorktreePopoverKind::BadgePicker => {
+                        worktree_badge_picker::panel(self, repo_id, cx)
+                    }
                     WorktreePopoverKind::RemoveConfirm { path, branch } => {
                         worktree_remove_confirm::panel(self, repo_id, path, branch, cx)
+                    }
+                },
+                RepoPopoverKind::Annex(annex_kind) => match annex_kind {
+                    AnnexPopoverKind::SectionMenu | AnnexPopoverKind::RepositoryMenu { .. } => {
+                        self.context_menu_view(PopoverKind::annex(repo_id, annex_kind), cx)
+                    }
+                    AnnexPopoverKind::Prompt(prompt) => {
+                        annex_prompt::panel(self, repo_id, &prompt, cx)
                     }
                 },
                 RepoPopoverKind::Submodule(submodule_kind) => match submodule_kind {
@@ -172,14 +205,25 @@ impl PopoverHost {
             PopoverKind::FileHistory { repo_id, path } => {
                 file_history::panel(self, repo_id, path, cx)
             }
-            PopoverKind::PushSetUpstreamPrompt { repo_id, remote } => {
-                push_set_upstream_prompt::panel(self, repo_id, remote, cx)
-            }
+            PopoverKind::PushSetUpstreamPrompt {
+                repo_id,
+                remote,
+                configure_only_for,
+            } => push_set_upstream_prompt::panel(self, repo_id, remote, configure_only_for, cx),
             PopoverKind::ForcePushConfirm { repo_id } => {
                 force_push_confirm::panel(self, repo_id, cx)
             }
             PopoverKind::CherryPickCommitConfirm { repo_id, commit_id } => {
                 cherry_pick_commit_confirm::panel(self, repo_id, commit_id, cx)
+            }
+            PopoverKind::InteractiveCherryPickConfirm { repo_id, entries } => {
+                interactive_cherry_pick_confirm::panel(self, repo_id, entries, cx)
+            }
+            PopoverKind::RevertCommitConfirm { repo_id, commit_id } => {
+                revert_commit_confirm::panel(self, repo_id, commit_id, cx)
+            }
+            PopoverKind::ApplyFileChangeConfirm { repo_id, target } => {
+                apply_file_change_confirm::panel(self, repo_id, target, cx)
             }
             PopoverKind::MergeCommitConfirm { repo_id, commit_id } => {
                 merge_commit_confirm::panel(self, repo_id, commit_id, cx)
@@ -200,6 +244,11 @@ impl PopoverHost {
                 area,
                 path,
             } => discard_changes_confirm::panel(self, repo_id, area, path.clone(), cx),
+            PopoverKind::DiscardFolderChangesConfirm {
+                repo_id,
+                section,
+                folder,
+            } => discard_folder_changes_confirm::panel(self, repo_id, section, folder, cx),
             PopoverKind::AddToGitignorePrompt {
                 repo_id,
                 area,
@@ -222,9 +271,32 @@ impl PopoverHost {
                 pull_reconcile_prompt::panel(self, repo_id, cx)
             }
             PopoverKind::DiffActionMenu => self.context_menu_view(PopoverKind::DiffActionMenu, cx),
-            PopoverKind::WebLinkMenu { url } => {
-                self.context_menu_view(PopoverKind::WebLinkMenu { url }, cx)
-            }
+            PopoverKind::WebLinkMenu {
+                url,
+                load_remote_image_url,
+            } => self.context_menu_view(
+                PopoverKind::WebLinkMenu {
+                    url,
+                    load_remote_image_url,
+                },
+                cx,
+            ),
+            PopoverKind::LocalFileLinkMenu {
+                repo_id,
+                source,
+                path,
+                missing,
+                load_remote_image_url,
+            } => self.context_menu_view(
+                PopoverKind::LocalFileLinkMenu {
+                    repo_id,
+                    source,
+                    path,
+                    missing,
+                    load_remote_image_url,
+                },
+                cx,
+            ),
             PopoverKind::CommitShaLinkMenu {
                 repo_id,
                 commit_id,
@@ -240,9 +312,18 @@ impl PopoverHost {
             PopoverKind::MergetoolSettingsMenu => {
                 self.context_menu_view(PopoverKind::MergetoolSettingsMenu, cx)
             }
-            PopoverKind::TerminalMenu { repo_id, context } => {
-                self.context_menu_view(PopoverKind::TerminalMenu { repo_id, context }, cx)
-            }
+            PopoverKind::TerminalMenu {
+                repo_id,
+                session_seq,
+                context,
+            } => self.context_menu_view(
+                PopoverKind::TerminalMenu {
+                    repo_id,
+                    session_seq,
+                    context,
+                },
+                cx,
+            ),
             PopoverKind::HistoryBranchFilter { repo_id } => {
                 self.context_menu_view(PopoverKind::HistoryBranchFilter { repo_id }, cx)
             }
@@ -250,9 +331,13 @@ impl PopoverHost {
             PopoverKind::DiffContentModeSettings => {
                 self.context_menu_view(PopoverKind::DiffContentModeSettings, cx)
             }
-            PopoverKind::CommitFileSortMenu => {
-                self.context_menu_view(PopoverKind::CommitFileSortMenu, cx)
+            PopoverKind::TextFormatMenu { section } => {
+                self.context_menu_view(PopoverKind::TextFormatMenu { section }, cx)
             }
+            PopoverKind::CommitFileSortMenu { list } => {
+                self.context_menu_view(PopoverKind::CommitFileSortMenu { list }, cx)
+            }
+            kind @ PopoverKind::FileListLayoutMenu { .. } => self.context_menu_view(kind, cx),
             PopoverKind::ChangeTrackingSettings => {
                 self.context_menu_view(PopoverKind::ChangeTrackingSettings, cx)
             }
@@ -286,18 +371,6 @@ impl PopoverHost {
             PopoverKind::TagMenu { repo_id, commit_id } => {
                 self.context_menu_view(PopoverKind::TagMenu { repo_id, commit_id }, cx)
             }
-            PopoverKind::TagRefMenu {
-                repo_id,
-                commit_id,
-                name,
-            } => self.context_menu_view(
-                PopoverKind::TagRefMenu {
-                    repo_id,
-                    commit_id,
-                    name,
-                },
-                cx,
-            ),
             PopoverKind::DiffHunkMenu { repo_id, src_ix } => {
                 self.context_menu_view(PopoverKind::DiffHunkMenu { repo_id, src_ix }, cx)
             }
@@ -399,30 +472,21 @@ impl PopoverHost {
                 },
                 cx,
             ),
-            PopoverKind::BranchMenu {
+            PopoverKind::StatusConflictMenu {
                 repo_id,
-                section,
-                name,
+                area,
+                path,
             } => self.context_menu_view(
-                PopoverKind::BranchMenu {
+                PopoverKind::StatusConflictMenu {
                     repo_id,
-                    section,
-                    name,
+                    area,
+                    path,
                 },
                 cx,
             ),
-            PopoverKind::BranchRefsMenu {
-                repo_id,
-                display_name,
-                targets,
-            } => self.context_menu_view(
-                PopoverKind::BranchRefsMenu {
-                    repo_id,
-                    display_name,
-                    targets,
-                },
-                cx,
-            ),
+            PopoverKind::BranchMenu { repo_id, target } => {
+                self.context_menu_view(PopoverKind::BranchMenu { repo_id, target }, cx)
+            }
             PopoverKind::BranchSectionMenu { repo_id, section } => {
                 self.context_menu_view(PopoverKind::BranchSectionMenu { repo_id, section }, cx)
             }
@@ -450,12 +514,18 @@ impl PopoverHost {
                 },
                 cx,
             ),
+            kind @ PopoverKind::WorktreeFileMenu { .. } => self.context_menu_view(kind, cx),
+            kind @ PopoverKind::CommitRangeFileMenu { .. } => self.context_menu_view(kind, cx),
             PopoverKind::FileBrowserFileMenu { repo_id, path } => {
                 self.context_menu_view(PopoverKind::FileBrowserFileMenu { repo_id, path }, cx)
             }
             PopoverKind::FileBrowserFolderMenu { repo_id, path } => {
                 self.context_menu_view(PopoverKind::FileBrowserFolderMenu { repo_id, path }, cx)
             }
+            PopoverKind::ExplorerSettingsMenu { repo_id } => {
+                self.context_menu_view(PopoverKind::ExplorerSettingsMenu { repo_id }, cx)
+            }
+            kind @ PopoverKind::FileListFolderMenu { .. } => self.context_menu_view(kind, cx),
             PopoverKind::BranchGroupMenu {
                 repo_id,
                 section,
@@ -470,8 +540,11 @@ impl PopoverHost {
                 },
                 cx,
             ),
-            PopoverKind::PinnedSectionMenu { repo_id, section } => {
-                self.context_menu_view(PopoverKind::PinnedSectionMenu { repo_id, section }, cx)
+            PopoverKind::SidebarPinnedOverflow { repo_id, bottom } => {
+                self.sidebar_pin_overflow_view(repo_id, bottom, surface.size.height / 2.0, cx)
+            }
+            PopoverKind::SidebarAncestorMenu { repo_id, section } => {
+                self.context_menu_view(PopoverKind::SidebarAncestorMenu { repo_id, section }, cx)
             }
             PopoverKind::DeleteBranchesConfirm {
                 repo_id,
@@ -571,11 +644,11 @@ impl PopoverHost {
                         div()
                             .px_2()
                             .py_1()
-                            .text_sm()
+                            .text_size(theme.ui_text(14.0))
                             .font_weight(FontWeight::BOLD)
                             .child("Reword commit message"),
                     )
-                    .child(div().border_t_1().border_color(theme.colors.stroke.default))
+                    .child(super::popover_rule(theme))
                     .child(
                         div()
                             .px_2()
@@ -586,7 +659,7 @@ impl PopoverHost {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child("Commit message"),
                             )
@@ -602,7 +675,7 @@ impl PopoverHost {
                             .gap_1()
                             .child(
                                 div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child("Description"),
                             )
@@ -621,20 +694,15 @@ impl PopoverHost {
                         div()
                             .px_2()
                             .pb_1()
-                            .text_xs()
+                            .text_size(theme.ui_text(12.0))
                             .text_color(theme.colors.foreground.secondary)
                             .child(
                                 "Clear the message and save to keep the original commit message.",
                             ),
                     )
-                    .child(div().border_t_1().border_color(theme.colors.stroke.default))
+                    .child(super::popover_rule(theme))
                     .child(
-                        div()
-                            .px_2()
-                            .py_1()
-                            .flex()
-                            .items_center()
-                            .justify_between()
+                        super::prompt_footer_row()
                             .child(
                                 components::Button::new("reword_cancel", "Cancel")
                                     .separated_end_slot(hotkey_hint(
@@ -643,14 +711,12 @@ impl PopoverHost {
                                         "Esc",
                                     ))
                                     .style(components::ButtonStyle::Outlined)
-                                    .render(theme, ui_scale_percent)
-                                    .on_click(cancel),
+                                    .on_click_handler(theme, ui_scale_percent, cancel),
                             )
                             .child(
                                 components::Button::new(submit_button_id, "Save message")
                                     .style(components::ButtonStyle::Filled)
-                                    .render(theme, ui_scale_percent)
-                                    .on_click(submit),
+                                    .on_click_handler(theme, ui_scale_percent, submit),
                             ),
                     )
             }
@@ -660,13 +726,21 @@ impl PopoverHost {
             PopoverKind::UnsavedFileEditsConfirm(prompt) => {
                 unsaved_file_edits_confirm::panel(self, prompt, cx)
             }
+            PopoverKind::FilesystemConflict(prompt) => {
+                filesystem_conflict_prompt::panel(self, prompt, cx)
+            }
+            PopoverKind::DeletePermanentlyConfirm(prompt) => {
+                delete_permanently_confirm::panel(self, prompt, cx)
+            }
+            PopoverKind::FilesystemUnsavedEditsConfirm(prompt) => {
+                filesystem_unsaved_edits_confirm::panel(self, prompt, cx)
+            }
+            PopoverKind::CloseGuardConfirm(prompt) => close_guard_confirm::panel(self, prompt, cx),
         };
 
         let is_right = matches!(anchor_corner, Anchor::TopRight | Anchor::BottomRight);
         let popover_border_color = theme.colors.stroke.default;
-        let gap_y = if is_app_menu {
-            crate::view::chrome::title_bar_height(ui_scale_percent)
-        } else if anchor_is_bounds {
+        let gap_y = if anchor_is_bounds {
             px(1.0)
         } else if is_right {
             scaled_px(10.0)
@@ -674,53 +748,42 @@ impl PopoverHost {
             scaled_px(8.0)
         };
 
-        let mut context_menu_max_panel_h: Option<Pixels> = None;
-        if is_context_menu {
-            let (below_anchor_y, above_anchor_y) = match &anchor_source {
-                PopoverAnchor::Point(_) => (anchor.y, anchor.y),
-                PopoverAnchor::Bounds(bounds) => (bounds.bottom_left().y, bounds.origin.y),
-                PopoverAnchor::Centered => (anchor.y, anchor.y),
-            };
-            let below = (window_h - margin_y) - (below_anchor_y + gap_y);
-            let above = (above_anchor_y - gap_y) - margin_y;
-            if below < scaled_px(240.0) && above > below {
-                anchor_corner = match anchor_corner {
-                    Anchor::TopLeft => Anchor::BottomLeft,
-                    Anchor::TopRight => Anchor::BottomRight,
-                    corner => corner,
-                };
-            }
-            if anchor_is_bounds {
-                anchor = anchor_for_corner(anchor_corner);
-            }
-
-            let popover_edge_y = match anchor_corner {
-                Anchor::BottomLeft | Anchor::BottomRight => anchor.y - gap_y,
-                _ => anchor.y + gap_y,
-            };
-            let max_popover_h = match anchor_corner {
-                Anchor::BottomLeft | Anchor::BottomRight => popover_edge_y - margin_y,
-                _ => (window_h - margin_y) - popover_edge_y,
-            }
-            .max(px(0.0));
-            let max_panel_h = (max_popover_h - scaled_px(12.0)).max(px(0.0));
-            context_menu_max_panel_h = Some(max_panel_h);
-        }
-
         let offset_y = match anchor_corner {
             Anchor::BottomLeft | Anchor::BottomRight => -gap_y,
             _ => gap_y,
         };
 
-        let panel = if let Some(max_panel_h) = context_menu_max_panel_h {
-            restrict_scroll_to_vertical_axis(
-                div()
-                    .id("context_menu_scroll")
-                    .min_h(px(0.0))
-                    .max_h(max_panel_h)
-                    .overflow_y_scroll(),
+        let panel = if let Some(layout) = &menu_layout {
+            let arrow = |direction, cx: &mut gpui::Context<Self>| {
+                self.context_menu_arrows.arrow(
+                    direction,
+                    &self.context_menu_scroll,
+                    &self.context_menu_placement,
+                    "context_menu_scroll",
+                    theme,
+                    ui_scale,
+                    cx,
+                )
+            };
+            let up = arrow(components::MenuScrollDirection::Up, cx);
+            let down = arrow(components::MenuScrollDirection::Down, cx);
+            menu_layer::scroll_area_with_arrows(
+                restrict_scroll_to_vertical_axis(
+                    div()
+                        .id("context_menu_scroll")
+                        .debug_selector(|| "context_menu_scroll".to_string())
+                        .min_h(px(0.0))
+                        .max_h(layout.content_max_h)
+                        .track_scroll(&self.context_menu_scroll)
+                        .overflow_y_scroll()
+                        .on_scroll_wheel(cx.listener(|this, _e: &ScrollWheelEvent, _w, _cx| {
+                            this.latch_context_menu_placement();
+                        })),
+                )
+                .child(panel),
+                up,
+                down,
             )
-            .child(panel)
             .into_any_element()
         } else {
             panel.into_any_element()
@@ -754,12 +817,16 @@ impl PopoverHost {
         let mut popover_container = popover_surface
             .id("app_popover")
             .debug_selector(|| "app_popover".to_string())
-            .on_any_mouse_down(|_e, _w, cx| cx.stop_propagation())
+            .on_any_mouse_down(cx.listener(|this, _e: &MouseDownEvent, _w, cx| {
+                this.latch_context_menu_placement();
+                cx.stop_propagation();
+            }))
             // `occlude` keeps the root view's mouse-move listener from firing
             // over the popover, so the tooltip host would otherwise anchor
             // truncated-text tooltips to wherever the pointer was before the
             // popover opened. Feed it positions from inside the popover.
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _window, cx| {
+                this.latch_context_menu_placement();
                 let _ = this
                     .tooltip_host
                     .update(cx, |host, cx| host.on_mouse_moved(e.position, cx));
@@ -779,6 +846,7 @@ impl PopoverHost {
         if is_centered {
             let top_offset = scaled_px(80.0);
             let scrim_close = cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                this.resolve_open_branch_exists_prompt(BranchExistsChoice::Cancel);
                 if !this.dismiss_hook_activity_workflow(window, cx) {
                     this.close_popover_and_restore_focus(window, cx);
                 }
@@ -799,9 +867,21 @@ impl PopoverHost {
                 .top_0()
                 .left_0()
                 .size_full()
-                .child(components::modal_scrim(theme).on_mouse_down(MouseButton::Left, scrim_close))
+                .child(
+                    components::modal_scrim(theme)
+                        .id("prompt_scrim")
+                        .on_pointer_click(MouseButton::Left, scrim_close),
+                )
                 .child(placement)
                 .into_any_element()
+        } else if let Some(layout) = menu_layout {
+            crate::kit::menu_placement::menu_placement(
+                self.context_menu_placement.clone(),
+                layout.request,
+                layout.limits,
+                popover_container,
+            )
+            .into_any_element()
         } else {
             anchored()
                 .position(anchor)

@@ -1,15 +1,13 @@
 use super::*;
-use palette::IntoColor;
-use std::cell::RefCell;
-use std::rc::Rc;
+use crate::kit::click::PointerClickExt as _;
+use crate::kit::interaction as controls;
+use crate::view::components::{ControlInteractionExt, InteractionState, InteractionStyle};
 use std::sync::OnceLock;
 
-const SPLASH_BACKDROP_PNG_BYTES: &[u8] =
-    include_bytes!(concat!(env!("OUT_DIR"), "/splash_backdrop.png"));
-/// Gap (on the 8px grid) around the inset content/details cards so they read as
-/// rounded surfaces floating on the shared window canvas, with the sidebar
-/// blended into that canvas.
-const CONTENT_CARD_GAP_PX: f32 = 8.0;
+const SPLASH_BACKDROP_DARK_PNG_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/splash_backdrop_dark.png"));
+const SPLASH_BACKDROP_LIGHT_PNG_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/splash_backdrop_light.png"));
 /// Bottom margin the main content card leaves for the bottom bar. The collapsed
 /// section popover matches it so its top/bottom gaps read symmetric.
 const CONTENT_CARD_BOTTOM_MARGIN_PX: f32 = 2.0;
@@ -19,55 +17,58 @@ const CONTENT_CARD_BOTTOM_MARGIN_PX: f32 = 2.0;
 /// canvas, so it can afford the room that branch names, worktree paths and
 /// stash summaries want, without the pane's permanent cost.
 const COLLAPSED_POPOVER_WIDTH_PX: f32 = 340.0;
-static SPLASH_BACKDROP_IMAGE_CACHE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
+static SPLASH_BACKDROP_DARK_IMAGE_CACHE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
+static SPLASH_BACKDROP_LIGHT_IMAGE_CACHE: OnceLock<Arc<gpui::Image>> = OnceLock::new();
 
-/// Corner radius of the main content card — squarer than the shared `panel`
-/// radius the floating dialogs and splash cards keep. This surface is chrome
-/// fused to the tab strip above it and the sidebar beside it, not a card
-/// floating on the canvas, so it takes the same radius as the controls
-/// (buttons, tabs) it sits among. The corner caps derive from this, so both
-/// move together.
+/// Interstitial geometry (loading and git-unavailable cards, Home buttons).
+const SPLASH_CARD_MAX_WIDTH_PX: f32 = components::INTERSTITIAL_CARD_MAX_WIDTH_PX;
+const SPLASH_BODY_MAX_WIDTH_PX: f32 = 440.0;
+const SPLASH_DETAIL_MAX_WIDTH_PX: f32 = 460.0;
+
 fn main_content_card_radius(theme: AppTheme) -> f32 {
     theme.radii.control
 }
 
-struct SplashInteractiveColors {
-    base: gpui::Rgba,
-    hover: gpui::Rgba,
-    active: gpui::Rgba,
-}
-
-struct SplashCtaButtonColors {
-    icon: gpui::Rgba,
-    text: gpui::Rgba,
-    background: SplashInteractiveColors,
-    border: SplashInteractiveColors,
-}
-
-pub(in crate::view) fn load_splash_backdrop_image() -> Arc<gpui::Image> {
-    SPLASH_BACKDROP_IMAGE_CACHE
+/// The splash backdrop for the theme's appearance: the product's own, else
+/// GitComet's.
+pub(in crate::view) fn load_splash_backdrop_image(is_dark: bool) -> Arc<gpui::Image> {
+    let branding = gitcomet_core::identity::current().branding();
+    let (cache, bytes) = if is_dark {
+        (
+            &SPLASH_BACKDROP_DARK_IMAGE_CACHE,
+            branding
+                .splash_backdrop_dark_png
+                .unwrap_or(SPLASH_BACKDROP_DARK_PNG_BYTES),
+        )
+    } else {
+        (
+            &SPLASH_BACKDROP_LIGHT_IMAGE_CACHE,
+            branding
+                .splash_backdrop_light_png
+                .unwrap_or(SPLASH_BACKDROP_LIGHT_PNG_BYTES),
+        )
+    };
+    cache
         .get_or_init(|| {
             Arc::new(gpui::Image::from_bytes(
                 gpui::ImageFormat::Png,
-                SPLASH_BACKDROP_PNG_BYTES.to_vec(),
+                bytes.to_vec(),
             ))
         })
         .clone()
 }
 
 /// Children clip to rectangles, so full-bleed content inside the card can
-/// square off its rounded corners. These caps repaint the four corner
+/// square off its rounded left corners. These caps repaint the two left corner
 /// notches (the area between the content rectangle's corner and the card's
 /// inner arc) in the surrounding surface color, restoring the rounding over
 /// anything the content paints. Canvas elements take no hitboxes, so the
 /// overlay is invisible to the mouse.
-fn card_corner_caps(radius: Pixels, color: gpui::Rgba) -> AnyElement {
+fn card_left_corner_caps(radius: Pixels, color: gpui::Rgba) -> AnyElement {
     #[derive(Clone, Copy)]
     enum CapCorner {
         TopLeft,
-        TopRight,
         BottomLeft,
-        BottomRight,
     }
 
     let cap = move |corner: CapCorner| {
@@ -84,20 +85,6 @@ fn card_corner_caps(radius: Pixels, color: gpui::Rgba) -> AnyElement {
                     point(bounds.left() + r, bounds.top()),
                     point(bounds.left(), bounds.top() + r - k),
                     point(bounds.left() + r - k, bounds.top()),
-                ),
-                CapCorner::TopRight => (
-                    point(bounds.right(), bounds.top()),
-                    point(bounds.left(), bounds.top()),
-                    point(bounds.right(), bounds.top() + r),
-                    point(bounds.left() + k, bounds.top()),
-                    point(bounds.right(), bounds.top() + r - k),
-                ),
-                CapCorner::BottomRight => (
-                    point(bounds.right(), bounds.bottom()),
-                    point(bounds.right(), bounds.top()),
-                    point(bounds.left(), bounds.bottom()),
-                    point(bounds.right(), bounds.top() + k),
-                    point(bounds.left() + k, bounds.bottom()),
                 ),
                 CapCorner::BottomLeft => (
                     point(bounds.left(), bounds.bottom()),
@@ -119,9 +106,7 @@ fn card_corner_caps(radius: Pixels, color: gpui::Rgba) -> AnyElement {
         let positioned = div().absolute().size(radius);
         let positioned = match corner {
             CapCorner::TopLeft => positioned.top_0().left_0(),
-            CapCorner::TopRight => positioned.top_0().right_0(),
             CapCorner::BottomLeft => positioned.bottom_0().left_0(),
-            CapCorner::BottomRight => positioned.bottom_0().right_0(),
         };
         positioned.child(
             gpui::canvas(
@@ -138,19 +123,21 @@ fn card_corner_caps(radius: Pixels, color: gpui::Rgba) -> AnyElement {
         .left_0()
         .size_full()
         .child(cap(CapCorner::TopLeft))
-        .child(cap(CapCorner::TopRight))
         .child(cap(CapCorner::BottomLeft))
-        .child(cap(CapCorner::BottomRight))
         .into_any_element()
 }
 
 impl GitCometView {
-    fn splash_backdrop_base() -> gpui::Background {
-        gpui::linear_gradient(
-            180.0,
-            gpui::linear_color_stop(gpui::rgba(0x060a13ff), 0.0),
-            gpui::linear_color_stop(gpui::rgba(0x02050fff), 1.0),
-        )
+    pub(super) fn splash_backdrop_base(&self) -> gpui::Background {
+        if self.theme.is_dark {
+            gpui::rgba(0x0d0f13ff).into()
+        } else {
+            gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(gpui::rgba(0xe7f3fdff), 0.0),
+                gpui::linear_color_stop(gpui::rgba(0xffffffff), 0.7),
+            )
+        }
     }
 
     fn splash_backdrop_image_layer(&self) -> AnyElement {
@@ -167,30 +154,37 @@ impl GitCometView {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .object_fit(gpui::ObjectFit::Fill),
+                    .object_fit(gpui::ObjectFit::Cover),
             )
             .into_any_element()
     }
 
-    fn has_repo_tabs(&self) -> bool {
+    pub(super) fn has_repo_tabs(&self) -> bool {
         !self.state.repos.is_empty()
     }
 
-    fn git_runtime_unavailable(&self) -> bool {
-        !self.state.git_runtime.is_available()
+    pub(super) fn git_runtime_unavailable(&self) -> bool {
+        matches!(
+            self.state.git_runtime.availability,
+            gitcomet_core::process::GitExecutableAvailability::Unavailable { .. }
+        )
     }
 
     fn git_runtime_unavailable_detail(&self) -> String {
         self.state
             .git_runtime
             .unavailable_detail()
-            .unwrap_or("GitComet could not find a usable Git executable.")
-            .to_string()
+            .map(ToString::to_string)
+            .unwrap_or_else(|| {
+                format!(
+                    "{} could not find a usable Git executable.",
+                    crate::view::product_name()
+                )
+            })
     }
 
     fn git_unavailable_status_icon(theme: AppTheme, ui_scale_percent: u32) -> AnyElement {
-        let scaled_px =
-            |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
         div()
             .id("git_unavailable_status_icon")
             .debug_selector(|| "git_unavailable_status_icon".to_string())
@@ -230,18 +224,19 @@ impl GitCometView {
     #[cfg(test)]
     pub(crate) fn blocks_non_repository_actions(&self) -> bool {
         repository_entry_interstitial_active(self.view_mode, self.has_repo_tabs())
-            || matches!(self.view_mode, GitCometViewMode::Normal) && self.git_runtime_unavailable()
+            || matches!(self.view_mode, GitCometViewMode::Normal)
+                && !self.state.git_runtime.is_available()
     }
 
     pub(crate) fn blocks_repository_management_actions(&self) -> bool {
-        matches!(self.view_mode, GitCometViewMode::Normal) && self.git_runtime_unavailable()
+        !self.shell_action_allowed(super::shell_policy::ShellAction::RepositoryEntry)
     }
 
-    pub(crate) fn is_splash_screen_active(&self) -> bool {
-        should_show_splash_screen(
+    pub(crate) fn is_home_screen_active(&self) -> bool {
+        should_show_home_screen(
             self.view_mode,
             self.has_repo_tabs(),
-            self.startup_repo_bootstrap_pending,
+            self.startup_bootstrap_loading(),
         )
     }
 
@@ -249,25 +244,32 @@ impl GitCometView {
         should_show_startup_repository_loading_screen(
             self.view_mode,
             self.has_repo_tabs(),
-            self.startup_repo_bootstrap_pending,
+            self.startup_bootstrap_loading(),
         )
     }
 
-    pub(super) fn sync_title_bar_workspace_actions(&mut self, cx: &mut gpui::Context<Self>) {
-        let enabled = titlebar_workspace_actions_enabled(self.view_mode, self.has_repo_tabs());
-        self.title_bar
-            .update(cx, |bar, cx| bar.set_workspace_actions_enabled(enabled, cx));
+    /// A bootstrap deferred until Git recovers stays pending (it keeps the
+    /// workspace membership) but shows Home's Git-unavailable screen.
+    fn startup_bootstrap_loading(&self) -> bool {
+        self.startup_repo_bootstrap_pending && !self.git_runtime_unavailable()
     }
 
-    fn interstitial_logo(_theme: AppTheme, size: Pixels) -> AnyElement {
+    pub(super) fn sync_title_bar_repo_tab_actions(&mut self, cx: &mut gpui::Context<Self>) {
+        let enabled = titlebar_repo_tab_actions_enabled(self.view_mode, self.has_repo_tabs());
+        self.title_bar
+            .update(cx, |bar, cx| bar.set_repo_tab_actions_enabled(enabled, cx));
+    }
+
+    pub(super) fn interstitial_logo(_theme: AppTheme, size: Pixels) -> AnyElement {
         div()
             .id("repository_entry_logo")
             .size(size)
-            .child(gpui::svg().path("gitcomet_logo.svg").w(size).h(size))
+            // `svg()` paints a one-colour mask; the logo has two colours.
+            .child(gpui::img("brand/logo.svg").w(size).h(size))
             .into_any_element()
     }
 
-    fn interstitial_backdrop(&self) -> AnyElement {
+    pub(super) fn interstitial_backdrop(&self) -> AnyElement {
         div()
             .id("splash_backdrop_native")
             .debug_selector(|| "splash_backdrop_native".to_string())
@@ -276,62 +278,9 @@ impl GitCometView {
             .left_0()
             .size_full()
             .overflow_hidden()
-            .bg(Self::splash_backdrop_base())
+            .bg(self.splash_backdrop_base())
             .child(self.splash_backdrop_image_layer())
             .into_any_element()
-    }
-
-    fn splash_cta_button(
-        id: &'static str,
-        label: &'static str,
-        icon_path: &'static str,
-        colors: SplashCtaButtonColors,
-        ui_scale_percent: u32,
-    ) -> gpui::Stateful<gpui::Div> {
-        let scaled_px =
-            |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let focus_ring = gpui::rgba(0x79d0ffeb);
-        let SplashCtaButtonColors {
-            icon: icon_color,
-            text: text_color,
-            background,
-            border: border_colors,
-        } = colors;
-        let SplashInteractiveColors {
-            base: bg,
-            hover: hover_bg,
-            active: active_bg,
-        } = background;
-        let SplashInteractiveColors {
-            base: border,
-            hover: hover_border,
-            active: active_border,
-        } = border_colors;
-
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .tab_index(0)
-            .h(scaled_px(36.0))
-            .px(scaled_px(16.0))
-            .flex()
-            .items_center()
-            .justify_center()
-            .gap(scaled_px(6.0))
-            .rounded(scaled_px(2.0))
-            .border_1()
-            .border_color(border)
-            .bg(bg)
-            .text_size(scaled_px(13.0))
-            .font_weight(FontWeight::BOLD)
-            .text_color(text_color)
-            .cursor(CursorStyle::PointingHand)
-            .whitespace_nowrap()
-            .child(svg_icon(icon_path, icon_color, scaled_px(14.0)))
-            .child(label)
-            .focus(move |s| s.border_color(focus_ring))
-            .hover(move |s| s.bg(hover_bg).border_color(hover_border))
-            .active(move |s| s.bg(active_bg).border_color(active_border))
     }
 
     fn interstitial_shell(
@@ -340,86 +289,40 @@ impl GitCometView {
         content: impl IntoElement,
         theme: AppTheme,
     ) -> AnyElement {
-        let border_glow = with_alpha(
-            theme.colors.stroke.default,
-            if theme.is_dark { 0.86 } else { 0.74 },
-        );
-
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .relative()
-            .flex()
-            .flex_1()
-            .min_h(px(0.0))
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .px_3()
-            .py_4()
-            .bg(gpui::rgba(0x02050fff))
-            .child(self.interstitial_backdrop())
-            .child(
-                div()
-                    .relative()
-                    .w_full()
-                    .max_w(px(560.0))
-                    .bg(with_alpha(
-                        theme.colors.surface.panel,
-                        if theme.is_dark { 0.96 } else { 0.98 },
-                    ))
-                    .border_1()
-                    .border_color(border_glow)
-                    .rounded(px(theme.radii.panel))
-                    .shadow(vec![gpui::BoxShadow {
-                        color: gpui::rgba(0x00000052).into_color(),
-                        offset: point(px(0.0), px(22.0)),
-                        blur_radius: px(52.0),
-                        spread_radius: px(0.0),
-                        inset: false,
-                    }])
-                    .p_4()
-                    .child(content),
-            )
-            .into_any_element()
+        components::interstitial(
+            id,
+            self.splash_backdrop_base(),
+            self.interstitial_backdrop(),
+            content,
+            theme,
+            crate::ui_scale::UiScale::from_percent(self.ui_scale_percent),
+        )
     }
 
     fn git_unavailable_open_settings_button(
         &self,
         cx: &mut gpui::Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
-        let primary_bg = gpui::rgba(0x5ac1feff);
-        let primary_hover = gpui::rgba(0x72c7ffff);
-        let primary_active = gpui::rgba(0x48b6eeff);
-        let primary_text = gpui::rgba(0x04172bff);
         let settings_tooltip: SharedString = "Open settings".into();
 
-        Self::splash_cta_button(
+        components::interstitial_cta_button(
             "git_unavailable_open_settings",
             "Open Settings",
             "icons/cog.svg",
-            SplashCtaButtonColors {
-                icon: primary_text,
-                text: primary_text,
-                background: SplashInteractiveColors {
-                    base: primary_bg,
-                    hover: primary_hover,
-                    active: primary_active,
-                },
-                border: SplashInteractiveColors {
-                    base: primary_bg,
-                    hover: primary_hover,
-                    active: primary_active,
-                },
-            },
-            self.ui_scale_percent,
+            true,
+            self.theme,
+            crate::ui_scale::UiScale::from_percent(self.ui_scale_percent),
         )
         .gitcomet_tooltip(self.theme, settings_tooltip)
-        .on_click(cx.listener(|this, _e, _window, cx| {
-            this.open_repo_panel = false;
-            cx.defer(crate::view::open_settings_window);
-            cx.notify();
-        }))
+        .on_activate(
+            false,
+            controls::ControlActivation::Action,
+            cx.listener(|this, _e, _window, cx| {
+                this.open_repo_panel = false;
+                cx.defer(crate::view::open_settings_window);
+                cx.notify();
+            }),
+        )
     }
 
     fn git_unavailable_panel_content(
@@ -427,6 +330,7 @@ impl GitCometView {
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        let scaled_px = crate::ui_scale::scaler(self.ui_scale_percent);
         let detail_bg = with_alpha(
             theme.colors.surface.canvas,
             if theme.is_dark { 0.36 } else { 0.82 },
@@ -448,35 +352,36 @@ impl GitCometView {
             ))
             .child(
                 div()
-                    .text_lg()
+                    .text_size(theme.ui_text(18.0))
                     .font_weight(FontWeight::BOLD)
                     .text_center()
                     .child("Git executable unavailable"),
             )
             .child(
                 div()
-                    .max_w(px(440.0))
+                    .max_w(scaled_px(SPLASH_BODY_MAX_WIDTH_PX))
                     .text_center()
-                    .text_sm()
-                    .line_height(px(22.0))
+                    .text_size(self.theme.ui_text(14.0))
+                    .line_height(self.theme.ui_text(22.0))
                     .text_color(theme.colors.foreground.secondary)
-                    .child(
-                        "GitComet cannot open, refresh, or run repository actions until a Git executable is configured.",
-                    ),
+                    .child(format!(
+                        "{} cannot open, refresh, or run repository actions until a Git executable is configured.",
+                        crate::view::product_name()
+                    )),
             )
             .child(
                 div()
                     .id("git_unavailable_detail")
                     .w_full()
-                    .max_w(px(460.0))
+                    .max_w(scaled_px(SPLASH_DETAIL_MAX_WIDTH_PX))
                     .rounded(px(theme.radii.panel))
                     .border_1()
                     .border_color(detail_border)
                     .bg(detail_bg)
                     .px_3()
                     .py_2()
-                    .text_xs()
-                    .line_height(px(18.0))
+                    .text_size(self.theme.ui_text(12.0))
+                    .line_height(self.theme.ui_text(18.0))
                     .text_color(theme.colors.foreground.secondary)
                     .child(self.git_runtime_unavailable_detail_content()),
             )
@@ -488,7 +393,7 @@ impl GitCometView {
             .into_any_element()
     }
 
-    fn git_unavailable_splash(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
+    pub(super) fn git_unavailable_splash(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         let theme = self.theme;
         self.interstitial_shell(
             "git_unavailable_screen",
@@ -499,6 +404,7 @@ impl GitCometView {
 
     fn git_unavailable_overlay(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
         let theme = self.theme;
+        let scaled_px = crate::ui_scale::scaler(self.ui_scale_percent);
         let border_glow = with_alpha(
             theme.colors.stroke.default,
             if theme.is_dark { 0.86 } else { 0.74 },
@@ -529,7 +435,7 @@ impl GitCometView {
                     .child(
                         div()
                             .w_full()
-                            .max_w(px(560.0))
+                            .max_w(scaled_px(SPLASH_CARD_MAX_WIDTH_PX))
                             .bg(with_alpha(
                                 theme.colors.surface.panel,
                                 if theme.is_dark { 0.96 } else { 0.98 },
@@ -537,13 +443,6 @@ impl GitCometView {
                             .border_1()
                             .border_color(border_glow)
                             .rounded(px(theme.radii.panel))
-                            .shadow(vec![gpui::BoxShadow {
-                                color: gpui::rgba(0x00000052).into_color(),
-                                offset: point(px(0.0), px(22.0)),
-                                blur_radius: px(52.0),
-                                spread_radius: px(0.0),
-                                inset: false,
-                            }])
                             .p_4()
                             .child(self.git_unavailable_panel_content(theme, cx)),
                     ),
@@ -554,8 +453,7 @@ impl GitCometView {
     pub(super) fn startup_repository_loading_screen(&mut self) -> AnyElement {
         let theme = self.theme;
         let ui_scale_percent = self.ui_scale_percent;
-        let scaled_px =
-            |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
 
         self.interstitial_shell(
             "repository_loading_screen",
@@ -567,15 +465,18 @@ impl GitCometView {
                 .child(Self::interstitial_logo(theme, scaled_px(84.0)))
                 .child(
                     div()
-                        .text_lg()
+                        .text_size(theme.ui_text(18.0))
                         .font_weight(FontWeight::BOLD)
                         .child("Loading repository session"),
                 )
                 .child(
                     div()
-                        .text_sm()
+                        .text_size(self.theme.ui_text(14.0))
                         .text_color(theme.colors.foreground.secondary)
-                        .child("GitComet is opening your workspace."),
+                        .child(format!(
+                            "{} is opening your workspace.",
+                            crate::view::product_name()
+                        )),
                 )
                 .child(
                     div()
@@ -583,7 +484,7 @@ impl GitCometView {
                         .flex()
                         .items_center()
                         .gap_1()
-                        .text_sm()
+                        .text_size(self.theme.ui_text(14.0))
                         .text_color(theme.colors.foreground.secondary)
                         .child(svg_spinner(
                             ("repository_loading_spinner", 0u64),
@@ -596,325 +497,6 @@ impl GitCometView {
         )
     }
 
-    pub(super) fn splash_screen(&mut self, cx: &mut gpui::Context<Self>) -> AnyElement {
-        if self.git_runtime_unavailable() {
-            return self.git_unavailable_splash(cx);
-        }
-
-        let hero_text = gpui::rgba(0xf6f7fbff);
-        let hero_muted = gpui::rgba(0xa8b1c6ff);
-        let hero_proof = gpui::rgba(0xffffffbd);
-        let panel_border = gpui::rgba(0xffffff1f);
-        let guide_edge = gpui::rgba(0xffffff22);
-        let guide_fade = gpui::rgba(0xffffff0a);
-        let node_color = gpui::rgba(0xffffffff);
-        let primary_bg = gpui::rgba(0x5ac1feff);
-        let primary_hover = gpui::rgba(0x72c7ffff);
-        let primary_active = gpui::rgba(0x48b6eeff);
-        let primary_text = gpui::rgba(0x04172bff);
-        let primary_button_colors = SplashCtaButtonColors {
-            icon: primary_text,
-            text: primary_text,
-            background: SplashInteractiveColors {
-                base: primary_bg,
-                hover: primary_hover,
-                active: primary_active,
-            },
-            border: SplashInteractiveColors {
-                base: primary_bg,
-                hover: primary_hover,
-                active: primary_active,
-            },
-        };
-        let secondary_bg = gpui::rgba(0xffffff26);
-        let secondary_hover = gpui::rgba(0xffffff33);
-        let secondary_active = gpui::rgba(0xffffff40);
-        let secondary_border = gpui::rgba(0xffffff47);
-        let secondary_hover_border = gpui::rgba(0xffffff66);
-        let secondary_active_border = gpui::rgba(0xffffff80);
-        let secondary_button_colors = SplashCtaButtonColors {
-            icon: hero_text,
-            text: hero_text,
-            background: SplashInteractiveColors {
-                base: secondary_bg,
-                hover: secondary_hover,
-                active: secondary_active,
-            },
-            border: SplashInteractiveColors {
-                base: secondary_border,
-                hover: secondary_hover_border,
-                active: secondary_active_border,
-            },
-        };
-        let panel_shadow = gpui::rgba(0x00000059);
-        let open_tooltip: SharedString = "Open repository".into();
-        let clone_tooltip: SharedString = "Clone repository".into();
-
-        let open_button = Self::splash_cta_button(
-            "splash_open_repo",
-            "Open Repository",
-            "icons/folder.svg",
-            primary_button_colors,
-            self.ui_scale_percent,
-        )
-        .gitcomet_tooltip(self.theme, open_tooltip)
-        .on_click(cx.listener(|this, _e, window, cx| {
-            this.prompt_open_repo(window, cx);
-        }));
-
-        let clone_button = {
-            let last_bounds: Rc<RefCell<Option<Bounds<Pixels>>>> = Rc::new(RefCell::new(None));
-            let last_bounds_for_prepaint = Rc::clone(&last_bounds);
-            let last_bounds_for_click = Rc::clone(&last_bounds);
-
-            let button = Self::splash_cta_button(
-                "splash_clone_repo",
-                "Clone Repository",
-                "icons/cloud.svg",
-                secondary_button_colors,
-                self.ui_scale_percent,
-            )
-            .gitcomet_tooltip(self.theme, clone_tooltip)
-            .on_click(cx.listener(move |this, e: &ClickEvent, window, cx| {
-                let bounds = (*last_bounds_for_click.borrow())
-                    .unwrap_or_else(|| Bounds::new(e.position(), size(px(0.0), px(0.0))));
-                this.open_popover_for_bounds(PopoverKind::CloneRepo, bounds, window, cx);
-            }));
-
-            div()
-                .on_children_prepainted(move |children_bounds, _window, _cx| {
-                    if let Some(bounds) = children_bounds.first() {
-                        *last_bounds_for_prepaint.borrow_mut() = Some(*bounds);
-                    }
-                })
-                .child(button)
-        };
-
-        let open_repo_fallback = if self.open_repo_panel {
-            div()
-                .w_full()
-                .pt(px(12.0))
-                .child(
-                    div()
-                        .pb(px(8.0))
-                        .text_size(px(11.0))
-                        .text_color(hero_muted)
-                        .text_center()
-                        .child(
-                            "Native folder picker unavailable. Enter a repository path manually.",
-                        ),
-                )
-                .child(self.open_repo_panel(cx))
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
-        let headline_line = |text: &'static str| {
-            div()
-                .text_center()
-                .font_family("Noto Serif")
-                .font_weight(FontWeight::BOLD)
-                .text_size(px(50.0))
-                .line_height(px(44.0))
-                .text_color(hero_text)
-                .whitespace_nowrap()
-                .child(text)
-        };
-
-        div()
-            .id("repository_entry_screen")
-            .debug_selector(|| "repository_entry_screen".to_string())
-            .relative()
-            .flex()
-            .flex_1()
-            .min_h(px(0.0))
-            .items_center()
-            .justify_start()
-            .overflow_hidden()
-            .bg(gpui::rgba(0x02050fff))
-            .px_4()
-            .pt(px(52.0))
-            .pb(px(24.0))
-            .child(self.interstitial_backdrop())
-            .child(
-                div().relative().w_full().flex().justify_center().child(
-                    div()
-                        .relative()
-                        .w_full()
-                        .max_w(px(700.0))
-                        .px(px(48.0))
-                        .py(px(36.0))
-                        .border_1()
-                        .border_color(panel_border)
-                        .bg(gpui::linear_gradient(
-                            180.0,
-                            gpui::linear_color_stop(gpui::rgba(0x0f15258f), 0.0),
-                            gpui::linear_color_stop(gpui::rgba(0x03081352), 1.0),
-                        ))
-                        .shadow(vec![gpui::BoxShadow {
-                            color: panel_shadow.into_color(),
-                            offset: point(px(0.0), px(40.0)),
-                            blur_radius: px(80.0),
-                            spread_radius: px(0.0),
-                            inset: false,
-                        }])
-                        .child(
-                            div()
-                                .flex()
-                                .flex_col()
-                                .items_center()
-                                .gap(px(12.0))
-                                .child(
-                                    div()
-                                        .id("splash_headline")
-                                        .debug_selector(|| "splash_headline".to_string())
-                                        .max_w(px(560.0))
-                                        .flex()
-                                        .flex_col()
-                                        .items_center()
-                                        .child(headline_line("Fastest Open"))
-                                        .child(headline_line("Source Git GUI")),
-                                )
-                                .child(
-                                    div()
-                                        .max_w(px(500.0))
-                                        .pt(px(2.0))
-                                        .text_center()
-                                        .text_size(px(14.0))
-                                        .line_height(px(22.0))
-                                        .text_color(hero_muted)
-                                        .child(
-                                            "GitComet is built for teams that want fast Git operations with local-first privacy, familiar workflows, and open source freedom.",
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .pt(px(4.0))
-                                        .flex()
-                                        .flex_wrap()
-                                        .justify_center()
-                                        .gap(px(10.0))
-                                        .child(
-                                            div()
-                                                .id("splash_open_repo_action")
-                                                .debug_selector(|| {
-                                                    "splash_open_repo_action".to_string()
-                                                })
-                                                .flex()
-                                                .justify_center()
-                                                .child(open_button),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("splash_clone_repo_action")
-                                                .debug_selector(|| {
-                                                    "splash_clone_repo_action".to_string()
-                                                })
-                                                .flex()
-                                                .justify_center()
-                                                .child(clone_button),
-                                        ),
-                                )
-                                .child(open_repo_fallback)
-                                .child(
-                                    div()
-                                        .pt(px(2.0))
-                                        .text_size(px(12.0))
-                                        .text_color(hero_proof)
-                                        .text_center()
-                                        .child("Available for Linux, Windows and macOS."),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(-224.0))
-                                .left(px(-1.0))
-                                .w(px(1.0))
-                                .h(px(224.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(guide_fade, 0.0),
-                                    gpui::linear_color_stop(guide_edge, 1.0),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(-224.0))
-                                .right(px(-1.0))
-                                .w(px(1.0))
-                                .h(px(224.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(guide_fade, 0.0),
-                                    gpui::linear_color_stop(guide_edge, 1.0),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(px(-214.0))
-                                .left(px(-1.0))
-                                .w(px(1.0))
-                                .h(px(214.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(guide_edge, 0.0),
-                                    gpui::linear_color_stop(guide_fade, 1.0),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(px(-214.0))
-                                .right(px(-1.0))
-                                .w(px(1.0))
-                                .h(px(214.0))
-                                .bg(gpui::linear_gradient(
-                                    180.0,
-                                    gpui::linear_color_stop(guide_edge, 0.0),
-                                    gpui::linear_color_stop(guide_fade, 1.0),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(-4.0))
-                                .left(px(-4.0))
-                                .size(px(7.0))
-                                .bg(node_color),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top(px(-4.0))
-                                .right(px(-4.0))
-                                .size(px(7.0))
-                                .bg(node_color),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(px(-4.0))
-                                .left(px(-4.0))
-                                .size(px(7.0))
-                                .bg(node_color),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .bottom(px(-4.0))
-                                .right(px(-4.0))
-                                .size(px(7.0))
-                                .bg(node_color),
-                        ),
-                ),
-            )
-            .into_any_element()
-    }
-
     /// The vertical icon rail shown in place of the sidebar while it is collapsed.
     /// An expand affordance sits at the top; below it, one toggle per section that
     /// opens that section in a floating popover without expanding the sidebar.
@@ -924,15 +506,17 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
-        let scaled_px =
-            |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
         let active = self.sidebar_collapsed_popover;
         let icon_muted = theme.colors.foreground.secondary;
-        let active_bg = theme.active_overlay();
-        let hover_bg = theme.hover_overlay();
         let slot = scaled_px(28.0);
 
-        let icons = CollapsedSidebarSection::ALL.into_iter().map(|section| {
+        let repo = self.active_repo();
+        let sections: Vec<_> = CollapsedSidebarSection::ALL
+            .into_iter()
+            .filter(|section| section.is_available(repo))
+            .collect();
+        let icons = sections.into_iter().map(|section| {
             let is_active = active == Some(section);
             let icon_color = if is_active {
                 theme.colors.foreground.primary
@@ -941,16 +525,19 @@ impl GitCometView {
             };
             div()
                 .id(section.element_id())
+                .debug_selector(move || section.element_id().to_string())
                 .flex()
                 .items_center()
                 .justify_center()
                 .size(slot)
                 .rounded(px(theme.radii.control))
                 .cursor(CursorStyle::PointingHand)
-                .when(is_active, |d| d.bg(active_bg))
-                .hover(move |d| if is_active { d } else { d.bg(hover_bg) })
+                .control_interaction(
+                    InteractionStyle::new(theme),
+                    InteractionState::default().open(is_active),
+                )
                 .child(svg_icon(section.icon_path(), icon_color, scaled_px(16.0)))
-                .on_mouse_down(
+                .on_pointer_click(
                     MouseButton::Left,
                     cx.listener(move |this, _e, _window, cx| {
                         this.toggle_sidebar_collapsed_popover(section, cx);
@@ -988,7 +575,7 @@ impl GitCometView {
             .bottom_0()
             .right_0()
             .occlude()
-            .on_any_mouse_down(cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
+            .on_any_pointer_click(cx.listener(|this, _e: &MouseDownEvent, _window, cx| {
                 this.close_sidebar_collapsed_popover(cx);
             }))
             .into_any_element()
@@ -1006,10 +593,10 @@ impl GitCometView {
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
-        let scaled_px =
-            |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
         let panel = div()
             .id("collapsed_sidebar_popover")
+            .h_full()
             .debug_selector(|| "collapsed_sidebar_popover".to_string())
             .w_full()
             .flex()
@@ -1019,7 +606,6 @@ impl GitCometView {
             .border_1()
             .border_color(theme.colors.stroke.default)
             .bg(theme.colors.surface.raised)
-            .shadow_lg()
             // Claim clicks anywhere on the panel so its empty regions don't fall
             // through to the dismiss scrim underneath.
             .occlude()
@@ -1031,7 +617,7 @@ impl GitCometView {
             // which would otherwise open a commit menu through the popover. It
             // opens the section's own menu instead, which is the only way to
             // reach the worktree/stash/submodule section actions while collapsed.
-            .on_mouse_down(
+            .on_pointer_click(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     cx.stop_propagation();
@@ -1041,8 +627,8 @@ impl GitCometView {
                     else {
                         return;
                     };
-                    this.set_active_context_menu_invoker(Some(invoker), cx);
-                    this.open_popover_at(kind, e.position, window, cx);
+
+                    this.open_popover_at(kind.invoked_by(invoker), e.position, window, cx);
                 }),
             )
             .child(self.sidebar_pane.clone())
@@ -1061,7 +647,7 @@ impl GitCometView {
             .left(self.sidebar_render_width)
             .ml(scaled_px(6.0))
             .top(scaled_px(4.0))
-            .bottom(scaled_px(4.0) + px(CONTENT_CARD_BOTTOM_MARGIN_PX))
+            .bottom(scaled_px(4.0) + scaled_px(CONTENT_CARD_BOTTOM_MARGIN_PX))
             .w(scaled_px(COLLAPSED_POPOVER_WIDTH_PX))
             .flex()
             .flex_col()
@@ -1084,20 +670,77 @@ impl GitCometView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        if let Some(pane) = &self.focused_diff_pane {
+            return div()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(pane.view())
+                .into_any_element();
+        }
+
         let theme = self.theme;
+        let ui_scale_percent = self.ui_scale_percent;
+        let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
+
+        // With a repository open the viewer takes only the main slot below, so
+        // the sidebar, details and action bar stay put. Without one there is no
+        // chrome to keep, and the viewer gets the whole content card.
+        let repository_chrome = renders_full_chrome(self.view_mode)
+            && !self.is_startup_repository_loading_screen_active()
+            && !self.is_home_screen_active();
+        if self.documents_active && !repository_chrome {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .bg(theme.colors.surface.chrome)
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.))
+                        .mx(scaled_px(6.0))
+                        .mt(scaled_px(4.0))
+                        .mb(scaled_px(CONTENT_CARD_BOTTOM_MARGIN_PX))
+                        .rounded(px(main_content_card_radius(theme)))
+                        .border_1()
+                        .border_color(theme.colors.stroke.default)
+                        .overflow_hidden()
+                        .child(self.documents.clone()),
+                )
+                .child(stable_cached_fixed_height_view(
+                    self.bottom_status_bar.clone(),
+                    bottom_status_bar_height(cx),
+                ))
+                .into_any_element();
+        }
 
         if self.is_startup_repository_loading_screen_active() {
             return self.startup_repository_loading_screen();
         }
 
-        if self.is_splash_screen_active() {
-            return self.splash_screen(cx);
+        if self.is_home_screen_active() {
+            return div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h(px(0.))
+                .child(self.home_screen(cx))
+                .child(self.bottom_status_bar.clone())
+                .into_any_element();
         }
 
         if renders_full_chrome(self.view_mode) {
             // Terminal and/or reflog — see `render_bottom_panel` for which.
             let bottom_panel = self.render_bottom_panel(theme, window, cx);
-            let has_bottom_panel = bottom_panel.is_some();
+            let bottom_panel_resize_handle = bottom_panel
+                .is_some()
+                .then(|| self.terminal_panel_resize_handle(theme, cx));
+            let main_content = self.repository_main_content();
+            let details_tabs = self.details_tab_content(cx);
+            let sidebar_sections = (!self.sidebar_collapsed)
+                .then(|| self.sidebar_section_content(window, cx))
+                .flatten();
             let content = div()
                 .flex()
                 .flex_col()
@@ -1148,7 +791,25 @@ impl GitCometView {
                                 .min_h(px(0.0))
                                 .bg(theme.colors.surface.chrome)
                                 .when(!self.sidebar_collapsed, |d| {
-                                    d.child(self.sidebar_pane.clone())
+                                    // Cached so frames driven by another view's
+                                    // `notify` (a spinner tick in the title bar,
+                                    // a diff update) reuse the sidebar's layout
+                                    // and paint. The wrapper fills this div, so
+                                    // the width animation still re-lays it out.
+                                    match sidebar_sections {
+                                        None => d.child(stable_cached_fill_view(
+                                            self.sidebar_pane.clone(),
+                                        )),
+                                        // Extension sections sit below the
+                                        // sidebar's own, which keeps the rest.
+                                        Some(sections) => d
+                                            .flex()
+                                            .flex_col()
+                                            .child(div().flex_1().min_h(px(0.0)).child(
+                                                stable_cached_fill_view(self.sidebar_pane.clone()),
+                                            ))
+                                            .child(sections),
+                                    }
                                 })
                                 .when(self.sidebar_collapsed, |d| {
                                     d.child(self.collapsed_sidebar_rail(theme, cx))
@@ -1157,8 +818,8 @@ impl GitCometView {
                         .child(
                             // Main + details share one card silhouette; the panes stay
                             // independently resizable inside it. The card sits flush
-                            // against the action bar and sidebar (no top/left gap); the
-                            // sidebar resize strip overlays the card's left edge below.
+                            // against the action bar, sidebar, and right window edge;
+                            // the sidebar resize strip overlays its left edge below.
                             div()
                                 .flex_1()
                                 .min_w(px(0.0))
@@ -1167,10 +828,10 @@ impl GitCometView {
                                 .flex_row()
                                 // Kept minimal so the bottom bar's icons (pane
                                 // toggles + zoom) read as one row hugging the card.
-                                .mb(px(CONTENT_CARD_BOTTOM_MARGIN_PX))
-                                .mr(px(CONTENT_CARD_GAP_PX))
+                                .mb(scaled_px(CONTENT_CARD_BOTTOM_MARGIN_PX))
                                 .relative()
-                                .rounded(px(main_content_card_radius(theme)))
+                                .rounded_tl(px(main_content_card_radius(theme)))
+                                .rounded_bl(px(main_content_card_radius(theme)))
                                 .border_1()
                                 .border_color(theme.colors.stroke.default)
                                 .overflow_hidden()
@@ -1181,17 +842,21 @@ impl GitCometView {
                                         .min_w(px(0.0))
                                         .min_h(px(0.0))
                                         .overflow_hidden()
-                                        .when_some(bottom_panel, |d, bottom_panel| {
-                                            d.flex()
-                                                .flex_col()
-                                                .child(div().flex_1().min_h(px(0.0)).child(
-                                                    stable_cached_fill_view(self.main_pane.clone()),
-                                                ))
-                                                .child(self.terminal_panel_resize_handle(theme, cx))
-                                                .child(bottom_panel)
-                                        })
-                                        .when(!has_bottom_panel, |d| {
-                                            d.child(stable_cached_fill_view(self.main_pane.clone()))
+                                        .map(|d| {
+                                            match (bottom_panel, bottom_panel_resize_handle) {
+                                                (Some(bottom_panel), Some(resize_handle)) => d
+                                                    .flex()
+                                                    .flex_col()
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .min_h(px(0.0))
+                                                            .child(main_content),
+                                                    )
+                                                    .child(resize_handle)
+                                                    .child(bottom_panel),
+                                                _ => d.child(main_content),
+                                            }
                                         }),
                                 )
                                 .child(
@@ -1209,13 +874,11 @@ impl GitCometView {
                                             // keep a hairline between main and the strip.
                                             d.border_l_1().border_color(theme.colors.stroke.subtle)
                                         })
-                                        .when(!self.details_collapsed, |d| {
-                                            d.child(
-                                                div()
-                                                    .flex_1()
-                                                    .min_h(px(0.0))
-                                                    .child(self.details_pane.clone()),
-                                            )
+                                        .when(!self.details_collapsed, |d| match details_tabs {
+                                            None => d.child(div().flex_1().min_h(px(0.0)).child(
+                                                stable_cached_fill_view(self.details_pane.clone()),
+                                            )),
+                                            Some(content) => d.child(content),
                                         }),
                                 )
                                 .child(
@@ -1237,7 +900,7 @@ impl GitCometView {
                                             cx,
                                         )),
                                 )
-                                .child(card_corner_caps(
+                                .child(card_left_corner_caps(
                                     px((main_content_card_radius(theme) - 1.0).max(0.0)),
                                     theme.colors.surface.chrome,
                                 )),
@@ -1254,7 +917,7 @@ impl GitCometView {
                             div()
                                 .absolute()
                                 .top_0()
-                                .bottom(px(CONTENT_CARD_BOTTOM_MARGIN_PX))
+                                .bottom(scaled_px(CONTENT_CARD_BOTTOM_MARGIN_PX))
                                 .left(
                                     (self.sidebar_render_width
                                         - self.pane_resize_handle_width() / 2.0)
@@ -1282,13 +945,10 @@ impl GitCometView {
                             ))
                         })
                 })
-                .child(
-                    // Keep the bottom bar uncached. It paints after the details pane,
-                    // so reusing its cached paint range can replay a stale input-handler
-                    // index while a focused TextInput is temporarily detached during a
-                    // Wayland text-input redraw.
+                .child(stable_cached_fixed_height_view(
                     self.bottom_status_bar.clone(),
-                )
+                    bottom_status_bar_height(cx),
+                ))
                 .into_any_element();
 
             if self.should_show_git_unavailable_overlay() {

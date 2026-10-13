@@ -2,6 +2,8 @@ pub(crate) mod common;
 
 mod branch_sidebar;
 mod branch_sidebar_cache;
+mod sidebar_sticky;
+pub(crate) use sidebar_sticky::bench_sidebar_sticky;
 mod branch_sidebar_extreme_scale;
 mod clipboard;
 mod commit_details;
@@ -46,6 +48,7 @@ mod history_column_resize_drag_step;
 mod history_graph;
 mod history_load_more_append;
 mod history_scope_switch;
+mod indexed_history;
 mod keyboard;
 mod large_file_diff_scroll;
 mod large_html_syntax;
@@ -93,7 +96,9 @@ pub(crate) use commit_details::bench_commit_details;
 pub(crate) use common::{benchmark_criterion, benchmark_selectors_match_filter};
 pub(crate) use conflict_load_duplication::bench_conflict_load_duplication;
 pub(crate) use conflict_resolved_output_gutter_scroll::bench_conflict_resolved_output_gutter_scroll;
-pub(crate) use conflict_resolved_output_live_syntax::bench_conflict_resolved_output_live_syntax;
+pub(crate) use conflict_resolved_output_live_syntax::{
+    bench_bounded_live_syntax_edits, bench_conflict_resolved_output_live_syntax,
+};
 pub(crate) use conflict_search_query_update::bench_conflict_search_query_update;
 pub(crate) use conflict_split_resize_step::bench_conflict_split_resize_step;
 pub(crate) use conflict_streamed_provider::bench_conflict_streamed_provider;
@@ -132,6 +137,7 @@ pub(crate) use history_column_resize_drag_step::bench_history_column_resize_drag
 pub(crate) use history_graph::bench_history_graph;
 pub(crate) use history_load_more_append::bench_history_load_more_append;
 pub(crate) use history_scope_switch::bench_history_scope_switch;
+pub(crate) use indexed_history::bench_indexed_history;
 pub(crate) use keyboard::bench_keyboard;
 pub(crate) use large_file_diff_scroll::bench_large_file_diff_scroll;
 pub(crate) use large_html_syntax::bench_large_html_syntax;
@@ -170,3 +176,12 @@ pub(crate) use undo_redo::bench_undo_redo;
 pub(crate) use window_resize_layout::bench_window_resize_layout;
 pub(crate) use window_resize_layout_extreme_scale::bench_window_resize_layout_extreme_scale;
 pub(crate) use worktree_preview_render::bench_worktree_preview_render;
+
+mod extensions;
+pub(crate) use extensions::bench_extensions;
+
+mod mermaid;
+pub(crate) use mermaid::bench_mermaid_preview;
+
+mod watcher_startup;
+pub(crate) use watcher_startup::bench_watcher_startup;

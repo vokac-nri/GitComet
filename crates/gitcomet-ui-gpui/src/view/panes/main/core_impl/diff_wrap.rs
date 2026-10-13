@@ -4,16 +4,31 @@ pub(super) fn line_ranges_intersect(a: &Range<usize>, b: &Range<usize>) -> bool 
     a.start < b.end && b.start < a.end
 }
 
+/// Shared wrap width for the two split columns: the narrower of their usable
+/// text widths, with the annotation column charged to the left one only.
+pub(super) fn split_wrap_text_width(
+    left_w: Pixels,
+    right_w: Pixels,
+    annotation_width: Pixels,
+    text_start: Pixels,
+    pad: Pixels,
+) -> Pixels {
+    let left = left_w - annotation_width - text_start - pad;
+    let right = right_w - text_start - pad;
+    left.min(right).max(px(0.0))
+}
+
 pub(super) fn diff_wrap_columns_for_width(width: Pixels, char_width: Pixels) -> usize {
     let char_width = f32::from(char_width.max(px(1.0)));
     ((f32::from(width.max(px(0.0))) / char_width).floor() as usize).max(1)
 }
 
 pub(super) fn diff_wrap_byte_ranges_for_source_text(
+    tab_width: usize,
     text: &str,
     columns: usize,
 ) -> Vec<rows::DiffWrapByteRange> {
-    let mut ranges = rows::diff_wrap_ranges_for_text(text, columns)
+    let mut ranges = rows::diff_wrap_ranges_for_text(tab_width, text, columns)
         .into_iter()
         .map(rows::DiffWrapByteRange::from_range)
         .collect::<Vec<_>>();
@@ -24,26 +39,45 @@ pub(super) fn diff_wrap_byte_ranges_for_source_text(
 }
 
 pub(super) fn diff_wrap_byte_ranges_for_revealed_text(
+    tab_width: usize,
     source_text: &str,
     raw_text: Option<&str>,
     columns: usize,
 ) -> Vec<rows::DiffWrapByteRange> {
     let marker_text = raw_text
-        .filter(|raw| crate::view::diff_utils::diff_text_display_len(raw) == source_text.len())
+        .filter(|raw| {
+            crate::view::tab_width::expanded_len(tab_width, raw) == source_text.len()
+                || crate::view::tab_width::expanded_patch_len(tab_width, raw) == source_text.len()
+        })
         .unwrap_or(source_text);
-    let offset_map = rows::whitespace_visible_diff_offset_map(marker_text, true);
+    // Patch signs are copied with the line but do not advance its tab stops.
+    // Map the content separately, then put the sign's byte back in the ranges.
+    let prefix = usize::from(
+        crate::view::tab_width::expanded_len(tab_width, marker_text) != source_text.len(),
+    );
+    let offset_map =
+        rows::whitespace_visible_diff_offset_map(tab_width, &marker_text[prefix..], true);
+    let source_offset = |offset: usize| {
+        if offset < prefix {
+            return 0;
+        }
+        let offset = offset - prefix;
+        prefix
+            + if offset >= offset_map.display_len() {
+                offset_map.source_len()
+            } else {
+                offset_map.source_offset_for_display(offset)
+            }
+    };
     let mut ranges = rows::diff_wrap_ranges_for_text(
+        tab_width,
         rows::whitespace_visible_line_text(marker_text).as_ref(),
         columns,
     )
     .into_iter()
     .map(|display_range| {
-        let start = offset_map.source_offset_for_display(display_range.start);
-        let end = if display_range.end >= offset_map.display_len() {
-            offset_map.source_len()
-        } else {
-            offset_map.source_offset_for_display(display_range.end)
-        };
+        let start = source_offset(display_range.start);
+        let end = source_offset(display_range.end);
         rows::DiffWrapByteRange { start, end }
     })
     .collect::<Vec<_>>();
@@ -54,15 +88,16 @@ pub(super) fn diff_wrap_byte_ranges_for_revealed_text(
 }
 
 pub(super) fn diff_wrap_byte_ranges_for_text(
+    tab_width: usize,
     source_text: &str,
     raw_text: Option<&str>,
     columns: usize,
     reveal_whitespace_chars: bool,
 ) -> Vec<rows::DiffWrapByteRange> {
     if reveal_whitespace_chars {
-        diff_wrap_byte_ranges_for_revealed_text(source_text, raw_text, columns)
+        diff_wrap_byte_ranges_for_revealed_text(tab_width, source_text, raw_text, columns)
     } else {
-        diff_wrap_byte_ranges_for_source_text(source_text, columns)
+        diff_wrap_byte_ranges_for_source_text(tab_width, source_text, columns)
     }
 }
 
@@ -71,12 +106,14 @@ pub(super) fn diff_wrap_empty_byte_ranges() -> Vec<rows::DiffWrapByteRange> {
 }
 
 pub(super) fn diff_wrap_byte_ranges_for_file_diff_text(
+    tab_width: usize,
     text: &gitcomet_core::file_diff::FileDiffLineText,
     columns: usize,
     reveal_whitespace_chars: bool,
 ) -> Vec<rows::DiffWrapByteRange> {
-    let display = crate::view::file_diff_display::file_diff_display_text(text);
+    let display = crate::view::file_diff_display::file_diff_display_text(tab_width, text);
     diff_wrap_byte_ranges_for_text(
+        tab_width,
         display.as_ref(),
         Some(text.as_ref()),
         columns,
@@ -85,12 +122,13 @@ pub(super) fn diff_wrap_byte_ranges_for_file_diff_text(
 }
 
 pub(super) fn diff_wrap_byte_ranges_for_optional_file_diff_text(
+    tab_width: usize,
     text: Option<&gitcomet_core::file_diff::FileDiffLineText>,
     columns: usize,
     reveal_whitespace_chars: bool,
 ) -> Vec<rows::DiffWrapByteRange> {
     text.map(|text| {
-        diff_wrap_byte_ranges_for_file_diff_text(text, columns, reveal_whitespace_chars)
+        diff_wrap_byte_ranges_for_file_diff_text(tab_width, text, columns, reveal_whitespace_chars)
     })
     .unwrap_or_else(diff_wrap_empty_byte_ranges)
 }
@@ -117,7 +155,7 @@ pub(super) fn shift_resolved_output_marker(
 }
 
 impl MainPaneView {
-    pub(super) fn diff_source_visible_len(&self) -> usize {
+    pub(in crate::view) fn diff_source_visible_len(&self) -> usize {
         // A file preview has no diff rows: its source rows are the file's
         // lines, and they wrap through the same projection.
         if self.is_file_preview_active() {
@@ -256,7 +294,7 @@ impl MainPaneView {
             if self.diff_wrap_visible_cache_key.take().is_some()
                 || !self.diff_wrap_visible_rows.is_empty()
             {
-                self.diff_wrap_visible_rows.clear();
+                self.diff_wrap_visible_rows = Arc::from([]);
                 self.diff_scrollbar_markers_cache = self.compute_diff_scrollbar_markers();
                 if self.diff_search_has_query() {
                     self.diff_search_recompute_matches_for_current_view_preserving_current();
@@ -294,8 +332,7 @@ impl MainPaneView {
             return;
         }
 
-        self.diff_wrap_visible_rows.clear();
-        self.diff_wrap_visible_rows.reserve(source_len);
+        let mut wrapped_rows = Vec::with_capacity(source_len);
         for source_visible_ix in 0..source_len {
             let (primary_ranges, secondary_ranges) = self.diff_wrap_ranges_for_source_visible_ix(
                 source_visible_ix,
@@ -305,7 +342,7 @@ impl MainPaneView {
             );
             let row_count = primary_ranges.len().max(secondary_ranges.len()).max(1);
             for wrap_ix in 0..row_count {
-                self.diff_wrap_visible_rows.push(DiffWrapVisualRow {
+                wrapped_rows.push(DiffWrapVisualRow {
                     source_visible_ix,
                     wrap_ix,
                     primary_range: diff_wrap_byte_range_at(&primary_ranges, wrap_ix),
@@ -313,6 +350,7 @@ impl MainPaneView {
                 });
             }
         }
+        self.diff_wrap_visible_rows = wrapped_rows.into();
         self.diff_wrap_visible_cache_key = Some(key);
         self.diff_scrollbar_markers_cache = self.compute_diff_scrollbar_markers();
         if self.diff_search_has_query() {
@@ -341,16 +379,25 @@ impl MainPaneView {
         // Measured in the editor font the rows are painted in, not in the
         // ambient UI font that is still current while this element tree is
         // being built. See `diff_text_wrap_char_width`.
-        let char_width =
-            rows::diff_canvas_text_wrap_char_width(window, self.diff_wrap_measure_font_family(cx));
+        let char_width = rows::diff_canvas_text_wrap_char_width(
+            window,
+            self.diff_wrap_measure_font_family(cx),
+            self.theme.metrics.editor_font_size_px,
+        );
         let pad = rows::diff_canvas_row_horizontal_padding(ui_scale_percent);
         let inline_text_start = if self.diff_show_line_numbers {
-            rows::diff_canvas_inline_text_start(ui_scale_percent)
+            rows::diff_canvas_inline_text_start(
+                ui_scale::UiScale::from_percent(ui_scale_percent)
+                    .with_appearance(self.theme.metrics),
+            )
         } else {
             pad
         };
         let single_text_start = if self.diff_show_line_numbers {
-            rows::diff_canvas_single_column_text_start(ui_scale_percent)
+            rows::diff_canvas_single_column_text_start(
+                ui_scale::UiScale::from_percent(ui_scale_percent)
+                    .with_appearance(self.theme.metrics),
+            )
         } else {
             pad
         };
@@ -368,10 +415,12 @@ impl MainPaneView {
 
         let (left_w, right_w) =
             crate::view::diff_split_column_widths(content_width, self.diff_split_ratio);
-        // The annotation column narrows the left split column; subtract it from
-        // the shared wrap width so wrapped text stays within the left column.
+        // Both columns wrap at one width so their rows stay aligned, so take the
+        // narrower of the two. Annotation sits inside the left column only:
+        // charging it to whichever column happens to be narrower can leave no
+        // room at all and wrap every line to one character.
         let split_text_width =
-            left_w.min(right_w).max(px(0.0)) - annotation_width - single_text_start - pad;
+            split_wrap_text_width(left_w, right_w, annotation_width, single_text_start, pad);
         let split_columns = diff_wrap_columns_for_width(split_text_width, char_width);
         (inline_columns, split_columns)
     }
@@ -390,11 +439,17 @@ impl MainPaneView {
         let ui_scale_percent = crate::ui_scale::UiScale::current(cx).percent();
         let vertical_gutter = components::Scrollbar::gutter(components::ScrollbarAxis::Vertical);
         let content_width = (self.main_pane_content_width(cx) - vertical_gutter).max(px(0.0));
-        let char_width =
-            rows::diff_canvas_text_wrap_char_width(window, self.diff_wrap_measure_font_family(cx));
+        let char_width = rows::diff_canvas_text_wrap_char_width(
+            window,
+            self.diff_wrap_measure_font_family(cx),
+            self.theme.metrics.editor_font_size_px,
+        );
         let pad = rows::diff_canvas_row_horizontal_padding(ui_scale_percent);
         let text_start = if self.diff_show_line_numbers {
-            rows::diff_canvas_single_column_text_start(ui_scale_percent)
+            rows::diff_canvas_single_column_text_start(
+                ui_scale::UiScale::from_percent(ui_scale_percent)
+                    .with_appearance(self.theme.metrics),
+            )
         } else {
             pad
         };
@@ -413,21 +468,6 @@ impl MainPaneView {
         )
     }
 
-    /// Widths a wrapped markdown preview row may occupy: the full content
-    /// width for the inline and worktree lists, and the narrower of the two
-    /// split columns for the side-by-side lists, so both columns wrap
-    /// identically and stay row-aligned.
-    pub(in crate::view) fn markdown_preview_wrap_widths(
-        &self,
-        cx: &mut gpui::Context<Self>,
-    ) -> (Pixels, Pixels) {
-        let vertical_gutter = components::Scrollbar::gutter(components::ScrollbarAxis::Vertical);
-        let content_width = (self.main_pane_content_width(cx) - vertical_gutter).max(px(0.0));
-        let (left_w, right_w) =
-            crate::view::diff_split_column_widths(content_width, self.diff_split_ratio);
-        (content_width, left_w.min(right_w).max(px(0.0)))
-    }
-
     pub(super) fn diff_wrap_ranges_for_source_visible_ix(
         &self,
         source_visible_ix: usize,
@@ -435,10 +475,13 @@ impl MainPaneView {
         split_columns: usize,
         preview_columns: usize,
     ) -> (Vec<rows::DiffWrapByteRange>, Vec<rows::DiffWrapByteRange>) {
+        let tab_width = self.display_tab_width;
+
         // A file preview is one column of plain file lines.
         if self.is_file_preview_active() {
             return (
                 diff_wrap_byte_ranges_for_optional_file_diff_text(
+                    tab_width,
                     self.worktree_preview_line_raw_text(source_visible_ix)
                         .as_ref(),
                     preview_columns,
@@ -462,6 +505,7 @@ impl MainPaneView {
                         };
                         (
                             diff_wrap_byte_ranges_for_file_diff_text(
+                                tab_width,
                                 &row.text,
                                 inline_columns,
                                 self.reveal_whitespace_chars,
@@ -475,11 +519,13 @@ impl MainPaneView {
                         };
                         (
                             diff_wrap_byte_ranges_for_optional_file_diff_text(
+                                tab_width,
                                 row.old.as_ref(),
                                 split_columns,
                                 self.reveal_whitespace_chars,
                             ),
                             diff_wrap_byte_ranges_for_optional_file_diff_text(
+                                tab_width,
                                 row.new.as_ref(),
                                 split_columns,
                                 self.reveal_whitespace_chars,
@@ -499,6 +545,7 @@ impl MainPaneView {
                     if let Some(row) = self.file_diff_inline_render_data(mapped_ix) {
                         return (
                             diff_wrap_byte_ranges_for_file_diff_text(
+                                tab_width,
                                 &row.text,
                                 inline_columns,
                                 self.reveal_whitespace_chars,
@@ -513,6 +560,7 @@ impl MainPaneView {
                         .diff_text_full_line_for_region(source_visible_ix, DiffTextRegion::Inline);
                     (
                         diff_wrap_byte_ranges_for_text(
+                            tab_width,
                             text.as_ref(),
                             Some(crate::view::diff_utils::diff_content_text(&line)),
                             inline_columns,
@@ -527,11 +575,13 @@ impl MainPaneView {
                     };
                     (
                         diff_wrap_byte_ranges_for_optional_file_diff_text(
+                            tab_width,
                             row.old.as_ref(),
                             split_columns,
                             self.reveal_whitespace_chars,
                         ),
                         diff_wrap_byte_ranges_for_optional_file_diff_text(
+                            tab_width,
                             row.new.as_ref(),
                             split_columns,
                             self.reveal_whitespace_chars,
@@ -558,6 +608,7 @@ impl MainPaneView {
                     self.diff_text_full_line_for_region(source_visible_ix, DiffTextRegion::Inline);
                 (
                     diff_wrap_byte_ranges_for_text(
+                        tab_width,
                         text.as_ref(),
                         Some(line.text.as_ref()),
                         inline_columns,
@@ -578,12 +629,14 @@ impl MainPaneView {
                     );
                     (
                         diff_wrap_byte_ranges_for_text(
+                            tab_width,
                             left.as_ref(),
                             row.old.as_ref().map(|text| text.as_ref()),
                             split_columns,
                             self.reveal_whitespace_chars,
                         ),
                         diff_wrap_byte_ranges_for_text(
+                            tab_width,
                             right.as_ref(),
                             row.new.as_ref().map(|text| text.as_ref()),
                             split_columns,
@@ -608,12 +661,14 @@ impl MainPaneView {
                     );
                     (
                         diff_wrap_byte_ranges_for_text(
+                            tab_width,
                             left.as_ref(),
                             (!left.is_empty()).then_some(line.text.as_ref()),
                             split_columns,
                             self.reveal_whitespace_chars,
                         ),
                         diff_wrap_byte_ranges_for_text(
+                            tab_width,
                             right.as_ref(),
                             (!right.is_empty()).then_some(line.text.as_ref()),
                             split_columns,
@@ -624,5 +679,67 @@ impl MainPaneView {
                 None => (diff_wrap_empty_byte_ranges(), diff_wrap_empty_byte_ranges()),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Annotation lives inside the left split column. Charging it to whichever
+    /// column is narrower left no room at all and wrapped every line to one
+    /// character.
+    #[test]
+    fn review_revealed_patch_tabs_keep_the_raw_marker_offsets() {
+        for raw in ["+a\tb", "-日\tb", " a\tb"] {
+            for width in [4, 8] {
+                let source = crate::view::tab_width::expand_patch_tabs(width, raw);
+                let ranges = diff_wrap_byte_ranges_for_revealed_text(width, &source, Some(raw), 4);
+                // The sign, letter, tab marker and final letter fill row one;
+                // only the EOL marker wraps. Byte offsets cover the full source.
+                assert_eq!(ranges[0].end, source.len(), "{raw:?}, tab width {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn annotation_only_narrows_the_left_split_column() {
+        let (text_start, pad) = (px(40.0), px(8.0));
+        let (left, right) = (px(650.0), px(440.0));
+        let annotation = px(375.0);
+
+        let width = split_wrap_text_width(left, right, annotation, text_start, pad);
+
+        assert_eq!(width, left - annotation - text_start - pad);
+        assert!(
+            diff_wrap_columns_for_width(width, px(7.8)) > 20,
+            "a real annotate column must still leave a readable wrap width"
+        );
+    }
+
+    /// Whichever column ends up narrower once annotation is charged is the one
+    /// that decides, so wrapped rows never overflow either column.
+    #[test]
+    fn the_shared_wrap_width_is_the_narrower_usable_column() {
+        let (text_start, pad) = (px(40.0), px(8.0));
+
+        assert_eq!(
+            split_wrap_text_width(px(900.0), px(300.0), px(0.0), text_start, pad),
+            px(300.0) - text_start - pad
+        );
+        assert_eq!(
+            split_wrap_text_width(px(400.0), px(900.0), px(100.0), text_start, pad),
+            px(400.0) - px(100.0) - text_start - pad
+        );
+    }
+
+    /// A pane too narrow to hold the annotation column must still wrap at one
+    /// column rather than at a negative width.
+    #[test]
+    fn a_column_narrower_than_its_chrome_never_wraps_below_one() {
+        let width = split_wrap_text_width(px(80.0), px(80.0), px(375.0), px(40.0), px(8.0));
+
+        assert_eq!(width, px(0.0));
+        assert_eq!(diff_wrap_columns_for_width(width, px(7.8)), 1);
     }
 }

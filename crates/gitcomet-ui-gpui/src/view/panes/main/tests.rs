@@ -234,13 +234,19 @@ fn identical_current_and_projection_remain_interactive_without_stage_payloads() 
 #[test]
 fn focused_mergetool_output_writes_exact_binary_bytes_and_creates_parent() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let output = dir.path().join("nested/result.bin");
     let bytes = b"\0ours\xffresult";
 
-    apply_focused_mergetool_output(&output, FocusedMergetoolOutput::Write(bytes))
-        .expect("write focused mergetool output");
+    apply_focused_mergetool_output(
+        dir.path(),
+        Path::new("nested/result.bin"),
+        FocusedMergetoolOutput::Write(bytes),
+    )
+    .expect("write focused mergetool output");
 
-    assert_eq!(std::fs::read(output).expect("read output"), bytes);
+    assert_eq!(
+        std::fs::read(dir.path().join("nested/result.bin")).expect("read output"),
+        bytes
+    );
 }
 
 #[test]
@@ -249,20 +255,61 @@ fn focused_mergetool_delete_accepts_existing_and_missing_outputs() {
     let output = dir.path().join("result.txt");
     std::fs::write(&output, "merged").expect("seed output");
 
-    apply_focused_mergetool_output(&output, FocusedMergetoolOutput::Delete)
-        .expect("delete focused mergetool output");
+    apply_focused_mergetool_output(
+        dir.path(),
+        Path::new("result.txt"),
+        FocusedMergetoolOutput::Delete,
+    )
+    .expect("delete focused mergetool output");
     assert!(!output.exists());
 
-    apply_focused_mergetool_output(&output, FocusedMergetoolOutput::Delete)
-        .expect("missing output is already deleted");
+    apply_focused_mergetool_output(
+        dir.path(),
+        Path::new("result.txt"),
+        FocusedMergetoolOutput::Delete,
+    )
+    .expect("missing output is already deleted");
+}
+
+#[cfg(unix)]
+#[test]
+fn focused_mergetool_output_refuses_to_leave_the_worktree() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let outside = tempfile::tempdir().expect("outside dir");
+    let victim = outside.path().join("victim");
+    std::fs::write(&victim, "original").expect("seed victim");
+    std::os::unix::fs::symlink(&victim, dir.path().join("conflict.txt")).expect("symlink");
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("docs")).expect("dir symlink");
+    std::fs::write(outside.path().join("note.txt"), "keep").expect("seed note");
+
+    apply_focused_mergetool_output(
+        dir.path(),
+        Path::new("conflict.txt"),
+        FocusedMergetoolOutput::Write(b"merged"),
+    )
+    .expect_err("a symlinked conflict path must be refused");
+    assert_eq!(
+        std::fs::read_to_string(&victim).expect("victim"),
+        "original"
+    );
+
+    apply_focused_mergetool_output(
+        dir.path(),
+        Path::new("docs/note.txt"),
+        FocusedMergetoolOutput::Delete,
+    )
+    .expect_err("a symlinked parent must be refused");
+    assert!(outside.path().join("note.txt").exists());
 }
 
 #[test]
 fn focused_mergetool_output_reports_filesystem_failures() {
     let dir = tempfile::tempdir().expect("temp dir");
 
+    std::fs::create_dir(dir.path().join("result")).expect("directory target");
     let err = apply_focused_mergetool_output(
         dir.path(),
+        Path::new("result"),
         FocusedMergetoolOutput::Write(b"cannot replace a directory"),
     )
     .expect_err("directory target must fail");
@@ -319,10 +366,7 @@ fn repo_browsing_commit(sha: &str, content_preview: bool) -> RepoState {
 }
 
 fn commit_content_target(sha: &str) -> DiffTarget {
-    DiffTarget::Commit {
-        commit_id: CommitId(sha.into()),
-        path: Some(PathBuf::from("src/main.rs")),
-    }
+    DiffTarget::commit(CommitId(sha.into()), PathBuf::from("src/main.rs"))
 }
 
 #[test]
@@ -357,10 +401,10 @@ fn historical_browse_content_ignores_plain_diffs_and_live_state() {
     assert!(!historical_browse_content(&previewing, None));
     assert!(!historical_browse_content(
         &previewing,
-        Some(&DiffTarget::WorkingTree {
-            path: PathBuf::from("src/main.rs"),
-            area: gitcomet_core::domain::DiffArea::Unstaged,
-        })
+        Some(&DiffTarget::working_tree(
+            PathBuf::from("src/main.rs"),
+            gitcomet_core::domain::DiffArea::Unstaged
+        ))
     ));
 
     // No browse point at all.
@@ -2660,7 +2704,7 @@ mod rope_backed_scanner_tests {
     #[test]
     fn the_rope_source_reads_non_ascii_offsets_without_panicking() {
         let text = "// caf\u{e9}\r\nlet s = \"\u{1f642}\";\n";
-        let rope = crate::kit::rope::Rope::from_str(text);
+        let rope = crate::kit::rope::Rope::from_text(text);
 
         // Every offset, including interior ones, must answer as the raw byte.
         for offset in 0..text.len() {
@@ -2765,7 +2809,7 @@ mod rope_backed_scanner_tests {
     fn rope_and_str_scanners_agree() {
         let (segments, output) = fixture();
         let block_map = block_map_for(&segments);
-        let rope = crate::kit::rope::Rope::from_str(&output);
+        let rope = crate::kit::rope::Rope::from_text(&output);
 
         assert_eq!(
             resolved_output_placeholder_protected_ranges(output.as_str()).as_ref(),
@@ -2840,7 +2884,7 @@ mod heuristic_window_tests {
     fn a_window_matches_the_whole_document_over_the_same_rows() {
         let theme = AppTheme::gitcomet_dark();
         let text = fixture();
-        let rope = Rope::from_str(&text);
+        let rope = Rope::from_text(&text);
         let language = rows::DiffSyntaxLanguage::Rust;
 
         let whole =
@@ -2903,7 +2947,7 @@ mod heuristic_window_tests {
     #[test]
     fn an_empty_or_out_of_bounds_window_is_empty() {
         let theme = AppTheme::gitcomet_dark();
-        let rope = Rope::from_str(&fixture());
+        let rope = Rope::from_text(&fixture());
         let language = rows::DiffSyntaxLanguage::Rust;
         assert!(
             resolved_output_heuristic_highlights_for_range(theme, &rope, language, 5..5).is_empty()
@@ -2940,7 +2984,7 @@ fn the_str_and_rope_sources_agree_on_out_of_range_and_mid_character_input() {
         "\u{1f642}\n\u{1f642}",
         "",
     ] {
-        let rope = Rope::from_str(text);
+        let rope = Rope::from_text(text);
         let past_end = text.len() + 5;
 
         for start in 0..=past_end {

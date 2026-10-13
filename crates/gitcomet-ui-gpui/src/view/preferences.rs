@@ -2,6 +2,23 @@ use super::*;
 use gitcomet_core::domain::HistoryMode;
 use gitcomet_state::model::GitLogTagFetchMode;
 
+/// The changed-file lists' default layout and sort, for lists built where
+/// the preferences are not passed in: a list an extension opens starts from
+/// them. Set from the preferences and on every change to them.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(in crate::view) struct FileListDefaults {
+    pub(in crate::view) layout: FileListLayout,
+    pub(in crate::view) sort: crate::view::rows::CommitFileSort,
+}
+
+impl gpui::Global for FileListDefaults {}
+
+impl FileListDefaults {
+    pub(in crate::view) fn current(cx: &App) -> Self {
+        cx.try_global::<Self>().copied().unwrap_or_default()
+    }
+}
+
 /// Window geometry and pane state restored at startup.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct WindowPreferences {
@@ -14,6 +31,7 @@ pub(super) struct WindowPreferences {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct AppearancePreferences {
+    pub(super) metrics: crate::appearance::Appearance,
     pub(super) theme_mode: ThemeMode,
     pub(super) ui_scale_percent: u32,
     pub(super) date_time_format: DateTimeFormat,
@@ -24,6 +42,11 @@ pub(super) struct AppearancePreferences {
 impl Default for AppearancePreferences {
     fn default() -> Self {
         Self {
+            // What a fresh session resolves to, not the neutral baseline.
+            metrics: crate::appearance::Appearance {
+                density: crate::appearance::UiDensity::PREFERENCE_DEFAULT,
+                ..crate::appearance::Appearance::default()
+            },
             theme_mode: ThemeMode::default(),
             ui_scale_percent: 100,
             date_time_format: DateTimeFormat::YmdHm,
@@ -40,6 +63,14 @@ pub(super) struct ChangeTrackingPreferences {
     pub(super) untracked_height: Option<u32>,
 }
 
+/// Defaults for every changed-file list. Kept out of
+/// [`ChangeTrackingPreferences`], which is about untracked grouping alone.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct FileListPreferences {
+    pub(super) layout: FileListLayout,
+    pub(super) sort: crate::view::rows::CommitFileSort,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct DiffPreferences {
     pub(super) scroll_sync: DiffScrollSync,
@@ -49,6 +80,8 @@ pub(super) struct DiffPreferences {
     pub(super) annotate_enabled: bool,
     pub(super) reveal_whitespace_chars: bool,
     pub(super) word_wrap: bool,
+    /// Columns a tab advances to, unless the file or its attributes say.
+    pub(super) tab_size: u8,
     pub(super) show_line_numbers: bool,
 }
 
@@ -62,7 +95,69 @@ impl Default for DiffPreferences {
             annotate_enabled: false,
             reveal_whitespace_chars: false,
             word_wrap: false,
+            tab_size: crate::view::tab_width::DEFAULT_TAB_WIDTH,
             show_line_numbers: true,
+        }
+    }
+}
+
+/// Whether rendered Markdown may turn repository-controlled HTTP(S) image
+/// sources into network requests.
+///
+/// The default is [`Self::NeverLoad`]. The URL is chosen by repository
+/// content, so fetching it tells a server the document's author picked who
+/// opened which file, and when. Anything that builds a policy without asking
+/// the user has to fail closed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RemoteMarkdownImagePolicy {
+    /// Remote pictures load as soon as the rendered preview asks for them.
+    AlwaysLoad,
+    /// Keep remote pictures inert until the user approves their URL in the
+    /// current preview target.
+    AskBeforeLoading,
+    /// Never make a request for a remote Markdown picture.
+    #[default]
+    NeverLoad,
+}
+
+impl RemoteMarkdownImagePolicy {
+    pub(super) const fn key(self) -> &'static str {
+        match self {
+            Self::AlwaysLoad => "always",
+            Self::AskBeforeLoading => "ask",
+            Self::NeverLoad => "never",
+        }
+    }
+
+    pub(super) fn from_key(raw: &str) -> Option<Self> {
+        match raw {
+            "always" => Some(Self::AlwaysLoad),
+            "ask" => Some(Self::AskBeforeLoading),
+            "never" => Some(Self::NeverLoad),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn settings_label(self) -> &'static str {
+        match self {
+            Self::AlwaysLoad => "Always load",
+            Self::AskBeforeLoading => "Ask before loading",
+            Self::NeverLoad => "Never load",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct SecurityPreferences {
+    pub(super) remote_markdown_images: RemoteMarkdownImagePolicy,
+    pub(super) remote_url_policy: RemoteUrlPolicy,
+}
+
+impl Default for SecurityPreferences {
+    fn default() -> Self {
+        Self {
+            remote_markdown_images: RemoteMarkdownImagePolicy::NeverLoad,
+            remote_url_policy: RemoteUrlPolicy::default(),
         }
     }
 }
@@ -88,15 +183,50 @@ impl Default for MergeToolPreferences {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum HistoryBranchNamesMode {
+    #[default]
+    SeparateColumn,
+    Inline,
+}
+
+impl HistoryBranchNamesMode {
+    pub(super) const fn key(self) -> &'static str {
+        match self {
+            Self::SeparateColumn => "separate_column",
+            Self::Inline => "inline",
+        }
+    }
+
+    pub(super) fn from_key(raw: &str) -> Option<Self> {
+        match raw {
+            "separate_column" => Some(Self::SeparateColumn),
+            "inline" => Some(Self::Inline),
+            _ => None,
+        }
+    }
+
+    pub(super) const fn settings_label(self) -> &'static str {
+        match self {
+            Self::SeparateColumn => "Separate column",
+            Self::Inline => "Inline with commit message",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct HistoryPreferences {
+    pub(super) branch_names: HistoryBranchNamesMode,
     pub(super) show_graph: bool,
     pub(super) show_author: bool,
     pub(super) show_date: bool,
     pub(super) show_sha: bool,
     pub(super) relative_dates: bool,
     pub(super) highlight_commit_chain: bool,
+    /// The Files tab browses whichever history row is selected.
+    pub(super) files_follow_selected_commit: bool,
     pub(super) show_tags: bool,
+    pub(super) verify_commit_signatures: bool,
     pub(super) tag_fetch_mode: GitLogTagFetchMode,
     pub(super) default_mode: HistoryMode,
 }
@@ -104,13 +234,16 @@ pub(super) struct HistoryPreferences {
 impl Default for HistoryPreferences {
     fn default() -> Self {
         Self {
+            branch_names: HistoryBranchNamesMode::default(),
             show_graph: true,
             show_author: true,
             show_date: true,
             show_sha: false,
             relative_dates: true,
             highlight_commit_chain: true,
+            files_follow_selected_commit: true,
             show_tags: true,
+            verify_commit_signatures: false,
             tag_fetch_mode: GitLogTagFetchMode::default(),
             default_mode: HistoryMode::default(),
         }
@@ -122,20 +255,34 @@ pub(super) struct FileEditingPreferences {
     pub(super) auto_save: bool,
 }
 
-/// What the app is allowed to disclose about the user, and to whom.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub(super) struct PrivacyPreferences {
-    /// Whether a markdown preview may fetch the `http(s)` image sources a
-    /// document names. Off by default: the URL is chosen by repository
-    /// content, so fetching one tells a server that the document's author
-    /// picked who opened which file, and when.
-    pub(super) load_remote_markdown_images: bool,
-}
-
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(super) struct RepositoryPreferences {
     pub(super) commit_push_after_enabled: bool,
     pub(super) default_tag_type: DefaultTagType,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct RemotePreferences {
+    pub(super) prune_deleted_remote_branches_on_fetch: bool,
+}
+
+impl Default for RemotePreferences {
+    fn default() -> Self {
+        Self {
+            prune_deleted_remote_branches_on_fetch: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct MaintenancePreferences {
+    pub(super) recommend: bool,
+}
+
+impl Default for MaintenancePreferences {
+    fn default() -> Self {
+        Self { recommend: true }
+    }
 }
 
 /// Parsed, defaulted preferences shared by the root view and its child views.
@@ -148,13 +295,17 @@ pub(super) struct UiPreferences {
     pub(super) window: WindowPreferences,
     pub(super) appearance: AppearancePreferences,
     pub(super) change_tracking: ChangeTrackingPreferences,
+    pub(super) file_lists: FileListPreferences,
     pub(super) diff: DiffPreferences,
+    pub(super) security: SecurityPreferences,
     pub(super) merge_tool: MergeToolPreferences,
     pub(super) history: HistoryPreferences,
     pub(super) file_editing: FileEditingPreferences,
-    pub(super) privacy: PrivacyPreferences,
     pub(super) repository: RepositoryPreferences,
+    pub(super) remotes: RemotePreferences,
+    pub(super) maintenance: MaintenancePreferences,
     pub(super) terminal: TerminalPreferences,
+    pub(super) large_files: gitcomet_state::model::LargeFileSettings,
 }
 
 impl UiPreferences {
@@ -168,6 +319,7 @@ impl UiPreferences {
                 sidebar_collapsed: session.sidebar_collapsed.unwrap_or(false),
             },
             appearance: AppearancePreferences {
+                metrics: crate::session_ui::appearance(session),
                 theme_mode: session
                     .theme_mode
                     .as_deref()
@@ -195,6 +347,18 @@ impl UiPreferences {
                 height: session.change_tracking_height,
                 untracked_height: session.untracked_height,
             },
+            file_lists: FileListPreferences {
+                layout: session
+                    .file_list_layout
+                    .as_deref()
+                    .and_then(FileListLayout::from_key)
+                    .unwrap_or_default(),
+                sort: session
+                    .file_list_sort
+                    .as_deref()
+                    .and_then(crate::view::rows::CommitFileSort::from_key)
+                    .unwrap_or_default(),
+            },
             diff: DiffPreferences {
                 scroll_sync: session
                     .diff_scroll_sync
@@ -219,7 +383,32 @@ impl UiPreferences {
                 annotate_enabled: session.annotate_enabled.unwrap_or(false),
                 reveal_whitespace_chars: session.diff_reveal_whitespace_chars.unwrap_or(false),
                 word_wrap: session.diff_word_wrap.unwrap_or(false),
+                tab_size: session
+                    .diff_tab_size
+                    .filter(|size| (1..=crate::view::tab_width::MAX_TAB_WIDTH).contains(size))
+                    .unwrap_or(crate::view::tab_width::DEFAULT_TAB_WIDTH),
                 show_line_numbers: session.diff_show_line_numbers.unwrap_or(true),
+            },
+            security: SecurityPreferences {
+                remote_markdown_images: session
+                    .remote_markdown_image_policy
+                    .as_deref()
+                    .and_then(RemoteMarkdownImagePolicy::from_key)
+                    .or_else(|| {
+                        // The fork's earlier on/off setting. Honour an explicit
+                        // opt-in until the user picks a policy; anything else
+                        // falls through to the default.
+                        (session.markdown_preview_load_remote_images == Some(true))
+                            .then_some(RemoteMarkdownImagePolicy::AlwaysLoad)
+                    })
+                    .unwrap_or_default(),
+                remote_url_policy: session
+                    .allowed_remote_protocols
+                    .as_ref()
+                    .map(|protocols| {
+                        RemoteUrlPolicy::from_keys(protocols.iter().map(String::as_str))
+                    })
+                    .unwrap_or_default(),
             },
             merge_tool: MergeToolPreferences {
                 auto_advance: session.mergetool_auto_advance.unwrap_or(true),
@@ -229,29 +418,55 @@ impl UiPreferences {
                 view_three_way: session.mergetool_view_three_way.unwrap_or(true),
             },
             history: HistoryPreferences {
+                branch_names: session
+                    .history_branch_names
+                    .as_deref()
+                    .and_then(HistoryBranchNamesMode::from_key)
+                    .unwrap_or_default(),
                 show_graph: session.history_show_graph.unwrap_or(true),
                 show_author: session.history_show_author.unwrap_or(true),
                 show_date: session.history_show_date.unwrap_or(true),
                 show_sha: session.history_show_sha.unwrap_or(false),
                 relative_dates: session.history_relative_dates.unwrap_or(true),
                 highlight_commit_chain: session.history_highlight_commit_chain.unwrap_or(true),
+                files_follow_selected_commit: session
+                    .file_browser_follow_selected_commit
+                    .unwrap_or(true),
                 show_tags: session.history_show_tags.unwrap_or(true),
+                verify_commit_signatures: session.history_verify_commit_signatures.unwrap_or(false),
                 tag_fetch_mode: session.history_tag_fetch_mode.unwrap_or_default(),
                 default_mode: session.default_history_mode.unwrap_or_default(),
             },
             file_editing: FileEditingPreferences {
                 auto_save: session.auto_save_file_edits.unwrap_or(false),
             },
-            privacy: PrivacyPreferences {
-                load_remote_markdown_images: session
-                    .markdown_preview_load_remote_images
-                    .unwrap_or(false),
-            },
             repository: RepositoryPreferences {
                 commit_push_after_enabled: session.commit_push_after_enabled.unwrap_or(false),
                 default_tag_type: session.default_tag_type.unwrap_or_default(),
             },
+            remotes: RemotePreferences {
+                prune_deleted_remote_branches_on_fetch: session
+                    .fetch_prune_deleted_remote_branches
+                    .unwrap_or(true),
+            },
+            maintenance: MaintenancePreferences {
+                recommend: session.recommend_repo_maintenance.unwrap_or(true),
+            },
             terminal: TerminalPreferences::from_ui_session(session),
+            large_files: {
+                let defaults = gitcomet_state::model::LargeFileSettings::default();
+                gitcomet_state::model::LargeFileSettings {
+                    hide_annex_refs: session
+                        .annex_hide_bookkeeping_refs
+                        .unwrap_or(defaults.hide_annex_refs),
+                    annex_pull_push: session
+                        .annex_pull_push_on_adjusted
+                        .unwrap_or(defaults.annex_pull_push),
+                    annex_sync_content: session
+                        .annex_sync_content
+                        .unwrap_or(defaults.annex_sync_content),
+                }
+            },
         }
     }
 }
@@ -261,14 +476,115 @@ mod tests {
     use super::*;
 
     #[test]
+    fn history_branch_names_restores_modes_and_defaults_unknown_values() {
+        for (raw, expected) in [
+            (None, HistoryBranchNamesMode::SeparateColumn),
+            (
+                Some("separate_column"),
+                HistoryBranchNamesMode::SeparateColumn,
+            ),
+            (Some("inline"), HistoryBranchNamesMode::Inline),
+            (Some("future_mode"), HistoryBranchNamesMode::SeparateColumn),
+        ] {
+            let preferences = UiPreferences::from_session(&session::UiSession {
+                history_branch_names: raw.map(str::to_owned),
+                ..Default::default()
+            });
+            assert_eq!(preferences.history.branch_names, expected);
+        }
+    }
+
+    #[test]
     fn session_defaults_are_resolved_once() {
         let preferences = UiPreferences::from_session(&session::UiSession::default());
         assert_eq!(preferences, UiPreferences::default());
         assert_eq!(preferences.diff.view_mode, DiffViewMode::Split);
         assert!(preferences.diff.show_line_numbers);
         assert!(preferences.history.show_graph);
+        // The store carries its own default for the reducer; the two must agree
+        // or the Files tab would follow the selection until the first sync.
+        assert_eq!(
+            preferences.history.files_follow_selected_commit,
+            gitcomet_state::model::FileBrowserSettings::default().follow_selected_commit
+        );
         assert!(preferences.merge_tool.view_three_way);
+        assert!(preferences.remotes.prune_deleted_remote_branches_on_fetch);
+        assert_eq!(
+            preferences.maintenance.recommend,
+            gitcomet_state::model::MaintenanceSettings::default().recommend
+        );
         // Repository content chooses these URLs, so the default has to be off.
-        assert!(!preferences.privacy.load_remote_markdown_images);
+        assert_eq!(
+            preferences.security.remote_markdown_images,
+            RemoteMarkdownImagePolicy::NeverLoad
+        );
+        assert_eq!(
+            RemoteMarkdownImagePolicy::default(),
+            RemoteMarkdownImagePolicy::NeverLoad
+        );
+        assert_eq!(
+            preferences.security.remote_url_policy,
+            RemoteUrlPolicy::default()
+        );
+    }
+
+    #[test]
+    fn legacy_remote_image_toggle_maps_onto_the_policy() {
+        let policy = |legacy: Option<bool>, policy: Option<&str>| {
+            UiPreferences::from_session(&session::UiSession {
+                markdown_preview_load_remote_images: legacy,
+                remote_markdown_image_policy: policy.map(str::to_owned),
+                ..Default::default()
+            })
+            .security
+            .remote_markdown_images
+        };
+        assert_eq!(
+            policy(Some(true), None),
+            RemoteMarkdownImagePolicy::AlwaysLoad
+        );
+        assert_eq!(
+            policy(Some(false), None),
+            RemoteMarkdownImagePolicy::NeverLoad
+        );
+        assert_eq!(policy(None, None), RemoteMarkdownImagePolicy::NeverLoad);
+        // Once the user has picked a policy, the old toggle no longer matters.
+        assert_eq!(
+            policy(Some(true), Some("ask")),
+            RemoteMarkdownImagePolicy::AskBeforeLoading
+        );
+    }
+
+    #[test]
+    fn security_preferences_are_parsed_from_session() {
+        let preferences = UiPreferences::from_session(&session::UiSession {
+            remote_markdown_image_policy: Some("ask".to_string()),
+            allowed_remote_protocols: Some(
+                ["https", "http"].into_iter().map(str::to_string).collect(),
+            ),
+            ..Default::default()
+        });
+        assert_eq!(
+            preferences.security.remote_markdown_images,
+            RemoteMarkdownImagePolicy::AskBeforeLoading
+        );
+        assert!(
+            preferences
+                .security
+                .remote_url_policy
+                .allows(RemoteProtocol::Https)
+        );
+        assert!(
+            preferences
+                .security
+                .remote_url_policy
+                .allows(RemoteProtocol::Http)
+        );
+        assert!(
+            !preferences
+                .security
+                .remote_url_policy
+                .allows(RemoteProtocol::Ssh)
+        );
     }
 }

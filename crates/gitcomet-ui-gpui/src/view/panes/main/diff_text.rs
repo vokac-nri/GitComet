@@ -1,4 +1,18 @@
 use super::*;
+use crate::kit::drag_autoscroll::{DRAG_AUTOSCROLL_TICK, drag_autoscroll_step};
+use gitcomet_ui_kit::text_layout::TextLayoutExt as _;
+
+#[cfg(test)]
+thread_local! {
+    // Web links a Ctrl/Cmd+click followed, in order.
+    static OPENED_WEB_LINKS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Web links followed since the last call, which clears them.
+#[cfg(test)]
+pub(in crate::view) fn take_opened_web_links_for_tests() -> Vec<String> {
+    OPENED_WEB_LINKS.with(|links| links.take())
+}
 
 #[derive(Clone, Copy)]
 enum DiffTextOffsetBias {
@@ -68,11 +82,21 @@ impl MainPaneView {
     }
 
     pub(in super::super::super) fn clear_diff_text_selection(&mut self) {
+        self.clear_diff_text_selection_span();
+        self.clear_diff_text_projected_highlights();
+    }
+
+    /// Drops the selected span only, leaving the projected click affordances
+    /// (bracket pair, occurrences) alone.
+    ///
+    /// Losing the window's text selection says nothing about those: they are a
+    /// separate affordance, and the surface that took the selection did not
+    /// invalidate the rows they are projected onto.
+    pub(in crate::view) fn clear_diff_text_selection_span(&mut self) {
         self.diff_text_selecting = false;
         self.diff_text_anchor = None;
         self.diff_text_head = None;
         self.diff_text_autoscroll_target = None;
-        self.clear_diff_text_projected_highlights();
     }
 
     /// Drop click affordances projected into the current visible-row space.
@@ -89,6 +113,7 @@ impl MainPaneView {
     pub(in super::super::super) fn clear_diff_selection_state(&mut self) {
         self.diff_selection_anchor = None;
         self.diff_selection_range = None;
+        self.diff_focused_change_block = None;
         self.clear_diff_text_selection();
     }
 
@@ -103,6 +128,57 @@ impl MainPaneView {
         hitbox: DiffTextHitbox,
     ) {
         self.diff_text_hitboxes.insert((visible_ix, region), hitbox);
+    }
+
+    /// Register one table cell of a row. The row's entry collects its cells,
+    /// and its bounds grow to span them, so row-level lookups see one row.
+    pub(in crate::view) fn add_diff_text_cell_hitbox(
+        &mut self,
+        visible_ix: usize,
+        region: DiffTextRegion,
+        row_len: usize,
+        cell: DiffTextHitbox,
+    ) {
+        let row = self
+            .diff_text_hitboxes
+            .entry((visible_ix, region))
+            .or_insert_with(|| DiffTextHitbox {
+                atomic: false,
+                bounds: cell.bounds,
+                layout_key: 0,
+                source_visible_ix: cell.source_visible_ix,
+                text_start_offset: 0,
+                text_len: row_len,
+                offset_map: None,
+                painted_text: SharedString::default(),
+                streamed_ascii_monospace_cell_width: None,
+                wrapped: None,
+                cells: Vec::new(),
+            });
+        row.bounds = row.bounds.union(&cell.bounds);
+        row.cells.push(cell);
+    }
+
+    /// The cell of a table row a point belongs to: the one it is in, else the
+    /// nearest, by the same line-first distance a drag uses between rows.
+    fn diff_text_cell_for_position(
+        hitbox: &DiffTextHitbox,
+        position: Point<Pixels>,
+    ) -> Option<&DiffTextHitbox> {
+        let distance = |bounds: &Bounds<Pixels>| {
+            let dy = (bounds.top() - position.y)
+                .max(position.y - bounds.bottom())
+                .max(px(0.0));
+            let dx = (bounds.left() - position.x)
+                .max(position.x - bounds.right())
+                .max(px(0.0));
+            (dy, dx)
+        };
+        hitbox.cells.iter().min_by(|a, b| {
+            distance(&a.bounds)
+                .partial_cmp(&distance(&b.bounds))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
     }
 
     /// Register a painted non-text block as a logical target for an active
@@ -227,15 +303,36 @@ impl MainPaneView {
         region: DiffTextRegion,
         position: Point<Pixels>,
     ) -> Option<DiffTextHit> {
+        if !hitbox.cells.is_empty() {
+            let cell = Self::diff_text_cell_for_position(hitbox, position)?;
+            return self.diff_text_hit_in_hitbox(cell, region, position);
+        }
+        if hitbox.atomic {
+            let after = position.y > hitbox.bounds.bottom()
+                || (position.y >= hitbox.bounds.top() && position.x >= hitbox.bounds.center().x);
+            return Some(DiffTextHit {
+                pos: DiffTextPos {
+                    source_visible_ix: hitbox.source_visible_ix,
+                    region,
+                    offset: hitbox.text_start_offset + if after { hitbox.text_len } else { 0 },
+                },
+                past_painted_text: true,
+            });
+        }
         if let Some(wrapped) = &hitbox.wrapped {
             // A wrapped row spans several visual lines, so the click resolves
             // against the layout it was painted with; `Err` is the clamp to the
             // nearest boundary, which is what a drag past the text wants.
-            let (painted_offset, past_painted_text) =
+            let (painted_offset, past_painted_text) = if position.y < hitbox.bounds.top() {
+                (0, true)
+            } else if position.y > hitbox.bounds.bottom() {
+                (wrapped.layout.len(), true)
+            } else {
                 match wrapped.layout.index_for_position(position) {
                     Ok(offset) => (offset, false),
                     Err(offset) => (offset, true),
-                };
+                }
+            };
             return Some(DiffTextHit {
                 pos: DiffTextPos {
                     source_visible_ix: hitbox.source_visible_ix,
@@ -297,13 +394,23 @@ impl MainPaneView {
     /// text it acts on.
     ///
     /// `range` is in the offset space that method reports. A range that wraps
-    /// reports its first visual line only: that is where it begins, and an end
-    /// x taken from a later line says nothing about how far the first one runs.
+    /// reports its part on the visual line nearest `near` — the line clicked.
     fn diff_text_bounds_in_hitbox(
         &self,
         hitbox: &DiffTextHitbox,
         range: Range<usize>,
+        near: Point<Pixels>,
     ) -> Option<Bounds<Pixels>> {
+        if !hitbox.cells.is_empty() {
+            let cell = hitbox.cells.iter().find(|cell| {
+                (cell.text_start_offset..=cell.text_start_offset + cell.text_len)
+                    .contains(&range.start)
+            })?;
+            return self.diff_text_bounds_in_hitbox(cell, range, near);
+        }
+        if hitbox.atomic {
+            return Some(hitbox.bounds);
+        }
         let local = |offset: usize| {
             offset
                 .saturating_sub(hitbox.text_start_offset)
@@ -312,21 +419,20 @@ impl MainPaneView {
         let (start, end) = (local(range.start), local(range.end));
 
         if let Some(wrapped) = &hitbox.wrapped {
-            let top_left = wrapped
-                .layout
-                .position_for_index(wrapped.painted_offset(start))?;
-            let right = wrapped
-                .layout
-                .position_for_index(wrapped.painted_offset(end))
-                .filter(|tail| tail.y <= top_left.y)
-                .map_or(hitbox.bounds.right(), |tail| tail.x);
-            return Some(Bounds::from_corners(
-                top_left,
-                point(
-                    right.max(top_left.x),
-                    top_left.y + wrapped.layout.line_height(),
-                ),
-            ));
+            // One box per visual line, as the selection paints: gpui puts an
+            // offset at a wrap boundary at the end of the line above, so a
+            // range that starts a line would otherwise begin on the previous one.
+            let rects = rows::markdown_flow_range_rects(
+                &wrapped.layout,
+                wrapped.painted_offset(start),
+                wrapped.painted_offset(end),
+            );
+            let distance = |rect: &Bounds<Pixels>| {
+                f32::from((rect.top() - near.y).max(near.y - rect.bottom()))
+            };
+            return rects
+                .into_iter()
+                .min_by(|a, b| distance(a).total_cmp(&distance(b)));
         }
 
         let x_for = |offset: usize| -> Option<Pixels> {
@@ -386,22 +492,28 @@ impl MainPaneView {
         let revealed = if self.conflict_text_hitboxes.is_empty() {
             // Every region, not the first that matches: the split columns are
             // separate scrollables and a hit can be in both.
-            let mut revealed = false;
+            let mut painted = false;
+            let mut revealed = true;
             for region in [
                 DiffTextRegion::Inline,
                 DiffTextRegion::SplitLeft,
                 DiffTextRegion::SplitRight,
             ] {
-                revealed |= self.reveal_diff_search_match_in_region(visible_ix, region, &matcher);
+                if self.diff_text_hitboxes.contains_key(&(visible_ix, region)) {
+                    painted = true;
+                    // Evaluate every painted column even if an earlier one
+                    // needs another layout. No column may cancel its retry.
+                    revealed &=
+                        self.reveal_diff_search_match_in_region(visible_ix, region, &matcher);
+                }
             }
-            revealed
+            painted && revealed
         } else {
             self.reveal_conflict_search_match_horizontally(visible_ix, &matcher)
         };
 
-        // A frame that painted the row settles the matter either way: it either
-        // moved or it did not need to. Only a frame that has not painted it yet
-        // is worth retrying.
+        // Retry until the row is painted with usable scroll geometry in every
+        // column. A settled split column cannot cancel another column's retry.
         self.diff_search_horizontal_reveal = if revealed || attempts_left <= 1 {
             None
         } else {
@@ -446,8 +558,8 @@ impl MainPaneView {
         ranges.first().cloned()
     }
 
-    /// Reveals the match in one region, reporting whether the row was painted
-    /// there at all — which is what tells the caller to stop retrying.
+    /// Reveals the match in one region, reporting whether its painted row and
+    /// scroll geometry are ready so the caller can stop retrying that region.
     fn reveal_diff_search_match_in_region(
         &mut self,
         visible_ix: usize,
@@ -458,8 +570,8 @@ impl MainPaneView {
             return false;
         };
         // A wrapped row has no off-screen right edge to chase; it already broke
-        // the line to fit the pane.
-        if hitbox.wrapped.is_some() {
+        // the line to fit the pane. Table cells wrap too.
+        if hitbox.wrapped.is_some() || !hitbox.cells.is_empty() {
             return true;
         }
 
@@ -499,9 +611,20 @@ impl MainPaneView {
         let offset = handle.offset();
         // Hitbox bounds are window space with the scroll already applied.
         let to_content = |x: Pixels| row_left + x - viewport.origin.x - offset.x;
+        let match_left = to_content(local_left);
+        let match_right = to_content(local_right);
+        // A newly visible long line records its width during paint. The list
+        // uses that width in the following layout, so a hitbox can be ready
+        // while the scroll range still describes the previous, shorter rows.
+        // Retry instead of claiming a reveal clamped to that stale range.
+        if viewport.size.width <= px(0.0)
+            || match_right > viewport.size.width + handle.max_offset().x + px(1.0)
+        {
+            return false;
+        }
         let Some(target_x) = super::helpers::reveal_scroll_x(
-            to_content(local_left),
-            to_content(local_right),
+            match_left,
+            match_right,
             viewport.size.width,
             handle.max_offset().x,
             offset.x,
@@ -703,6 +826,7 @@ impl MainPaneView {
     }
 
     /// Byte offset in the text a row painted, for a point inside that row.
+    #[cfg(test)]
     pub(in crate::view) fn diff_text_offset_for_position(
         &self,
         visible_ix: usize,
@@ -711,6 +835,19 @@ impl MainPaneView {
     ) -> Option<usize> {
         self.diff_text_pos_from_hitbox(visible_ix, region, position)
             .map(|pos| pos.offset)
+    }
+
+    /// As above, but `None` beside or past the painted text, where the hit is
+    /// only the nearest edge.
+    pub(in crate::view) fn diff_text_offset_on_text(
+        &self,
+        visible_ix: usize,
+        region: DiffTextRegion,
+        position: Point<Pixels>,
+    ) -> Option<usize> {
+        let hitbox = self.diff_text_hitboxes.get(&(visible_ix, region))?;
+        let hit = self.diff_text_hit_in_hitbox(hitbox, region, position)?;
+        (!hit.past_painted_text).then_some(hit.pos.offset)
     }
 
     pub(in super::super::super) fn diff_text_visual_source_range_for_region(
@@ -862,8 +999,9 @@ impl MainPaneView {
         self.set_diff_text_selection(anchor, head, 1);
     }
 
-    /// Open the link menu when a plain click lands on a web link in the
-    /// rendered markdown preview, and report whether it did.
+    /// Open the link menu when a plain click lands on a link in the rendered
+    /// markdown preview, and report whether it did. With `follow` (Ctrl/Cmd
+    /// held) the link opens straight away instead.
     ///
     /// A double or triple click is still a text selection — only a single
     /// click follows the link, so selecting the words of a link keeps working.
@@ -873,29 +1011,45 @@ impl MainPaneView {
         region: DiffTextRegion,
         position: Point<Pixels>,
         click_count: usize,
+        follow: bool,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
         if click_count > 1 || self.diff_text_has_selection() {
             return false;
         }
-        let Some((url, span)) = self.markdown_preview_link_span_at(visible_ix, region, position)
+        let Some((destination, span)) =
+            self.markdown_preview_link_span_at(visible_ix, region, position)
         else {
             return false;
         };
 
+        // A row can contain several links: pairing the row alone is not enough.
+        if self.markdown_preview_link_span_at(visible_ix, region, window.mouse_position())
+            != Some((destination.clone(), span.clone()))
+        {
+            return false;
+        }
+        // An in-document anchor scrolls; it has no menu.
+        if self.scroll_markdown_preview_to_anchor(region, &destination, cx) {
+            return true;
+        }
+        // A link the preview cannot open is a click on plain words.
+        let Some(kind) =
+            self.markdown_preview_link_popover_kind(region, visible_ix, &destination, None)
+        else {
+            return false;
+        };
+        if follow && self.follow_markdown_preview_link(&kind, cx) {
+            return true;
+        }
         // Anchor on the link's own box, so the menu opens flush under the words
         // it describes rather than under the row that happens to hold them.
         let anchor = self
             .diff_text_hitboxes
             .get(&(visible_ix, region))
-            .and_then(|hitbox| self.diff_text_bounds_in_hitbox(hitbox, span));
-        match anchor {
-            Some(bounds) => {
-                self.open_popover_for_bounds(PopoverKind::WebLinkMenu { url }, bounds, window, cx)
-            }
-            None => self.open_popover_at(PopoverKind::WebLinkMenu { url }, position, window, cx),
-        }
+            .and_then(|hitbox| self.diff_text_bounds_in_hitbox(hitbox, span, position));
+        self.open_markdown_preview_link_popover(kind, anchor, position, window, cx);
         true
     }
 
@@ -904,20 +1058,115 @@ impl MainPaneView {
     ///
     /// The picture's own box is what the menu wants to hang off; the click
     /// point stands in for the frames where it has not been painted yet.
+    /// With `follow` (Ctrl/Cmd held) the link opens straight away instead.
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::view) fn open_markdown_preview_link_menu(
         &mut self,
-        url: SharedString,
+        region: DiffTextRegion,
+        row_ix: usize,
+        destination: SharedString,
+        load_remote_image_url: Option<SharedString>,
+        anchor_bounds: Option<Bounds<Pixels>>,
+        position: Point<Pixels>,
+        follow: bool,
+        window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        match self.markdown_preview_link_popover_kind(
+            region,
+            row_ix,
+            &destination,
+            load_remote_image_url.clone(),
+        ) {
+            Some(kind) if follow && self.follow_markdown_preview_link(&kind, cx) => {}
+            Some(kind) => {
+                self.open_markdown_preview_link_popover(kind, anchor_bounds, position, window, cx)
+            }
+            // An anchor, or a link that cannot open, has no menu to carry Load
+            // image: a click on a blocked picture approves it, and once shown
+            // the picture follows its anchor.
+            None => match load_remote_image_url {
+                Some(image_url) => self.approve_remote_markdown_image(image_url, cx),
+                None => {
+                    self.scroll_markdown_preview_to_anchor(region, &destination, cx);
+                }
+            },
+        }
+    }
+
+    fn open_markdown_preview_link_popover(
+        &mut self,
+        kind: PopoverKind,
         anchor_bounds: Option<Bounds<Pixels>>,
         position: Point<Pixels>,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
         match anchor_bounds {
-            Some(bounds) => {
-                self.open_popover_for_bounds(PopoverKind::WebLinkMenu { url }, bounds, window, cx)
-            }
-            None => self.open_popover_at(PopoverKind::WebLinkMenu { url }, position, window, cx),
+            Some(bounds) => self.open_popover_for_bounds(kind, bounds, window, cx),
+            None => self.open_popover_at(kind, position, window, cx),
         }
+    }
+
+    /// Run what a link menu's main entry would, and report whether it did.
+    /// A missing file has nothing to open, so its menu still explains why.
+    fn follow_markdown_preview_link(
+        &mut self,
+        kind: &PopoverKind,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        use crate::view::LocalFileLinkSource;
+
+        match kind {
+            PopoverKind::WebLinkMenu { url, .. } => {
+                self.open_markdown_preview_web_link(url.clone(), cx);
+            }
+            PopoverKind::LocalFileLinkMenu {
+                repo_id,
+                source,
+                path,
+                missing: false,
+                ..
+            } => self.store.dispatch(match source {
+                LocalFileLinkSource::Version(source) => Msg::OpenFileContent {
+                    repo_id: *repo_id,
+                    source: source.clone(),
+                    path: path.clone(),
+                },
+                LocalFileLinkSource::ParentOf(commit_id) => Msg::OpenFileAtCommitParent {
+                    repo_id: *repo_id,
+                    commit_id: commit_id.clone(),
+                    path: path.clone(),
+                },
+            }),
+            _ => return false,
+        }
+        true
+    }
+
+    fn open_markdown_preview_web_link(&mut self, url: SharedString, cx: &mut gpui::Context<Self>) {
+        // Tests record the link rather than start a browser.
+        #[cfg(test)]
+        {
+            let _ = cx;
+            OPENED_WEB_LINKS.with(|links| links.borrow_mut().push(url.to_string()));
+        }
+        #[cfg(not(test))]
+        crate::view::platform_open::spawn_launch(
+            cx,
+            move || crate::view::platform_open::open_url_blocking(&url),
+            |this, result, cx| {
+                if let Err(err) = result {
+                    let _ = this.root_view.update(cx, |root, cx| {
+                        root.push_toast(
+                            crate::view::components::ToastKind::Error,
+                            format!("Failed to open link: {err}"),
+                            cx,
+                        );
+                    });
+                }
+            },
+        );
     }
 
     pub(in super::super::super) fn handle_diff_text_mouse_down(
@@ -926,8 +1175,12 @@ impl MainPaneView {
         region: DiffTextRegion,
         position: Point<Pixels>,
         click_count: usize,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
         // Deliberately does not claim the press: the diff row's own release
         // handler reads the claim, and this gesture starts on that same row.
         // A drag that actually moved is suppressed by
@@ -937,6 +1190,7 @@ impl MainPaneView {
         // a double- or triple-click selects a span, and a press that misses the
         // text entirely is a press away from the pair. Both must dismiss it, and
         // both skip `begin_diff_text_selection`'s set below.
+        self.diff_text_selection_owner.adopt(window, cx);
         self.diff_text_pair_match = None;
         self.diff_text_occurrences.clear();
         self.diff_text_pending_syntax_click = None;
@@ -952,6 +1206,7 @@ impl MainPaneView {
                 if self.diff_text_selecting {
                     self.diff_suppress_clicks_remaining = 1;
                 }
+                self.begin_diff_text_scroll_tracking(position, cx);
             }
             _ => {
                 self.begin_diff_text_selection(visible_ix, region, position, cx);
@@ -971,6 +1226,7 @@ impl MainPaneView {
         region: DiffTextRegion,
         position: Point<Pixels>,
         click_count: usize,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
         if click_count == 1
@@ -979,21 +1235,22 @@ impl MainPaneView {
                 .is_none()
             && let Some(pos) = self.diff_text_pos_from_nearest_hitbox(visible_ix, region, position)
         {
-            self.begin_diff_text_selection_from_document_space(pos, position, cx);
+            self.begin_diff_text_selection_from_document_space(pos, position, window, cx);
             return;
         }
 
-        self.handle_diff_text_mouse_down(visible_ix, region, position, click_count, cx);
+        self.handle_diff_text_mouse_down(visible_ix, region, position, click_count, window, cx);
     }
 
     pub(in crate::view) fn handle_diff_text_empty_space_mouse_down(
         &mut self,
         region: DiffTextRegion,
         position: Point<Pixels>,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
         let (_, pos) = self.diff_text_eof_target(region);
-        self.begin_diff_text_selection_from_document_space(pos, position, cx);
+        self.begin_diff_text_selection_from_document_space(pos, position, window, cx);
     }
 
     /// Start a selection at the document boundary represented by a Markdown
@@ -1005,6 +1262,7 @@ impl MainPaneView {
         next_source_visible_ix: usize,
         region: DiffTextRegion,
         position: Point<Pixels>,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
         self.begin_diff_text_selection_from_document_space(
@@ -1014,6 +1272,7 @@ impl MainPaneView {
                 offset: 0,
             },
             position,
+            window,
             cx,
         );
     }
@@ -1022,8 +1281,13 @@ impl MainPaneView {
         &mut self,
         pos: DiffTextPos,
         position: Point<Pixels>,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
+        self.diff_text_selection_owner.adopt(window, cx);
         self.diff_text_pair_match = None;
         self.diff_text_occurrences.clear();
         self.diff_text_pending_syntax_click = None;
@@ -1044,6 +1308,9 @@ impl MainPaneView {
         position: Point<Pixels>,
         cx: &mut gpui::Context<Self>,
     ) {
+        if self.store.binding.is_some() && !self.store.policy.select_lines {
+            return;
+        }
         let Some(hit) = self.diff_text_hit_from_hitbox(visible_ix, region, position) else {
             return;
         };
@@ -1084,9 +1351,7 @@ impl MainPaneView {
         let autoscroll_seq = self.diff_text_autoscroll_seq;
         cx.spawn(
             async move |view: WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(16))
-                    .await;
+                cx.background_executor().timer(DRAG_AUTOSCROLL_TICK).await;
                 let mut keep_going = false;
                 let _ = view.update(cx, |this, cx| {
                     if !this.diff_text_selecting {
@@ -1097,7 +1362,7 @@ impl MainPaneView {
                     }
 
                     keep_going = true;
-                    let changed = this.tick_diff_text_selection_autoscroll(cx);
+                    let changed = this.tick_diff_text_selection_autoscroll();
                     if changed {
                         cx.notify();
                     }
@@ -1447,7 +1712,11 @@ impl MainPaneView {
         side: DiffTextPairSide,
         pos: &DiffTextPos,
     ) -> Option<DiffTextPairMatch> {
-        let hit = rows::prepared_diff_syntax_pair_at_display_offset(document, line_ix, pos.offset)?;
+        let tab_width = self.display_tab_width;
+
+        let hit = rows::prepared_diff_syntax_pair_at_display_offset(
+            tab_width, document, line_ix, pos.offset,
+        )?;
 
         let spans: Vec<DiffTextPairSpan> = hit
             .open
@@ -1483,8 +1752,11 @@ impl MainPaneView {
         side: DiffTextPairSide,
         pos: &DiffTextPos,
     ) -> FxHashMap<(usize, DiffTextRegion), smallvec::SmallVec<[Range<usize>; 4]>> {
-        let ends =
-            rows::prepared_diff_syntax_occurrences_at_display_offset(document, line_ix, pos.offset);
+        let tab_width = self.display_tab_width;
+
+        let ends = rows::prepared_diff_syntax_occurrences_at_display_offset(
+            tab_width, document, line_ix, pos.offset,
+        );
         if ends.is_empty() {
             return FxHashMap::default();
         }
@@ -1726,19 +1998,13 @@ impl MainPaneView {
         visible_ix: usize,
         region: DiffTextRegion,
     ) -> SharedString {
+        let tab_width = self.display_tab_width;
+
         let fallback = SharedString::default();
         let expand_tabs = |s: &str| -> SharedString {
-            if !s.contains('\t') {
-                return SharedString::new(s);
-            }
-            let mut out = String::with_capacity(crate::view::diff_utils::diff_text_display_len(s));
-            for ch in s.chars() {
-                match ch {
-                    '\t' => out.push_str("    "),
-                    _ => out.push(ch),
-                }
-            }
-            out.into()
+            crate::view::tab_width::expand_tabs(tab_width, s)
+                .into_owned()
+                .into()
         };
 
         // When markdown rendered preview is active, rows come from the
@@ -1754,7 +2020,7 @@ impl MainPaneView {
             }
             return self
                 .worktree_preview_line_raw_text(visible_ix)
-                .map(|line| file_diff_display_text(&line))
+                .map(|line| file_diff_display_text(tab_width, &line))
                 .unwrap_or(fallback);
         }
 
@@ -1793,7 +2059,7 @@ impl MainPaneView {
                         {
                             return styled.text.clone();
                         }
-                        return file_diff_display_text(&row.text);
+                        return file_diff_display_text(tab_width, &row.text);
                     }
                     DiffViewMode::Split => {
                         if !matches!(
@@ -1817,7 +2083,9 @@ impl MainPaneView {
                             DiffTextRegion::SplitRight => row.new.as_ref(),
                             DiffTextRegion::Inline => unreachable!(),
                         };
-                        return text.map(file_diff_display_text).unwrap_or(fallback);
+                        return text
+                            .map(|text| file_diff_display_text(tab_width, text))
+                            .unwrap_or(fallback);
                     }
                 },
             }
@@ -1838,7 +2106,7 @@ impl MainPaneView {
                     {
                         return styled.text.clone();
                     }
-                    return file_diff_display_text(&row.text);
+                    return file_diff_display_text(tab_width, &row.text);
                 } else if let Some(line) = self.file_diff_inline_row(mapped_ix) {
                     let cache_epoch = self.file_diff_inline_style_cache_epoch(&line);
                     if let Some(styled) = self.diff_text_segments_cache_get(mapped_ix, cache_epoch)
@@ -1868,7 +2136,9 @@ impl MainPaneView {
             {
                 return display.clone();
             }
-            return expand_tabs(line.text.as_ref());
+            return crate::view::tab_width::expand_patch_tabs(tab_width, line.text.as_ref())
+                .into_owned()
+                .into();
         }
 
         match region {
@@ -1891,7 +2161,9 @@ impl MainPaneView {
                 DiffTextRegion::SplitRight => row.new.as_ref(),
                 DiffTextRegion::Inline => unreachable!(),
             };
-            return text.map(file_diff_display_text).unwrap_or(fallback);
+            return text
+                .map(|text| file_diff_display_text(tab_width, text))
+                .unwrap_or(fallback);
         }
 
         let Some(split_row) = self.patch_diff_split_row(mapped_ix) else {
@@ -1927,6 +2199,8 @@ impl MainPaneView {
         visible_ix: usize,
         region: DiffTextRegion,
     ) -> usize {
+        let tab_width = self.display_tab_width;
+
         let display_len = crate::view::diff_utils::diff_text_display_len;
 
         if self.diff_text_wrap_for_visible_ix(visible_ix).is_some() {
@@ -1939,18 +2213,23 @@ impl MainPaneView {
             return self.markdown_preview_row_text_len(visible_ix, region);
         }
 
+        // Below a wrapped line the row position runs ahead of the line number.
+        let source_ix = self
+            .diff_source_visible_ix_for_visible_ix(visible_ix)
+            .unwrap_or(visible_ix);
+
         if self.is_file_preview_active() {
             if region != DiffTextRegion::Inline {
                 return 0;
             }
             return self
-                .worktree_preview_line_raw_text(visible_ix)
-                .map(|line| file_diff_display_len(&line))
+                .worktree_preview_line_raw_text(source_ix)
+                .map(|line| file_diff_display_len(tab_width, &line))
                 .unwrap_or(0);
         }
 
         if self.is_collapsed_diff_projection_active() {
-            let Some(row) = self.collapsed_visible_row(visible_ix) else {
+            let Some(row) = self.collapsed_visible_row(source_ix) else {
                 return 0;
             };
             match row {
@@ -1970,7 +2249,7 @@ impl MainPaneView {
                         .header_display_src_ix()
                         .and_then(|src_ix| {
                             self.collapsed_diff_hunk_header_display(src_ix)
-                                .map(|display| display_len(display.as_ref()))
+                                .map(|display| display_len(tab_width, display.as_ref()))
                         })
                         .unwrap_or(0);
                 }
@@ -1987,7 +2266,7 @@ impl MainPaneView {
                         {
                             return styled.text.len();
                         }
-                        return file_diff_display_len(&row.text);
+                        return file_diff_display_len(tab_width, &row.text);
                     }
                     DiffViewMode::Split => {
                         if !matches!(
@@ -2011,13 +2290,15 @@ impl MainPaneView {
                             DiffTextRegion::SplitRight => row.new.as_ref(),
                             DiffTextRegion::Inline => unreachable!(),
                         };
-                        return text.map(file_diff_display_len).unwrap_or(0);
+                        return text
+                            .map(|text| file_diff_display_len(tab_width, text))
+                            .unwrap_or(0);
                     }
                 },
             }
         }
 
-        let Some(mapped_ix) = self.diff_mapped_ix_for_visible_ix(visible_ix) else {
+        let Some(mapped_ix) = self.diff_source_mapped_ix_for_visible_ix(source_ix) else {
             return 0;
         };
 
@@ -2032,14 +2313,14 @@ impl MainPaneView {
                     {
                         return styled.text.len();
                     }
-                    return file_diff_display_len(&row.text);
+                    return file_diff_display_len(tab_width, &row.text);
                 } else if let Some(line) = self.file_diff_inline_row(mapped_ix) {
                     let cache_epoch = self.file_diff_inline_style_cache_epoch(&line);
                     if let Some(styled) = self.diff_text_segments_cache_get(mapped_ix, cache_epoch)
                     {
                         return styled.text.len();
                     }
-                    return display_len(diff_content_text(&line));
+                    return display_len(tab_width, diff_content_text(&line));
                 }
                 return 0;
             }
@@ -2062,7 +2343,7 @@ impl MainPaneView {
             {
                 return display.len();
             }
-            return display_len(line.text.as_ref());
+            return crate::view::tab_width::expanded_patch_len(tab_width, line.text.as_ref());
         }
 
         match region {
@@ -2085,7 +2366,9 @@ impl MainPaneView {
                 DiffTextRegion::SplitRight => row.new.as_ref(),
                 DiffTextRegion::Inline => unreachable!(),
             };
-            return text.map(file_diff_display_len).unwrap_or(0);
+            return text
+                .map(|text| file_diff_display_len(tab_width, text))
+                .unwrap_or(0);
         }
 
         let Some(split_row) = self.patch_diff_split_row(mapped_ix) else {
@@ -2103,7 +2386,7 @@ impl MainPaneView {
                 {
                     return display.len();
                 }
-                display_len(line.text.as_ref())
+                display_len(tab_width, line.text.as_ref())
             }
             PatchSplitRow::Aligned { row, .. } => {
                 let text = match region {
@@ -2111,7 +2394,7 @@ impl MainPaneView {
                     DiffTextRegion::SplitRight => row.new.as_deref().unwrap_or(""),
                     DiffTextRegion::Inline => unreachable!(),
                 };
-                display_len(text)
+                display_len(tab_width, text)
             }
         }
     }
@@ -2175,17 +2458,28 @@ impl MainPaneView {
         range: Range<usize>,
         expanded_tabs: &mut String,
     ) {
+        let tab_width = self.display_tab_width;
+
         if range.start >= range.end {
             return;
         }
 
         if self.diff_text_wrap_for_visible_ix(visible_ix).is_some() {
             let text = self.diff_text_line_for_region(visible_ix, region);
-            append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+            append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
             return;
         }
 
-        self.append_diff_text_source_region_slice(out, visible_ix, region, range, expanded_tabs);
+        let source_visible_ix = self
+            .diff_source_visible_ix_for_visible_ix(visible_ix)
+            .unwrap_or(visible_ix);
+        self.append_diff_text_source_region_slice(
+            out,
+            source_visible_ix,
+            region,
+            range,
+            expanded_tabs,
+        );
     }
 
     fn append_diff_text_source_region_slice(
@@ -2196,13 +2490,20 @@ impl MainPaneView {
         range: Range<usize>,
         expanded_tabs: &mut String,
     ) {
+        let tab_width = self.display_tab_width;
+
         if range.start >= range.end {
             return;
         }
 
         if self.is_markdown_preview_active() {
+            // Preview selections are in raw row coordinates: a tab is one byte
+            // there (and separates table cells), not the spaces it paints as.
             let text = self.markdown_preview_row_text(source_visible_ix, region);
-            append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+            let end = range.end.min(text.len());
+            if let Some(slice) = text.get(range.start.min(end)..end) {
+                out.push_str(slice);
+            }
             return;
         }
 
@@ -2211,7 +2512,13 @@ impl MainPaneView {
                 return;
             }
             if let Some(raw_text) = self.worktree_preview_line_raw_text(source_visible_ix) {
-                append_file_diff_display_text_slice(out, &raw_text, range, expanded_tabs);
+                append_file_diff_display_text_slice(
+                    tab_width,
+                    out,
+                    &raw_text,
+                    range,
+                    expanded_tabs,
+                );
             }
             return;
         }
@@ -2226,6 +2533,7 @@ impl MainPaneView {
                     ) => {
                         if let Some(row) = self.file_diff_inline_render_data(row_ix) {
                             append_file_diff_display_text_slice(
+                                tab_width,
                                 out,
                                 &row.text,
                                 range,
@@ -2248,6 +2556,7 @@ impl MainPaneView {
                                 });
                         if let Some(raw_text) = raw_text {
                             append_file_diff_display_text_slice(
+                                tab_width,
                                 out,
                                 &raw_text,
                                 range,
@@ -2260,7 +2569,7 @@ impl MainPaneView {
                 }
             }
             let text = self.diff_text_full_line_for_region(source_visible_ix, region);
-            append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+            append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
             return;
         }
 
@@ -2273,7 +2582,13 @@ impl MainPaneView {
                 return;
             }
             if let Some(row) = self.file_diff_inline_render_data(mapped_ix) {
-                append_file_diff_display_text_slice(out, &row.text, range, expanded_tabs);
+                append_file_diff_display_text_slice(
+                    tab_width,
+                    out,
+                    &row.text,
+                    range,
+                    expanded_tabs,
+                );
             }
             return;
         }
@@ -2288,13 +2603,13 @@ impl MainPaneView {
                 DiffTextRegion::Inline => return,
             };
             if let Some(text) = text {
-                append_file_diff_display_text_slice(out, text, range, expanded_tabs);
+                append_file_diff_display_text_slice(tab_width, out, text, range, expanded_tabs);
             }
             return;
         }
 
         let text = self.diff_text_full_line_for_region(source_visible_ix, region);
-        append_diff_display_text_slice(out, text.as_ref(), range, expanded_tabs);
+        append_diff_display_text_slice(tab_width, out, text.as_ref(), range, expanded_tabs);
     }
 
     fn diff_text_string_for_region(
@@ -2340,16 +2655,17 @@ impl MainPaneView {
         // the text with a line of its own.
         let mut rows_written = 0usize;
         // A picture is one line of the document however many rows it was given,
-        // and every one of them carries its description. The row the selection
-        // starts on always contributes, so a selection that begins inside a
-        // picture still describes it once.
-        let repeats_a_picture = |this: &Self, source_visible_ix: usize, region| {
+        // and every one of them carries its description; a diff's alignment
+        // padding is no line at all. The row the selection starts on always
+        // contributes, so a selection that begins inside a picture still
+        // describes it once.
+        let copies_nothing = |this: &Self, source_visible_ix: usize, region| {
             source_visible_ix != start.source_visible_ix
-                && this.markdown_preview_row_repeats_a_picture(source_visible_ix, region)
+                && this.markdown_preview_row_copies_nothing(source_visible_ix, region)
         };
         for source_visible_ix in start.source_visible_ix..=end.source_visible_ix {
             if force_inline || self.diff_view == DiffViewMode::Inline {
-                if repeats_a_picture(self, source_visible_ix, DiffTextRegion::Inline) {
+                if copies_nothing(self, source_visible_ix, DiffTextRegion::Inline) {
                     continue;
                 }
                 let line_len = self
@@ -2383,7 +2699,7 @@ impl MainPaneView {
             .then_some(start.region);
 
             if let Some(region) = split_region {
-                if repeats_a_picture(self, source_visible_ix, region) {
+                if copies_nothing(self, source_visible_ix, region) {
                     continue;
                 }
                 let line_len = self.diff_text_full_line_len_for_region(source_visible_ix, region);
@@ -2404,6 +2720,11 @@ impl MainPaneView {
                     &mut expanded_tabs,
                 );
             } else {
+                if copies_nothing(self, source_visible_ix, DiffTextRegion::SplitLeft)
+                    && copies_nothing(self, source_visible_ix, DiffTextRegion::SplitRight)
+                {
+                    continue;
+                }
                 let left_full_len = self.diff_text_full_line_len_for_region(
                     source_visible_ix,
                     DiffTextRegion::SplitLeft,
@@ -2495,7 +2816,7 @@ impl MainPaneView {
     fn diff_copy_source(&self) -> crate::clipboard::CopySource {
         match self
             .active_repo()
-            .and_then(|repo| repo.diff_state.diff_target.as_ref())
+            .and_then(|repo| self.bound_diff_state(repo).diff_target.as_ref())
         {
             Some(DiffTarget::Commit { .. }) => crate::clipboard::CopySource::CommitDetailsDiff,
             Some(DiffTarget::CommitRange { .. }) => crate::clipboard::CopySource::CommitRangeDiff,
@@ -2517,6 +2838,14 @@ impl MainPaneView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // Before every guard, like `TextInput::on_mouse_down_right`: this is a
+        // press on the surface that owns the selection, so it keeps it whether
+        // or not a menu ends up opening. A right-click inside the highlight
+        // must still reach Copy. Gated on there being one, so a pane painting
+        // nothing never holds the window's selection.
+        if self.diff_text_has_selection() {
+            self.diff_text_selection_owner.adopt(window, cx);
+        }
         if self.is_inline_submodule_diff_active() {
             return;
         }
@@ -2526,7 +2855,7 @@ impl MainPaneView {
         let repo_id = repo.id;
         let workdir = repo.spec.workdir.clone();
 
-        let (area, allow_apply) = match repo.diff_state.diff_target.as_ref() {
+        let (area, allow_apply) = match self.bound_diff_state(repo).diff_target.as_ref() {
             Some(DiffTarget::WorkingTree { area, .. }) => (*area, true),
             _ => (DiffArea::Unstaged, false),
         };
@@ -2745,7 +3074,8 @@ impl MainPaneView {
                 })
             });
 
-        let allow_patch_actions = allow_apply && !is_file_preview;
+        let allow_patch_actions =
+            allow_apply && !is_file_preview && !self.has_large_file_text_diff();
 
         let selection = text_selection
             .or_else(|| self.diff_selection_range.map(|(a, b)| (a.min(b), a.max(b))))
@@ -2830,18 +3160,17 @@ impl MainPaneView {
 
                 (
                     hunks_count,
-                    hunk_patch,
+                    hunk_patch.map(Into::into),
                     lines_count,
-                    lines_patch,
-                    discard_lines_patch,
+                    lines_patch.map(Into::into),
+                    discard_lines_patch.map(Into::into),
                 )
             } else {
                 (0, None, 0, None, None)
             };
 
-        self.activate_context_menu_invoker("diff_editor_menu".into(), cx);
         self.open_popover_at(
-            PopoverKind::DiffEditorMenu {
+            (PopoverKind::DiffEditorMenu {
                 repo_id,
                 area,
                 path,
@@ -2852,7 +3181,8 @@ impl MainPaneView {
                 lines_count,
                 copy_text,
                 copy_target,
-            },
+            })
+            .invoked_by("diff_editor_menu".into()),
             anchor,
             window,
             cx,
@@ -2872,11 +3202,10 @@ impl MainPaneView {
 }
 
 impl MainPaneView {
-    fn tick_diff_text_selection_autoscroll(&mut self, cx: &mut gpui::Context<Self>) -> bool {
-        if let Ok(pos) = self.root_view.update(cx, |root, _cx| root.last_mouse_pos) {
-            self.diff_text_last_mouse_pos = pos;
-        }
-
+    /// The pointer is `diff_text_last_mouse_pos`, which the window-wide
+    /// `DiffTextSelectionTracker` keeps even past the window edge; the root
+    /// view's own position stops at it.
+    fn tick_diff_text_selection_autoscroll(&mut self) -> bool {
         let Some(target) = self.diff_text_autoscroll_target else {
             // Still update selection periodically so it can expand while the user scrolls.
             let before = self.diff_text_head;
@@ -2894,8 +3223,8 @@ impl MainPaneView {
         let old_offset = handle.offset();
         let mouse = self.diff_text_last_mouse_pos;
 
-        let delta_x = autoscroll_delta_for_axis(mouse.x, bounds.left(), bounds.right());
-        let delta_y = autoscroll_delta_for_axis(mouse.y, bounds.top(), bounds.bottom());
+        let delta_x = drag_autoscroll_step(mouse.x, bounds.left(), bounds.right());
+        let delta_y = drag_autoscroll_step(mouse.y, bounds.top(), bounds.bottom());
 
         let new_x = (old_offset.x + delta_x).clamp(-max_offset.x, px(0.0));
         let new_y = (old_offset.y + delta_y).clamp(-max_offset.y, px(0.0));
@@ -2955,23 +3284,6 @@ impl MainPaneView {
                 .base_handle
                 .clone(),
         }
-    }
-}
-
-fn autoscroll_delta_for_axis(cursor: Pixels, min: Pixels, max: Pixels) -> Pixels {
-    fn speed(distance: Pixels) -> Pixels {
-        // 2–48px per tick, scaling with how far outside the container the cursor is.
-        let min_step = px(2.0);
-        let max_step = px(48.0);
-        (distance * 0.4).max(min_step).min(max_step)
-    }
-
-    if cursor < min {
-        speed(min - cursor)
-    } else if cursor > max {
-        -speed(cursor - max)
-    } else {
-        px(0.0)
     }
 }
 

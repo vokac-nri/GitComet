@@ -1,6 +1,7 @@
 use crate::model::GitLogTagFetchMode;
 use crate::model::{
-    ConflictFileLoadMode, DefaultTagType, GitOperationOuterOutcome, RepoId, SidebarDataRequest,
+    BranchExistsPromptState, ConflictFileLoadMode, DefaultTagType, FileBrowserSettings,
+    GitOperationOuterOutcome, MaintenanceSettings, RemoteSettings, RepoId, SidebarDataRequest,
     SidebarMode,
 };
 use gitcomet_core::auth::StagedGitAuth;
@@ -9,12 +10,15 @@ use gitcomet_core::domain::*;
 use gitcomet_core::error::Error;
 use gitcomet_core::git_operation::{GitOperationEvent, GitOperationId};
 use gitcomet_core::process::GitRuntimeState;
+use gitcomet_core::remote_url::RemoteUrlPolicy;
 use gitcomet_core::services::GitRepository;
 use gitcomet_core::services::{
-    CommandOutput, CommitOperationOutcome, ConflictSide, ForcePushLease, InteractiveRebaseEntry,
-    PullMode, RemoteUrlKind, ResetMode, SafePushAfterCommitContext, SafePushAfterCommitDecision,
-    SafePushAfterCommitTarget, SequencerState, SubmoduleTrustDecision, SubmoduleTrustTarget,
+    CheckoutRemoteBranchMode, CommandOutput, CommitOperationOutcome, ConflictSide, ForcePushLease,
+    InteractiveRebaseEntry, PullMode, RemoteUrlKind, ResetMode, SafePushAfterCommitContext,
+    SafePushAfterCommitDecision, SafePushAfterCommitTarget, SequencerState, SubmoduleTrustDecision,
+    SubmoduleTrustTarget,
 };
+use gitcomet_core::signing_tools::SigningToolsState;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -29,7 +33,6 @@ pub enum RepoActionKind {
     CheckoutRemoteBranch,
     CheckoutCommit,
     CherryPickCommit,
-    RevertCommit,
     CreateBranch,
     CreateBranchAndCheckout,
     RenameBranch,
@@ -48,12 +51,53 @@ pub enum RepoActionKind {
     DropStash,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BranchExistsChoice {
+    Cancel,
+    CheckoutExisting,
+    OverwriteAndCheckout,
+}
+
 impl RepoActionKind {
+    pub(crate) fn status_diff_area(self) -> Option<DiffArea> {
+        match self {
+            Self::StagePath | Self::StagePaths => Some(DiffArea::Unstaged),
+            Self::UnstagePath | Self::UnstagePaths => Some(DiffArea::Staged),
+            _ => None,
+        }
+    }
+
+    /// Whether the action can rewrite files in the checkout (index-only and
+    /// ref-only actions cannot).
+    pub fn writes_worktree(self) -> bool {
+        match self {
+            Self::CheckoutBranch
+            | Self::CheckoutRemoteBranch
+            | Self::CheckoutCommit
+            | Self::CherryPickCommit
+            | Self::CreateBranchAndCheckout
+            | Self::DiscardWorktreeChangesPath
+            | Self::DiscardWorktreeChangesPaths
+            | Self::Stash
+            | Self::ApplyStash
+            | Self::PopStash => true,
+            Self::CreateBranch
+            | Self::RenameBranch
+            | Self::DeleteBranch
+            | Self::ForceDeleteBranch
+            | Self::DeleteBranches
+            | Self::StagePath
+            | Self::StagePaths
+            | Self::UnstagePath
+            | Self::UnstagePaths
+            | Self::DropStash => false,
+        }
+    }
+
     pub(crate) fn hook_activity_label(self) -> &'static str {
         match self {
             Self::CheckoutBranch | Self::CheckoutRemoteBranch | Self::CheckoutCommit => "Checkout",
             Self::CherryPickCommit => "Cherry-pick",
-            Self::RevertCommit => "Revert",
             Self::CreateBranch => "Create branch",
             Self::CreateBranchAndCheckout => "Create branch and checkout",
             Self::RenameBranch => "Rename branch",
@@ -159,24 +203,74 @@ impl ConflictAutosolveStats {
 /// Why the file-system watcher is in a degraded state (carried by [`Msg::RepoWatchDegraded`]).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RepoWatchDegradedReason {
-    /// The worktree has more non-ignored folders than the watch budget, so its source folders are
-    /// not watched live at all. Carries the folder count.
+    /// Ignore/configuration inputs could not be read; existing selective coverage is retained.
+    IgnorePolicyFailed,
+    /// The worktree exceeds its watch budget; only the worktree root and Git
+    /// metadata retain coverage. Carries a lower bound on the folder count.
     TooManyFolders { dir_count: usize },
-    /// Some per-directory watches could not be added (the kernel inotify limit was reached), so part
-    /// of the worktree is not watched live. Carries the number of folders left unwatched.
+    /// Some native registrations failed, so coverage is incomplete. Carries the
+    /// number of locations that could not be watched.
     WatchLimitReached { unwatched_dirs: usize },
 }
 
 // Dispatch keeps internal messages inline so the hot reducer path does not
 // require an additional allocation for every effect completion.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Debug, strum::IntoStaticStr)]
 pub enum Msg {
+    OpenDocumentRepository {
+        path: PathBuf,
+        activate: bool,
+    },
+    RememberDocumentInRepository {
+        repo_id: RepoId,
+        path: PathBuf,
+    },
+    FilesystemRequest(gitcomet_core::filesystem::Request),
+    FilesystemProgress(gitcomet_core::filesystem::Progress),
+    AcknowledgeFilesystemResults(Vec<gitcomet_core::filesystem::OperationId>),
+    FilesystemJournalUpdated {
+        undo: bool,
+        redo: bool,
+    },
+    FilesystemFinished(gitcomet_core::filesystem::OperationResult),
+    FilesystemPathsChanged(Vec<gitcomet_core::filesystem::PathChange>),
+    SelectExplorerPath {
+        repo_id: RepoId,
+        path: PathBuf,
+        visible: Vec<PathBuf>,
+        toggle: bool,
+        range: bool,
+        context_menu: bool,
+    },
+    FocusExplorerPath {
+        repo_id: RepoId,
+        path: PathBuf,
+    },
+    SelectAllExplorerPaths {
+        repo_id: RepoId,
+        visible: Vec<PathBuf>,
+    },
+    /// Only supplied flags change; omitted flags retain their current values.
+    SetExplorerVisibility {
+        repo_id: RepoId,
+        hidden: Option<bool>,
+        ignored: Option<bool>,
+    },
+    IndexedHistory(crate::indexed_history::IndexedHistoryMsg),
+    DiffSession(crate::diff_session::DiffSessionMsg),
+    HistoryAuthors(crate::history_authors::HistoryAuthorsMsg),
+    HistoryFind(crate::history_find::HistoryFindMsg),
     OpenRepo(PathBuf),
     /// Opens a repository candidate supplied by an external file-system drop.
     /// The candidate is not persisted until the backend has opened it
     /// successfully, and any open failure discards its temporary tab.
     OpenRepoFromExternalDrop(PathBuf),
+    /// Release failure receipts already observed by the window, retaining any
+    /// newer failures that arrived while the acknowledgement was queued.
+    AcknowledgeRepoOpenFailures {
+        through_revision: u64,
+    },
     RestoreSession {
         open_repos: Vec<PathBuf>,
         active_repo: Option<PathBuf>,
@@ -184,15 +278,22 @@ pub enum Msg {
     CloseRepo {
         repo_id: RepoId,
     },
+    /// Remove a repository from this store because ownership moved to another
+    /// window. Unlike a close, this must not add the still-open repository to
+    /// the Recently Closed list.
+    MoveRepoOut {
+        repo_id: RepoId,
+    },
     CloseRepos {
         repo_ids: Vec<RepoId>,
         activate_after: Option<RepoId>,
     },
-    ShowBannerError {
+    /// An error to show the user: a diagnostic of the repo, or an app
+    /// notification without one.
+    ReportError {
         repo_id: Option<RepoId>,
         message: String,
     },
-    DismissBannerError,
     DismissRepoError {
         repo_id: RepoId,
     },
@@ -206,10 +307,23 @@ pub enum Msg {
     },
     CancelAuthPrompt,
     SetGitRuntimeState(GitRuntimeState),
+    SetSigningToolsState(SigningToolsState),
+    SetLargeFileToolsState(gitcomet_core::large_file_tools::LargeFileToolsState),
+    SetCommitSignatureTargets {
+        repo_id: RepoId,
+        epoch: u64,
+        commit_ids: Arc<[CommitId]>,
+    },
+    SetRemoteUrlPolicy(RemoteUrlPolicy),
     SetGitLogSettings {
         show_history_tags: bool,
         tag_fetch_mode: GitLogTagFetchMode,
+        verify_commit_signatures: bool,
     },
+    SetRemoteSettings(RemoteSettings),
+    SetMaintenanceSettings(MaintenanceSettings),
+    SetFileBrowserSettings(FileBrowserSettings),
+    SetLargeFileSettings(crate::model::LargeFileSettings),
     SetDefaultTagType(DefaultTagType),
     SetActiveRepo {
         repo_id: RepoId,
@@ -224,6 +338,29 @@ pub enum Msg {
     RepoActivated {
         repo_id: RepoId,
     },
+    /// A [`WatchLease`](crate::store::WatchLease) was taken or dropped. Sent
+    /// by the lease itself; not meant for dispatch by hand.
+    AcquireWatchLease {
+        repo_id: RepoId,
+        lifetime: u64,
+    },
+    ReleaseWatchLease {
+        repo_id: RepoId,
+        lifetime: u64,
+    },
+    /// Keep a linked worktree watched independently of the active repository.
+    WatchWorktree {
+        repo_id: RepoId,
+        lifetime: u64,
+        path: PathBuf,
+        watch: bool,
+    },
+    WorktreeExternallyChanged {
+        repo_id: RepoId,
+        lifetime: u64,
+        path: PathBuf,
+        change: RepoExternalChange,
+    },
     RepoExternallyChanged {
         repo_id: RepoId,
         change: RepoExternalChange,
@@ -235,6 +372,11 @@ pub enum Msg {
         repo_id: RepoId,
         reason: RepoWatchDegradedReason,
     },
+    UpdateRepositoryPreference {
+        repo_id: RepoId,
+        update: crate::model::RepositoryPreferenceUpdate,
+    },
+    ApplyRepositoryPreferences(crate::model::RepositoryPreferencesSnapshot),
     SetHistoryScope {
         repo_id: RepoId,
         scope: LogScope,
@@ -245,20 +387,18 @@ pub enum Msg {
         repo_id: RepoId,
         author: Option<String>,
     },
-    SetFetchPruneDeletedRemoteTrackingBranches {
-        repo_id: RepoId,
-        enabled: bool,
-    },
     LoadMoreHistory {
         repo_id: RepoId,
     },
     SelectCommit {
+        request_id: Option<u64>,
         repo_id: RepoId,
         commit_id: CommitId,
     },
     /// Modifier-aware history selection. `visible_order` (the visible commit
     /// ids in log order) is only provided for `Range` clicks.
     SelectCommitMulti {
+        request_id: Option<u64>,
         repo_id: RepoId,
         commit_id: CommitId,
         mode: CommitSelectMode,
@@ -266,6 +406,7 @@ pub enum Msg {
         visible_order: Option<Vec<CommitId>>,
     },
     ClearCommitSelection {
+        request_id: Option<u64>,
         repo_id: RepoId,
     },
     /// Compare two points (commits, or branch/tag tips resolved to commit ids).
@@ -284,6 +425,16 @@ pub enum Msg {
         repo_id: RepoId,
         from: CommitId,
         from_label: String,
+    },
+    /// A comparison with explicit options (a merge-base comparison, or one
+    /// that lists untracked files). `to: None` is the working tree.
+    CompareWithOptions {
+        repo_id: RepoId,
+        from: CommitId,
+        to: Option<CommitId>,
+        options: gitcomet_core::services::ComparisonOptions,
+        from_label: String,
+        to_label: String,
     },
     /// Clear an active range comparison, returning to single/empty selection.
     ClearComparison {
@@ -310,12 +461,19 @@ pub enum Msg {
         repo_id: RepoId,
         target: DiffTarget,
     },
+    /// Read the open file `path` with the user's encoding, line ending or tab
+    /// size; an empty value restores the attribute/detected defaults.
+    SetTextOverride {
+        repo_id: RepoId,
+        path: PathBuf,
+        value: gitcomet_core::text_format::TextOverride,
+    },
     OpenInlineSubmoduleDiff {
         repo_id: RepoId,
         origin: crate::model::ForeignDiffOrigin,
         submodule_repo_path: PathBuf,
         parent_submodule_path: PathBuf,
-        entries: Vec<crate::model::InlineSubmoduleDiffEntry>,
+        entries: std::sync::Arc<[crate::model::InlineSubmoduleDiffEntry]>,
         selected_ix: usize,
     },
     SelectInlineSubmoduleDiff {
@@ -379,6 +537,7 @@ pub enum Msg {
     /// Select the history row for a linked worktree's uncommitted changes, so
     /// the details pane shows that worktree's files instead of a commit.
     SelectWorktreeUncommitted {
+        request_id: Option<u64>,
         repo_id: RepoId,
         path: PathBuf,
     },
@@ -465,6 +624,11 @@ pub enum Msg {
         commit_id: CommitId,
         path: PathBuf,
     },
+    ShowFileChangesAtCommit {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        path: PathBuf,
+    },
     BrowseRepositoryAtCommit {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -483,6 +647,19 @@ pub enum Msg {
     FinishCommitReveal {
         repo_id: RepoId,
     },
+    /// Resolve `reference` and report what commit it names, without selecting
+    /// anything. Backs the Reveal Commit dialog's preview row, which has to be
+    /// able to show a commit the user has not committed to jumping to yet.
+    ///
+    /// Unlike [`Msg::RevealCommit`] this never touches the selection, so it is
+    /// safe to issue on every keystroke; the reducer's request counter drops
+    /// replies a later lookup has overtaken.
+    ResolveCommitLookup {
+        repo_id: RepoId,
+        reference: CommitId,
+        purpose: crate::model::CommitLookupPurpose,
+    },
+    /// Exit file browsing and keep the explorer on the working tree.
     ResetBrowseToLive {
         repo_id: RepoId,
     },
@@ -509,15 +686,15 @@ pub enum Msg {
     },
     StageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: ContentBytes,
     },
     UnstageHunk {
         repo_id: RepoId,
-        patch: String,
+        patch: ContentBytes,
     },
     ApplyWorktreePatch {
         repo_id: RepoId,
-        patch: String,
+        patch: ContentBytes,
         reverse: bool,
     },
     CheckoutBranch {
@@ -529,6 +706,7 @@ pub enum Msg {
         remote: String,
         branch: String,
         local_branch: String,
+        mode: CheckoutRemoteBranchMode,
     },
     CheckoutCommit {
         repo_id: RepoId,
@@ -544,6 +722,16 @@ pub enum Msg {
     RevertCommit {
         repo_id: RepoId,
         commit_id: CommitId,
+        commit: bool,
+        mainline: Option<usize>,
+        summary: String,
+    },
+    /// Applies files' change from a commit or comparison.
+    ApplyFileChange {
+        repo_id: RepoId,
+        target: gitcomet_core::domain::ApplyChangeTarget,
+        commit: bool,
+        commit_retry: Option<gitcomet_core::domain::ApplyFileChangeRetry>,
     },
     CreateBranch {
         repo_id: RepoId,
@@ -554,11 +742,23 @@ pub enum Msg {
         repo_id: RepoId,
         name: String,
         target: String,
+        /// Reset the branch to `target` first when a branch with this name
+        /// already exists, instead of failing with "already exists".
+        force: bool,
+    },
+    ResolveBranchExistsPrompt {
+        prompt: BranchExistsPromptState,
+        choice: BranchExistsChoice,
+    },
+    ShowBranchExistsPrompt {
+        prompt: BranchExistsPromptState,
     },
     RenameBranch {
         repo_id: RepoId,
         old_name: String,
         new_name: String,
+        /// Replace an existing `new_name` instead of failing with "already exists".
+        force: bool,
     },
     DeleteBranch {
         repo_id: RepoId,
@@ -679,14 +879,43 @@ pub enum Msg {
     SaveWorktreeFile {
         repo_id: RepoId,
         path: PathBuf,
-        contents: String,
+        contents: ContentBytes,
+        /// Contents read by the caller, or `None` to use the loaded conflict baseline.
+        expected_contents: Option<Arc<[u8]>>,
         stage: bool,
+        /// Reports whether this exact write succeeded. A closed channel also
+        /// means failure; callers must not infer success from an idle queue.
+        completion: Option<smol::channel::Sender<bool>>,
     },
     /// Append patterns to the repository-root `.gitignore`, creating it when
     /// absent. Patterns already present are skipped, so re-running is a no-op.
     AppendGitignorePatterns {
         repo_id: RepoId,
         patterns: Vec<String>,
+    },
+    /// Run a Git LFS or git-annex operation through the tool.
+    RunLargeFileCommand {
+        repo_id: RepoId,
+        command: gitcomet_core::large_files::LargeFileCommand,
+    },
+    /// Reload Git LFS locks from the server; never polled.
+    LoadLfsLocks {
+        repo_id: RepoId,
+    },
+    /// Ask git-annex where the displayed content keys are.
+    LoadAnnexWhereis {
+        repo_id: RepoId,
+        keys: Vec<String>,
+    },
+    /// List local annexed content no file uses any more.
+    LoadAnnexUnused {
+        repo_id: RepoId,
+    },
+    /// Append one rule line to the repository-root `.gitattributes`, creating
+    /// it when absent; skipped when it is already the last rule.
+    AppendGitattributesRule {
+        repo_id: RepoId,
+        rule: String,
     },
     Commit {
         repo_id: RepoId,
@@ -702,13 +931,19 @@ pub enum Msg {
         repo_id: RepoId,
         context: SafePushAfterCommitContext,
     },
-    FetchAll {
-        repo_id: RepoId,
-    },
+    Fetch(super::FetchMsg),
     PruneMergedBranches {
         repo_id: RepoId,
     },
     PruneLocalTags {
+        repo_id: RepoId,
+    },
+    /// The user accepted git's maintenance recommendation.
+    StartRepoMaintenance {
+        repo_id: RepoId,
+    },
+    /// "Remind me later" on the maintenance recommendation.
+    SnoozeRepoMaintenance {
         repo_id: RepoId,
     },
     Pull {
@@ -727,6 +962,15 @@ pub enum Msg {
     SquashRef {
         repo_id: RepoId,
         reference: String,
+    },
+    PushWithTags {
+        repo_id: RepoId,
+        request: gitcomet_core::tag_push::TagPushRequest,
+    },
+    PreviewTagPush {
+        repo_id: RepoId,
+        request: gitcomet_core::tag_push::TagPushRequest,
+        cancellation: gitcomet_core::services::CancellationToken,
     },
     Push {
         repo_id: RepoId,
@@ -751,7 +995,7 @@ pub enum Msg {
     SetUpstreamBranch {
         repo_id: RepoId,
         branch: String,
-        upstream: String,
+        upstream: Upstream,
     },
     UnsetUpstreamBranch {
         repo_id: RepoId,
@@ -816,6 +1060,8 @@ pub enum Msg {
     InteractiveCherryPick {
         repo_id: RepoId,
         entries: Vec<InteractiveRebaseEntry>,
+        /// False merges every pick into the index without committing.
+        commit: bool,
     },
     CancelInteractiveRebaseSetup {
         repo_id: RepoId,
@@ -1008,13 +1254,22 @@ pub enum Msg {
     Internal(InternalMsg),
 }
 
+#[derive(strum::IntoStaticStr)]
 pub enum InternalMsg {
+    TagPushPreviewLoaded {
+        repo_id: RepoId,
+        mode: gitcomet_core::tag_push::TagPushMode,
+        generation: u64,
+        result: gitcomet_core::services::Result<gitcomet_core::tag_push::TagPushPreview>,
+    },
     GitOperationStarted {
         repo_id: RepoId,
         operation_id: GitOperationId,
         label: String,
         context: Option<String>,
         time: SystemTime,
+        /// Shown as a progress card while it runs.
+        progress_lane: bool,
     },
     GitOperationEvent {
         repo_id: RepoId,
@@ -1050,9 +1305,14 @@ pub enum InternalMsg {
         message: Box<InternalMsg>,
     },
     RepoOpenedOk {
+        preferences: Option<crate::model::RepositoryPreferencesSnapshot>,
         repo_id: RepoId,
         spec: RepoSpec,
         repo: Arc<dyn GitRepository>,
+    },
+    RepoMaintenanceChecked {
+        repo_id: RepoId,
+        needed: bool,
     },
     RepoOpenedErr {
         repo_id: RepoId,
@@ -1079,6 +1339,13 @@ pub enum InternalMsg {
         repo_id: RepoId,
         result: Result<Vec<FileStatus>, Error>,
     },
+    UncommittedLineStatsLoaded {
+        repo_id: RepoId,
+        generation: crate::model::LineStatsGeneration,
+        result: Result<UncommittedLineStats, Error>,
+        /// Present when the effect asked for large-file rows.
+        large_files: Option<Result<gitcomet_core::large_files::UncommittedLargeFiles, Error>>,
+    },
     StatusLoaded {
         repo_id: RepoId,
         result: Result<RepoStatus, Error>,
@@ -1096,7 +1363,7 @@ pub enum InternalMsg {
         seq: crate::model::LogLoadSeq,
         scope: LogScope,
         cursor: Option<LogCursor>,
-        result: Result<LogPage, Error>,
+        result: Result<gitcomet_core::services::HistoryReadResult, Error>,
     },
     /// A partially built log page, reported while the walk is still running so
     /// an author filter on a large repository shows what it has found instead
@@ -1150,6 +1417,18 @@ pub enum InternalMsg {
         repo_id: RepoId,
         result: Result<Option<String>, Error>,
     },
+    /// The message git prepared for an uncommitted revert or applied change,
+    /// offered as the commit box's starting text.
+    CommitMessageSuggested {
+        repo_id: RepoId,
+        message: String,
+    },
+    /// An automatic commit consumed this suggestion. Clear only that message,
+    /// preserving a newer suggestion or a draft the user has edited.
+    CommitMessageSuggestionConsumed {
+        repo_id: RepoId,
+        message: String,
+    },
     HoverCommitMessageLoaded {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -1158,7 +1437,10 @@ pub enum InternalMsg {
     FileHistoryLoaded {
         repo_id: RepoId,
         path: PathBuf,
-        result: Result<LogPage, Error>,
+        /// The cursor the page was requested with: `None` for the first page,
+        /// `Some` for a continuation to append to it.
+        cursor: Option<LogCursor>,
+        result: Result<Arc<LogPage>, Error>,
     },
     BlameLoaded {
         repo_id: RepoId,
@@ -1170,7 +1452,7 @@ pub enum InternalMsg {
         repo_id: RepoId,
         path: PathBuf,
         result: Box<Result<Option<crate::model::ConflictFile>, Error>>,
-        conflict_session: Option<ConflictSession>,
+        conflict_session: Option<Box<ConflictSession>>,
     },
     WorktreesLoaded {
         repo_id: RepoId,
@@ -1178,17 +1460,36 @@ pub enum InternalMsg {
     },
     WorktreeDirtyLoaded {
         repo_id: RepoId,
+        scope: crate::model::WorktreeDirtyScope,
         result: Result<Vec<WorktreeDirtySummary>, Error>,
     },
     RefMetadataLoaded {
         repo_id: RepoId,
-        result: Result<Vec<(String, RefMetadata)>, Error>,
+        result: Result<Arc<rustc_hash::FxHashMap<String, RefMetadata>>, Error>,
     },
     SubmodulesLoaded {
         repo_id: RepoId,
         result: Result<Vec<Submodule>, Error>,
     },
+    LargeFileSupportLoaded {
+        repo_id: RepoId,
+        result: Result<gitcomet_core::large_files::LargeFileSupport, Error>,
+    },
+    LfsLocksLoaded {
+        repo_id: RepoId,
+        result: Result<Vec<gitcomet_core::large_files::LfsLock>, Error>,
+    },
+    AnnexWhereisLoaded {
+        repo_id: RepoId,
+        key: String,
+        result: Result<gitcomet_core::large_files::AnnexWhereis, Error>,
+    },
+    AnnexUnusedLoaded {
+        repo_id: RepoId,
+        result: Result<gitcomet_core::large_files::AnnexUnused, Error>,
+    },
     FileBrowserLoaded {
+        cancellation: Option<gitcomet_core::services::CancellationToken>,
         repo_id: RepoId,
         source: FileSource,
         result: Result<Vec<FileEntry>, Error>,
@@ -1216,11 +1517,27 @@ pub enum InternalMsg {
         commit_id: CommitId,
         result: Result<CommitDetails, Error>,
     },
+    CommitSignaturesVerified {
+        repo_id: RepoId,
+        epoch: u64,
+        batch: u64,
+        result: Result<Vec<(CommitId, CommitSignature)>, Error>,
+    },
     /// A [`Msg::RevealCommit`] reference resolved (or failed to).
     CommitRevealResolved {
         repo_id: RepoId,
         reference: CommitId,
         result: Result<CommitDetails, Error>,
+    },
+    /// A [`Msg::ResolveCommitLookup`] reference resolved (or failed to).
+    CommitLookupResolved {
+        repo_id: RepoId,
+        reference: CommitId,
+        /// The `Effect::ResolveCommitLookup` request this answers; a reply that
+        /// lost a race against a newer lookup is dropped.
+        request: u64,
+        purpose: crate::model::CommitLookupPurpose,
+        result: Result<Commit, Error>,
     },
     RangeFilesLoaded {
         repo_id: RepoId,
@@ -1229,7 +1546,7 @@ pub enum InternalMsg {
         to: Option<CommitId>,
         /// The `Effect::LoadRangeFiles` request this answers.
         request: u64,
-        result: Result<Vec<CommitFileChange>, Error>,
+        result: Result<gitcomet_core::services::Comparison, Error>,
     },
     SquashMessagePreviewLoaded {
         repo_id: RepoId,
@@ -1257,11 +1574,16 @@ pub enum InternalMsg {
         target: DiffTarget,
         result: Result<Option<FileDiffText>, Error>,
     },
+    TextAttributesLoaded {
+        repo_id: RepoId,
+        target: DiffTarget,
+        result: Result<gitcomet_core::text_format::TextAttributes, Error>,
+    },
     DiffPreviewTextFileLoaded {
         repo_id: RepoId,
         target: DiffTarget,
         side: DiffPreviewTextSide,
-        result: Result<Option<PathBuf>, Error>,
+        result: Result<Option<DiffPreviewTextFile>, Error>,
     },
     SubmoduleSummaryLoaded {
         repo_id: RepoId,
@@ -1294,6 +1616,27 @@ pub enum InternalMsg {
     RepoActionFinished {
         repo_id: RepoId,
         action: RepoActionKind,
+        result: Result<(), Error>,
+    },
+    /// Carries the affected paths so the reducer can retire their status diffs
+    /// only after a successful stage, unstage, or discard.
+    RepoPathsActionFinished {
+        repo_id: RepoId,
+        action: RepoActionKind,
+        paths: RepoPathList,
+        result: Result<(), Error>,
+    },
+    /// The action ran into an existing branch; open the collision prompt.
+    BranchAlreadyExists {
+        action: RepoActionKind,
+        prompt: BranchExistsPromptState,
+    },
+    /// The action was carried out in (or redirected to) another worktree that
+    /// has the branch checked out; on success that worktree is opened.
+    RepoActionFinishedInWorktree {
+        repo_id: RepoId,
+        action: RepoActionKind,
+        worktree_path: PathBuf,
         result: Result<(), Error>,
     },
     CommitFinished {
@@ -1362,5 +1705,54 @@ mod tests {
         assert!(debug.contains("CloneRepoFinished"));
         assert!(debug.contains("ok: false"));
         assert!(!debug.contains("clone failed"));
+    }
+}
+
+/// Bytes for a file write or a patch, already in the file's encoding.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ContentBytes(std::sync::Arc<[u8]>);
+
+impl ContentBytes {
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Nothing but whitespace.
+    pub fn is_blank(&self) -> bool {
+        self.0.iter().all(u8::is_ascii_whitespace)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl PartialEq<str> for ContentBytes {
+    fn eq(&self, other: &str) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl From<String> for ContentBytes {
+    fn from(text: String) -> Self {
+        Self(std::sync::Arc::from(text.into_bytes()))
+    }
+}
+
+impl From<&str> for ContentBytes {
+    fn from(text: &str) -> Self {
+        Self(std::sync::Arc::from(text.as_bytes()))
+    }
+}
+
+impl From<Vec<u8>> for ContentBytes {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self(std::sync::Arc::from(bytes))
+    }
+}
+
+impl From<std::sync::Arc<[u8]>> for ContentBytes {
+    fn from(bytes: std::sync::Arc<[u8]>) -> Self {
+        Self(bytes)
     }
 }

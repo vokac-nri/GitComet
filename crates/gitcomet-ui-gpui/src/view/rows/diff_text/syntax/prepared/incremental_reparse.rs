@@ -113,6 +113,8 @@ pub(crate) fn treesitter_document_cache_key_for_reparse_plan(
         new_input[edit.start_byte..edit.new_end_byte].hash(&mut hasher);
     }
     PreparedSyntaxCacheKey {
+        #[cfg(test)]
+        test_scope: syntax_test_scope(),
         language,
         doc_hash: hasher.finish(),
     }
@@ -435,7 +437,7 @@ pub(crate) struct TreesitterHighlightSpec {
     pub(crate) injection_combined_patterns: Vec<bool>,
     /// `injection_combined_patterns.iter().any(|&c| c)`, hoisted so the whole
     /// combined path can be skipped with one branch. This is the gate that keeps
-    /// the feature a no-op for every grammar that does not declare it -- today
-    /// that is all of them except F#, whose `xml_doc` rule is combined upstream.
+    /// the feature a no-op for every grammar that does not declare it; the ones
+    /// that do are listed in `combined_injection_declarations_are_exactly_the_known_set`.
     pub(crate) has_combined_injections: bool,
 }

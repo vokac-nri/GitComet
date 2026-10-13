@@ -155,7 +155,7 @@ pub(crate) fn build_line_token_chunk_for_state(
         return (None, 0);
     };
     let started = Instant::now();
-    let chunk = collect_treesitter_document_line_tokens_for_line_window(
+    let chunk = collect_treesitter_document_line_tokens_for_line_window_with_combined_layers(
         &tree_state.tree,
         highlight,
         tree_state.text.as_bytes(),
@@ -163,6 +163,7 @@ pub(crate) fn build_line_token_chunk_for_state(
         chunk_start,
         chunk_end,
         tree_state.source_hash,
+        tree_state.combined_layers(),
     );
     let chunk_build_ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
     let arc_chunk = share_recent_line_token_arcs(chunk);
@@ -878,6 +879,10 @@ impl TreesitterDocumentCache {
             };
             let mut remaining = VecDeque::with_capacity(deferred.len());
             while let Some(result) = deferred.pop_front() {
+                #[cfg(test)]
+                if !syntax_test_scope_is_active(result.chunk_key.cache_key) {
+                    continue;
+                }
                 merge_shared_prepared_document_chunk(
                     result.chunk_key.cache_key,
                     result.chunk_key.chunk_ix,
@@ -908,6 +913,10 @@ impl TreesitterDocumentCache {
                 Err(poisoned) => poisoned.into_inner(),
             };
             for result in polled_results {
+                #[cfg(test)]
+                if !syntax_test_scope_is_active(result.chunk_key.cache_key) {
+                    continue;
+                }
                 merge_shared_prepared_document_chunk(
                     result.chunk_key.cache_key,
                     result.chunk_key.chunk_ix,
@@ -974,6 +983,8 @@ impl TreesitterDocumentCache {
     #[cfg(test)]
     pub(crate) fn make_test_cache_key(doc_hash: u64) -> PreparedSyntaxCacheKey {
         PreparedSyntaxCacheKey {
+            #[cfg(test)]
+            test_scope: syntax_test_scope(),
             language: DiffSyntaxLanguage::Rust,
             doc_hash,
         }

@@ -1,5 +1,5 @@
 pub(crate) use gitcomet_ui_gpui::perf_sidecar::{
-    PerfSidecarReport, criterion_sidecar_path, read_sidecar,
+    PerfSidecarReport, criterion_sidecar_path, measurement_kind_for_bench, read_sidecar,
 };
 pub(crate) use serde::Deserialize;
 pub(crate) use std::env;
@@ -13,6 +13,7 @@ mod artifacts;
 mod budgets;
 mod cli;
 mod evaluate;
+mod indexed_history;
 mod model;
 mod report;
 #[cfg(test)]
@@ -52,7 +53,11 @@ fn run_report(cli: CliArgs) -> Result<(), String> {
         .map(load_artifact_freshness_reference)
         .transpose()?;
     let mut timing_results = Vec::with_capacity(PERF_BUDGETS.len());
-    for spec in PERF_BUDGETS.iter().copied() {
+    for spec in PERF_BUDGETS
+        .iter()
+        .copied()
+        .chain(indexed_history::calibrated_specs()?)
+    {
         timing_results.push(evaluate_budget(
             spec,
             &cli.criterion_roots,
@@ -79,6 +84,9 @@ fn run_report(cli: CliArgs) -> Result<(), String> {
     );
     println!("{markdown}");
     append_github_summary(&markdown)?;
+    if let Some(path) = cli.summary_json.as_deref() {
+        write_summary_json(path, &structural_results)?;
+    }
 
     let mut has_alert = false;
     for result in &timing_results {

@@ -31,7 +31,10 @@ macro_rules! exact_filtered_target {
     };
 }
 
+exact_filtered_target!(bench_extensions_selected => bench_extensions, ["diff_view_open_first_window", "diff_scroll/overlay_lane_window", "diff_scroll/insets_window", "file_list", "shell/view_switch",
+        "shell/empty_registry", "settings_window_render", "history_annotations"]);
 exact_filtered_target!(bench_open_repo_selected => bench_open_repo);
+exact_filtered_target!(bench_sidebar_sticky_selected => bench_sidebar_sticky);
 exact_filtered_target!(bench_branch_sidebar_selected => bench_branch_sidebar, [
     "branch_sidebar/local_heavy",
     "branch_sidebar/remote_fanout",
@@ -48,6 +51,7 @@ exact_filtered_target!(bench_branch_sidebar_cache_selected => bench_branch_sideb
     "branch_sidebar/cache_invalidation_worktrees_ready",
 ]);
 exact_filtered_target!(bench_history_graph_selected => bench_history_graph);
+exact_filtered_target!(bench_indexed_history_selected => bench_indexed_history);
 exact_filtered_target!(bench_history_cache_build_selected => bench_history_cache_build, [
     "history_cache_build/balanced",
     "history_cache_build/merge_dense",
@@ -201,6 +205,10 @@ exact_filtered_target!(
 exact_filtered_target!(
     bench_conflict_split_resize_step_selected => bench_conflict_split_resize_step
 );
+exact_filtered_target!(bench_watcher_startup_selected => bench_watcher_startup, ["native_watcher_startup"]);
+exact_filtered_target!(
+    bench_bounded_live_syntax_edits_selected => bench_bounded_live_syntax_edits
+);
 exact_filtered_target!(
     bench_conflict_resolved_output_live_syntax_selected => bench_conflict_resolved_output_live_syntax
 );
@@ -236,15 +244,21 @@ exact_filtered_target!(bench_clipboard_selected => bench_clipboard);
 exact_filtered_target!(bench_display_selected => bench_display);
 exact_filtered_target!(bench_real_repo_selected => bench_real_repo);
 
+exact_filtered_target!(bench_mermaid_preview_selected => bench_mermaid_preview);
+
 criterion_group! {
     name = benches;
     config = performance_benches::benchmark_criterion();
     targets =
+    bench_mermaid_preview_selected,
+    bench_extensions_selected,
         bench_open_repo_selected,
+        bench_sidebar_sticky_selected,
         bench_branch_sidebar_selected,
         bench_branch_sidebar_extreme_scale_selected,
         bench_branch_sidebar_cache_selected,
         bench_history_graph_selected,
+        bench_indexed_history_selected,
         bench_history_cache_build_selected,
         bench_history_cache_build_extreme_scale_selected,
         bench_history_load_more_append_selected,
@@ -307,6 +321,8 @@ criterion_group! {
         bench_diff_open_conflict_compare_first_window_selected,
         bench_diff_refresh_rev_only_same_content_selected,
         bench_conflict_split_resize_step_selected,
+        bench_watcher_startup_selected,
+        bench_bounded_live_syntax_edits_selected,
         bench_conflict_resolved_output_live_syntax_selected,
         bench_conflict_streamed_provider_selected,
         bench_conflict_streamed_resolved_output_selected,

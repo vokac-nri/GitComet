@@ -11,9 +11,11 @@ use alacritty_terminal::index::{Column, Line};
 use alacritty_terminal::term::cell::Flags;
 use palette::IntoColor;
 
-struct TerminalScrollbarDriver {
-    term_lock: Option<AlacrittyTermLock>,
-    line_height: Pixels,
+pub(super) struct TerminalScrollbarDriver {
+    pub(super) term_lock: Option<AlacrittyTermLock>,
+    pub(super) line_height: Pixels,
+    pub(super) fallback_history: usize,
+    pub(super) fallback_display: usize,
 }
 
 impl ScrollbarDriver for TerminalScrollbarDriver {
@@ -24,7 +26,10 @@ impl ScrollbarDriver for TerminalScrollbarDriver {
         let Some(ref term_lock) = self.term_lock else {
             return px(0.0);
         };
-        (term_lock.lock().grid().history_size() as f32 * self.line_height).max(px(0.0))
+        let history = term_lock
+            .try_lock_unfair()
+            .map_or(self.fallback_history, |term| term.grid().history_size());
+        (history as f32 * self.line_height).max(px(0.0))
     }
 
     fn raw_offset(&self, axis: ScrollbarAxis) -> Pixels {
@@ -34,10 +39,12 @@ impl ScrollbarDriver for TerminalScrollbarDriver {
         let Some(ref term_lock) = self.term_lock else {
             return px(0.0);
         };
-        let term = term_lock.lock();
-        let history = term.grid().history_size() as f32;
-        let display = term.grid().display_offset() as f32;
-        -(history - display) * self.line_height
+        let (history, display) = term_lock
+            .try_lock_unfair()
+            .map_or((self.fallback_history, self.fallback_display), |term| {
+                (term.grid().history_size(), term.grid().display_offset())
+            });
+        -(history as f32 - display as f32) * self.line_height
     }
 
     fn set_axis_offset(&self, axis: ScrollbarAxis, offset: Pixels) {
@@ -135,8 +142,37 @@ impl Element for TerminalSelectionTracker {
         _request_layout: &mut Self::RequestLayoutState,
         _prepaint: &mut Self::PrepaintState,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) {
+        if self.view.read(cx).focus_handle.is_focused(window) {
+            let view = self.view.clone();
+            let window_handle = window.window_handle();
+            window.on_mouse_event(move |event: &MouseDownEvent, phase, _window, cx| {
+                if phase != gpui::DispatchPhase::Capture
+                    || event.first_mouse
+                    || !matches!(
+                        event.button,
+                        MouseButton::Left | MouseButton::Middle | MouseButton::Right
+                    )
+                {
+                    return;
+                }
+                view.update(cx, |this, _cx| this.took_press = false);
+                let view = view.clone();
+                cx.defer(move |cx| {
+                    if view.read(cx).took_press {
+                        return;
+                    }
+                    let _ = window_handle.update(cx, |_root, window, cx| {
+                        if !crate::text_selection_owner::press_keeps_focus(window, cx)
+                            && view.read(cx).focus_handle.is_focused(window)
+                        {
+                            window.blur(cx);
+                        }
+                    });
+                });
+            });
+        }
         // Registered unconditionally and gated inside the closures: `selecting`
         // only becomes true while handling mouse-down, i.e. after this frame was
         // painted, so gating here would drop every move and up event of the drag
@@ -193,22 +229,36 @@ impl TerminalViewportView {
         focus_handle: FocusHandle,
         term_lock: AlacrittyTermLock,
         pty_sender: terminal_alacritty::PtySender,
+        cx: &mut gpui::Context<Self>,
     ) -> Self {
-        Self::with_backend(theme, focus_handle, Some(term_lock), Some(pty_sender))
+        Self::with_backend(theme, focus_handle, Some(term_lock), Some(pty_sender), cx)
     }
 
-    /// Shared constructor. Tests use it to build a viewport over a real `Term`
-    /// but with no PTY, since a `PtySender` can only come from a spawned event
-    /// loop.
+    /// Shared constructor. Tests use a real `Term` with either no PTY or a
+    /// sender that records messages without spawning a process.
     pub(super) fn with_backend(
         theme: AppTheme,
         focus_handle: FocusHandle,
         term_lock: Option<AlacrittyTermLock>,
         pty_sender: Option<terminal_alacritty::PtySender>,
+        cx: &mut gpui::Context<Self>,
     ) -> Self {
+        let selection_owner_observer = crate::text_selection_owner::observe(cx, |this, cx| {
+            if !this.selection_owner.is_stale(cx) {
+                return;
+            }
+            // Not folded into the condition above: `clear_selection` also ends
+            // any drag and invalidates the autoscroll ticker, which is too much
+            // to hide behind `&&`.
+            if this.clear_selection() {
+                cx.notify();
+            }
+        });
         Self {
             theme,
             focus_handle,
+            focus_subscriptions: None,
+            took_press: false,
             term_lock,
             pty_sender,
             layout_cache: None,
@@ -218,7 +268,9 @@ impl TerminalViewportView {
             cursor_blink_active: false,
             cursor_blink_task_scheduled: false,
             cursor_blink_seq: 0,
+            cursor_idle_blinks: 0,
             content_epoch: 1,
+            paint_retry_scheduled: false,
             last_content: None,
             viewport_bounds: None,
             pressed_mouse_button: None,
@@ -232,6 +284,8 @@ impl TerminalViewportView {
             selection_drag_moved: false,
             selection_autoscroll_seq: 0,
             ime_state: None,
+            selection_owner: Default::default(),
+            _selection_owner_observer: selection_owner_observer,
         }
     }
 
@@ -271,12 +325,34 @@ impl TerminalViewportView {
         self.cursor_blink_seq = self.cursor_blink_seq.wrapping_add(1);
         self.cursor_blink_visible = true;
         self.cursor_blink_hold_until = Instant::now();
+        self.cursor_idle_blinks = 0;
+    }
+
+    fn cursor_blink_timed_out(&self) -> bool {
+        u64::from(self.cursor_idle_blinks) * TERMINAL_CARET_BLINK_INTERVAL_MS
+            >= TERMINAL_CARET_BLINK_TIMEOUT_MS
+    }
+
+    fn reset_focus(&mut self, cx: &mut gpui::Context<Self>) {
+        self.deactivate_cursor_blink();
+        if self.was_focused {
+            self.was_focused = false;
+            self.handle_focus_lost(cx);
+        } else {
+            self.end_selection_drag(cx);
+        }
+        self.pressed_mouse_button = None;
+        self.last_motion_cell = None;
+        self.ime_state = None;
+        self.took_press = false;
+        cx.notify();
     }
 
     fn schedule_cursor_blink_tick(&mut self, cx: &mut gpui::Context<Self>) {
         if !crate::ui_runtime::current().uses_cursor_blink()
             || !self.cursor_blink_active
             || self.cursor_blink_task_scheduled
+            || self.cursor_blink_timed_out()
         {
             return;
         }
@@ -284,15 +360,19 @@ impl TerminalViewportView {
         let blink_seq = self.cursor_blink_seq;
         cx.spawn(
             async move |view: WeakEntity<TerminalViewportView>, cx: &mut gpui::AsyncApp| {
-                smol::Timer::after(Duration::from_millis(TERMINAL_CARET_BLINK_INTERVAL_MS)).await;
-                let _ = view.update(cx, |this, cx| this.advance_cursor_blink(blink_seq, cx));
+                cx.background_executor()
+                    .timer(Duration::from_millis(TERMINAL_CARET_BLINK_INTERVAL_MS))
+                    .await;
+                let _ = view.update_in(cx, |this, window, cx| {
+                    this.advance_cursor_blink(blink_seq, window, cx)
+                });
             },
         )
         .detach();
     }
 
     fn cursor_blink_should_run(&self, window: &Window) -> bool {
-        self.connected() && self.focus_handle.is_focused(window)
+        self.connected() && crate::window_focus::is_active(&self.focus_handle, window)
     }
 
     pub(super) fn connected(&self) -> bool {
@@ -300,11 +380,12 @@ impl TerminalViewportView {
     }
 
     fn sync_cursor_blink_activity(&mut self, window: &Window, cx: &mut gpui::Context<Self>) {
-        let is_focused = self.focus_handle.is_focused(window);
+        let is_focused = crate::window_focus::is_active(&self.focus_handle, window);
         if is_focused && !self.was_focused {
+            self.reset_cursor_blink(cx);
             self.handle_focus_gained(cx);
         } else if !is_focused && self.was_focused {
-            self.handle_focus_lost(cx);
+            self.reset_focus(cx);
         }
         self.was_focused = is_focused;
 
@@ -355,8 +436,17 @@ impl TerminalViewportView {
         }
     }
 
-    pub(super) fn advance_cursor_blink(&mut self, blink_seq: u64, cx: &mut gpui::Context<Self>) {
+    pub(super) fn advance_cursor_blink(
+        &mut self,
+        blink_seq: u64,
+        window: &Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
         if self.cursor_blink_seq != blink_seq {
+            return;
+        }
+        if !self.cursor_blink_should_run(window) {
+            self.reset_focus(cx);
             return;
         }
         self.cursor_blink_task_scheduled = false;
@@ -364,8 +454,11 @@ impl TerminalViewportView {
             self.cursor_blink_visible = true;
             return;
         }
+        self.cursor_idle_blinks = self.cursor_idle_blinks.saturating_add(1);
         let now = Instant::now();
-        if now < self.cursor_blink_hold_until {
+        // Shown while typing, and at rest after the timeout, where ticks stop
+        // until `reset_cursor_blink`.
+        if now < self.cursor_blink_hold_until || self.cursor_blink_timed_out() {
             if !self.cursor_blink_visible {
                 self.cursor_blink_visible = true;
                 cx.notify();
@@ -381,6 +474,7 @@ impl TerminalViewportView {
     pub(super) fn reset_cursor_blink(&mut self, cx: &mut gpui::Context<Self>) {
         let was_visible = self.cursor_blink_visible;
         self.cursor_blink_visible = true;
+        self.cursor_idle_blinks = 0;
         self.cursor_blink_hold_until =
             Instant::now() + Duration::from_millis(TERMINAL_CARET_RESUME_DELAY_MS);
         if !crate::ui_runtime::current().uses_cursor_blink() {
@@ -409,10 +503,16 @@ impl TerminalViewportView {
     pub(super) fn handle_key_down(
         &mut self,
         keystroke: &gpui::Keystroke,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
         if let Some(action) = terminal_clipboard_shortcut_action(keystroke) {
-            self.perform_clipboard_action(action, cx);
+            self.perform_command(
+                action,
+                crate::clipboard::CopySource::TerminalShortcut,
+                window,
+                cx,
+            );
             cx.stop_propagation();
             return true;
         }
@@ -439,42 +539,53 @@ impl TerminalViewportView {
         false
     }
 
-    pub(super) fn perform_clipboard_action(
+    pub(super) fn perform_command(
         &mut self,
-        action: TerminalShortcutAction,
+        action: TerminalCommand,
+        copy_source: crate::clipboard::CopySource,
+        window: &Window,
         cx: &mut gpui::Context<Self>,
     ) {
         match action {
-            TerminalShortcutAction::Copy => {
-                let text = if self.select_all_active {
-                    self.copy_entire_buffer()
-                } else if let Some((start, end)) = self.selection_start.zip(self.selection_end) {
-                    self.copy_grid_range(start, end)
-                } else {
-                    // Fallback: copy visible screen content when no selection
-                    self.copy_visible_screen()
-                };
+            TerminalCommand::Copy => {
+                let text = self.selected_text().unwrap_or_else(|| {
+                    // Keyboard Copy also works without a selection.
+                    if copy_source == crate::clipboard::CopySource::TerminalShortcut
+                        && !self.has_selection()
+                    {
+                        self.copy_visible_screen()
+                    } else {
+                        String::new()
+                    }
+                });
                 if !text.is_empty() {
-                    crate::clipboard::write_text(
-                        cx,
-                        text,
-                        crate::clipboard::CopySource::TerminalShortcut,
-                    );
+                    crate::clipboard::write_text(cx, text, copy_source);
                 }
             }
-            TerminalShortcutAction::Paste => {
-                let bracketed = self
-                    .last_content
-                    .as_ref()
-                    .map(|c| c.mode.contains(TerminalModes::BRACKETED_PASTE))
-                    .unwrap_or(false);
+            TerminalCommand::Paste => {
                 if let Some(text) = crate::clipboard::read_text(cx) {
-                    let bytes = terminal_paste_bytes(&text, bracketed);
-                    self.queue_input(bytes, cx);
+                    self.paste_text(&text, cx);
                 }
             }
-            TerminalShortcutAction::SelectAll => self.select_all(cx),
+            TerminalCommand::SelectAll => self.select_all(window, cx),
+            TerminalCommand::ClearScreenAndScrollback => self.clear_screen_and_scrollback(cx),
         }
+    }
+
+    pub(super) fn clear_screen_and_scrollback(&mut self, cx: &mut gpui::Context<Self>) {
+        let Some(term_lock) = &self.term_lock else {
+            return;
+        };
+        {
+            let mut term = term_lock.lock();
+            clear_terminal_screen_and_scrollback(&mut term);
+            self.last_content = Some(make_terminal_content(&term));
+        }
+        self.clear_selection();
+        self.content_epoch = self.content_epoch.wrapping_add(1);
+        self.render_cache = TerminalRenderCache::default();
+        self.reset_cursor_blink(cx);
+        cx.notify();
     }
 
     pub(super) fn copy_grid_range(
@@ -645,7 +756,7 @@ impl TerminalViewportView {
         })
     }
 
-    pub(super) fn select_all(&mut self, cx: &mut gpui::Context<Self>) {
+    pub(super) fn select_all(&mut self, window: &Window, cx: &mut gpui::Context<Self>) {
         let Some(geometry) = self.grid_geometry() else {
             return;
         };
@@ -661,6 +772,7 @@ impl TerminalViewportView {
             geometry.columns as u16 - 1,
         ));
         self.select_all_active = true;
+        self.selection_owner.adopt(window, cx);
         cx.notify();
     }
 
@@ -836,9 +948,14 @@ impl TerminalViewportView {
         cx: &mut gpui::Context<Self>,
         button: gpui::MouseButton,
     ) {
+        self.took_press = true;
         window.focus(&self.focus_handle, cx);
         self.reset_cursor_blink(cx);
         crate::press_gesture::claim_press(cx);
+        // Every button, like `TextInput::on_mouse_down`: a right-click opens a
+        // menu that copies this selection, and a middle-click paste must not
+        // let the press resolver collapse it either.
+        self.selection_owner.adopt(window, cx);
 
         let mode = self.live_modes();
         if mode.mouse_mode() {
@@ -1064,8 +1181,12 @@ impl TerminalViewportView {
                         .timer(Duration::from_millis(16))
                         .await;
                     let mut keep_going = false;
-                    let updated = view.update(cx, |this, cx| {
+                    let updated = view.update_in(cx, |this, window, cx| {
                         if !this.selecting || this.selection_autoscroll_seq != seq {
+                            return;
+                        }
+                        if !crate::window_focus::is_active(&this.focus_handle, window) {
+                            this.end_selection_drag(cx);
                             return;
                         }
                         keep_going = true;
@@ -1226,6 +1347,23 @@ impl TerminalViewportView {
         }
     }
 
+    fn schedule_paint_retry(&mut self, cx: &mut gpui::Context<Self>) {
+        if self.paint_retry_scheduled {
+            return;
+        }
+        self.paint_retry_scheduled = true;
+        cx.spawn(async move |view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(16))
+                .await;
+            let _ = view.update(cx, |view, cx| {
+                view.paint_retry_scheduled = false;
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(super) fn build_terminal_canvas_paint_state(
         &mut self,
         bounds: Bounds<Pixels>,
@@ -1237,13 +1375,23 @@ impl TerminalViewportView {
         self.sync_terminal_grid_size(next_size);
         self.sync_cursor_blink_activity(window, cx);
 
-        // Refresh content from alacritty
+        // A PTY batch holds this lock while parsing. Painting must not wait
+        // behind output: retain the last coherent viewport and retry on a frame.
         if let Some(term_lock) = &self.term_lock {
-            let term = term_lock.lock();
-            let content = make_terminal_content(&term);
+            let fresh = term_lock
+                .try_lock_unfair()
+                .map(|term| make_terminal_content(&term));
+            let content = if let Some(content) = fresh {
+                self.last_content = Some(content.clone());
+                content
+            } else {
+                self.schedule_paint_retry(cx);
+                let Some(content) = self.last_content.clone() else {
+                    return TerminalCanvasPaintState::default();
+                };
+                content
+            };
             let display_offset = content.display_offset;
-            self.last_content = Some(content.clone());
-            drop(term);
 
             let rows = next_size.rows;
             let cols = next_size.cols as usize;
@@ -1283,25 +1431,34 @@ impl TerminalViewportView {
             for row in 0..rows {
                 let cache_row = &mut self.render_cache.rows[usize::from(row)];
                 let grid_row = row as i32 - disp_off;
-                let row_fingerprint = terminal_row_fingerprint(&content.cells, grid_row, cols);
+                // Alacritty's display iterator is ordered by row. Bound each
+                // fingerprint/shape pass to its row instead of rescanning the
+                // whole viewport once per row.
+                let first = content
+                    .cells
+                    .partition_point(|cell| cell.point.line.0 < grid_row);
+                let last = content
+                    .cells
+                    .partition_point(|cell| cell.point.line.0 <= grid_row);
+                let cells = &content.cells[first..last];
+                let row_fingerprint = terminal_row_fingerprint(cells, grid_row, cols);
 
                 if rebuild
                     || cache_row.shaped.is_none()
                     || cache_row.fingerprint != row_fingerprint
                     || cache_row.layout_key != layout.key
                 {
-                    let (text, runs, bg_rects) = build_alacritty_row(
-                        &content.cells,
+                    let (text, runs, bg_rects) =
+                        build_alacritty_row(cells, grid_row, cols, &layout.base_style, self.theme);
+                    let shaped = super::painting::shape_terminal_grid_line(
+                        text,
+                        &runs,
+                        cells,
                         grid_row,
                         cols,
-                        &layout.base_style,
-                        self.theme,
-                    );
-                    let shaped = window.text_system().shape_line(
-                        text,
                         layout.metrics.font_size,
-                        &runs,
-                        Some(layout.metrics.cell_width),
+                        layout.metrics.cell_width,
+                        window,
                     );
                     cache_row.fingerprint = row_fingerprint;
                     cache_row.layout_key = layout.key;
@@ -1414,7 +1571,8 @@ impl TerminalViewportView {
             }
 
             // Cursor
-            if self.cursor_blink_visible
+            if crate::window_focus::is_active(&self.focus_handle, window)
+                && self.cursor_blink_visible
                 && self
                     .ime_state
                     .as_ref()
@@ -1462,6 +1620,7 @@ impl TerminalViewportView {
             // IME marked text
             if let Some(ref ime) = self.ime_state
                 && !ime.marked_text.is_empty()
+                && crate::window_focus::is_active(&self.focus_handle, window)
             {
                 paint_state.ime_marked_text = Some(ime.marked_text.clone());
                 paint_state.ime_base_style = Some(layout.base_style.clone());
@@ -1491,7 +1650,15 @@ impl TerminalViewportView {
 }
 
 impl Render for TerminalViewportView {
-    fn render(&mut self, _window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
+        if self.focus_subscriptions.is_none() {
+            self.focus_subscriptions = Some(crate::window_focus::observe_blur(
+                &self.focus_handle,
+                window,
+                cx,
+                Self::reset_focus,
+            ));
+        }
         let view = cx.entity().clone();
         let theme = self.theme;
         let term_lock = self.term_lock.clone();
@@ -1540,8 +1707,8 @@ impl Render for TerminalViewportView {
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, window, cx| {
                 this.handle_mouse_move(e, window, cx);
             }))
-            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, _window, cx| {
-                this.handle_key_down(&e.keystroke, cx);
+            .on_key_down(cx.listener(|this, e: &gpui::KeyDownEvent, window, cx| {
+                this.handle_key_down(&e.keystroke, window, cx);
             }))
             .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, window, cx| {
                 this.handle_scroll_wheel(e, window, cx);
@@ -1575,6 +1742,7 @@ impl Render for TerminalViewportView {
                                     },
                                     move |_bounds, paint_state, window, cx| {
                                         let ime_handler = TerminalTextInputHandler {
+                                            focus_handle: focus_handle.clone(),
                                             pty_sender: pty_sender.clone(),
                                             ime_state: paint_state.ime_marked_text.as_ref().map(
                                                 |t| TerminalImeState {
@@ -1582,7 +1750,9 @@ impl Render for TerminalViewportView {
                                                 },
                                             ),
                                         };
-                                        window.handle_input(&focus_handle, ime_handler, cx);
+                                        if crate::window_focus::is_active(&focus_handle, window) {
+                                            window.handle_input(&focus_handle, ime_handler, cx);
+                                        }
                                         paint_terminal_canvas_state(paint_state, theme, window, cx);
                                     },
                                 )
@@ -1592,7 +1762,7 @@ impl Render for TerminalViewportView {
                     )
                     .child({
                         let line_height = self
-                            .terminal_layout_snapshot(_window, cx)
+                            .terminal_layout_snapshot(window, cx)
                             .metrics
                             .line_height;
                         Scrollbar::new(
@@ -1600,6 +1770,14 @@ impl Render for TerminalViewportView {
                             TerminalScrollbarDriver {
                                 term_lock: term_lock.clone(),
                                 line_height,
+                                fallback_history: self
+                                    .last_content
+                                    .as_ref()
+                                    .map_or(0, |c| c.history_size),
+                                fallback_display: self
+                                    .last_content
+                                    .as_ref()
+                                    .map_or(0, |c| c.display_offset),
                             },
                         )
                         .always_visible()
@@ -1620,6 +1798,11 @@ where
     style.font_family = crate::font_preferences::current_editor_font_family(cx).into();
     style.font_features = gpui::FontFeatures::disable_ligatures();
     style.font_weight = FontWeight::NORMAL;
+    let appearance =
+        cx.update_default_global::<crate::appearance::Appearance, _>(|appearance, _| *appearance);
+    style.font_size =
+        crate::ui_scale::design_px_from_window(appearance.editor_font_size_px as f32, window)
+            .into();
     style.font_style = gpui::FontStyle::Normal;
     style.color = terminal_default_foreground(theme).into_color();
     style.white_space = gpui::WhiteSpace::Nowrap;
@@ -1642,7 +1825,7 @@ fn terminal_grid_size(bounds: Bounds<Pixels>, metrics: TerminalTextMetrics) -> T
 
 fn terminal_layout_cache(mut base_style: gpui::TextStyle, window: &Window) -> TerminalLayoutCache {
     let rem_size = window.rem_size();
-    let font_size = base_style.font_size.to_pixels(rem_size) * TERMINAL_FONT_SCALE;
+    let font_size = base_style.font_size.to_pixels(rem_size);
     let line_height = terminal_line_height(font_size);
     base_style.line_height = line_height.into();
     let font_id = window.text_system().resolve_font(&base_style.font());

@@ -1,19 +1,23 @@
+use crate::kit::click::PointerClickExt as _;
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use crate::kit::{Scrollbar, ScrollbarAxis};
 use crate::theme::AppTheme;
 use crate::ui_scale;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, CursorStyle, Entity, FocusHandle, FontWeight, MouseButton, MouseDownEvent,
-    ScrollStrategy, SharedString, UniformListScrollHandle, WeakEntity, Window, div, px,
-    uniform_list,
+    AnyElement, Entity, FocusHandle, FontWeight, MouseButton, MouseDownEvent, ScrollStrategy,
+    SharedString, UniformListScrollHandle, WeakEntity, Window, div, px, uniform_list,
 };
 use palette::IntoColor;
 
 use super::shortcut_labels::Shortcut;
+use super::tooltip::GitCometTooltipExt;
 use super::{GitCometView, components, restrict_scroll_to_vertical_axis};
+use gitcomet_core::tag_push::TagPushMode;
 
 pub(crate) struct CommandEntry {
     pub(crate) id: &'static str,
+    /// Read through [`CommandEntry::label`], which names the product for `{app}`.
     pub(crate) label: &'static str,
     pub(crate) shortcut: Shortcut,
     pub(crate) category: &'static str,
@@ -21,6 +25,138 @@ pub(crate) struct CommandEntry {
     /// Extra search terms, matched after the label so wording the user
     /// remembers still finds a command the label no longer spells out.
     pub(crate) keywords: &'static str,
+    /// What the command needs beyond a repository. Unlike `requires_repo`,
+    /// which hides the command, an unmet need leaves it listed but disabled.
+    pub(crate) needs: Needs,
+}
+
+impl CommandEntry {
+    /// The label as shown and matched, naming the product for `{app}`.
+    pub(crate) fn label(&self) -> std::borrow::Cow<'static, str> {
+        if self.label.contains("{app}") {
+            std::borrow::Cow::Owned(self.label.replace("{app}", crate::view::product_name()))
+        } else {
+            std::borrow::Cow::Borrowed(self.label)
+        }
+    }
+}
+
+/// A precondition a command can be listed without. The palette shows such a
+/// command disabled, with the reason as its tooltip, so it stays discoverable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Needs {
+    Nothing,
+    ExternalEditor,
+    Merge,
+    /// A rebase, apply, cherry-pick, or revert in progress.
+    Sequencer,
+    /// A sequencer operation with every conflict resolved.
+    SequencerResolved,
+    PushWithTags(TagPushMode),
+    /// A remote whose URL points at a web page.
+    RemoteWebPage,
+    MacOs,
+    Linux,
+    /// Git can run `git lfs`.
+    GitLfsTool,
+    /// Git can run `git lfs` and the repository uses it.
+    GitLfsRepo,
+    /// Git can run `git annex` and the repository uses git-annex.
+    GitAnnexRepo,
+    /// As `GitAnnexRepo`, and this clone has run `git annex init`.
+    GitAnnexInitialized,
+    /// As `GitAnnexInitialized`, on an adjusted branch.
+    GitAnnexAdjusted,
+}
+
+/// The app state commands are enabled against, taken from the root view.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PaletteContext {
+    pub(crate) has_active_repo: bool,
+    pub(crate) external_editor: bool,
+    pub(crate) merging: bool,
+    pub(crate) sequencer: bool,
+    /// A sequencer command is running, so Continue/Abort would be refused.
+    pub(crate) sequencer_busy: bool,
+    pub(crate) unresolved_conflicts: bool,
+    /// Why each tag-push mode is unavailable, indexed by `TagPushMode::index`.
+    /// Computed by the push menu's own logic so the two cannot disagree.
+    pub(crate) push_with_tags_unavailable: [Option<&'static str>; 2],
+    /// Why no remote can be opened in a browser, from `remote_web_request`.
+    pub(crate) remote_web_page_unavailable: Option<&'static str>,
+    /// Git cannot run `git lfs`.
+    pub(crate) git_lfs_missing: bool,
+    /// The active repository tracks or stores Git LFS files.
+    pub(crate) repo_uses_lfs: bool,
+    /// Git cannot run `git annex`.
+    pub(crate) git_annex_missing: bool,
+    pub(crate) repo_uses_annex: bool,
+    pub(crate) annex_initialized: bool,
+    pub(crate) annex_adjusted: bool,
+}
+
+const GIT_LFS_MISSING: &str = "Install Git LFS where Git can find it first";
+
+/// Why a command with `needs` cannot run under `ctx`, or `None` when it can.
+pub(crate) fn unavailable_reason(needs: Needs, ctx: &PaletteContext) -> Option<&'static str> {
+    const NOT_SEQUENCING: &str =
+        "Only available while a rebase, cherry-pick, or revert is in progress";
+    // Same wording as the action bar's disabled Continue/Abort.
+    const SEQUENCER_BUSY: &str = "Wait for the running Git operation to finish";
+    match needs {
+        Needs::Nothing => None,
+        Needs::ExternalEditor => {
+            (!ctx.external_editor).then_some("Choose an external code editor in Settings first")
+        }
+        Needs::Merge => (!ctx.merging).then_some("Only available while a merge is in progress"),
+        Needs::Sequencer => {
+            if !ctx.sequencer {
+                Some(NOT_SEQUENCING)
+            } else if ctx.sequencer_busy {
+                Some(SEQUENCER_BUSY)
+            } else {
+                None
+            }
+        }
+        Needs::SequencerResolved => {
+            if !ctx.sequencer {
+                Some(NOT_SEQUENCING)
+            } else if ctx.sequencer_busy {
+                Some(SEQUENCER_BUSY)
+            } else if ctx.unresolved_conflicts {
+                // Same wording as the action bar's Continue button.
+                Some("Resolve all conflicts before continuing")
+            } else {
+                None
+            }
+        }
+        Needs::PushWithTags(mode) => ctx.push_with_tags_unavailable[mode.index()],
+        Needs::RemoteWebPage => ctx.remote_web_page_unavailable,
+        Needs::MacOs => (!cfg!(target_os = "macos")).then_some("Only available on macOS"),
+        Needs::Linux => (!cfg!(any(target_os = "linux", target_os = "freebsd")))
+            .then_some("Only available on Linux"),
+        Needs::GitLfsTool => ctx.git_lfs_missing.then_some(GIT_LFS_MISSING),
+        Needs::GitAnnexRepo | Needs::GitAnnexInitialized | Needs::GitAnnexAdjusted => {
+            if ctx.git_annex_missing {
+                Some("Install git-annex where Git can find it first")
+            } else if !ctx.repo_uses_annex {
+                Some("This repository does not use git-annex")
+            } else if needs != Needs::GitAnnexRepo && !ctx.annex_initialized {
+                Some("Initialize git-annex in this clone first")
+            } else if needs == Needs::GitAnnexAdjusted && !ctx.annex_adjusted {
+                Some("Only available on a git-annex adjusted branch")
+            } else {
+                None
+            }
+        }
+        Needs::GitLfsRepo => {
+            if ctx.git_lfs_missing {
+                Some(GIT_LFS_MISSING)
+            } else {
+                (!ctx.repo_uses_lfs).then_some("This repository does not use Git LFS")
+            }
+        }
+    }
 }
 
 pub(crate) const COMMANDS: &[CommandEntry] = &[
@@ -31,6 +167,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Commit",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "stage-all",
@@ -39,6 +176,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Working Copy",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "unstage-all",
@@ -47,6 +185,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Working Copy",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "create-branch",
@@ -55,6 +194,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Branch",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "checkout-branch",
@@ -63,6 +203,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Branch",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "delete-branch",
@@ -71,6 +212,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Branch",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "rename-branch",
@@ -79,6 +221,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Branch",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "rebase",
@@ -87,6 +230,43 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Branch",
         keywords: "rebase onto history rewrite",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "prune-merged-branches",
+        label: "Prune Merged Branches",
+        shortcut: Shortcut::None,
+        category: "Branch",
+        keywords: "delete cleanup merged local branches",
+        requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "abort-merge",
+        label: "Abort Merge",
+        shortcut: Shortcut::None,
+        category: "Branch",
+        keywords: "cancel merge conflict",
+        requires_repo: true,
+        needs: Needs::Merge,
+    },
+    CommandEntry {
+        id: "continue-rebase",
+        label: "Continue Rebase, Cherry-Pick, or Revert",
+        shortcut: Shortcut::None,
+        category: "Branch",
+        keywords: "continue resume rebase cherry pick revert apply am sequencer",
+        requires_repo: true,
+        needs: Needs::SequencerResolved,
+    },
+    CommandEntry {
+        id: "abort-rebase",
+        label: "Abort Rebase, Cherry-Pick, or Revert",
+        shortcut: Shortcut::None,
+        category: "Branch",
+        keywords: "abort cancel rebase cherry pick revert apply am sequencer",
+        requires_repo: true,
+        needs: Needs::Sequencer,
     },
     CommandEntry {
         id: "pull",
@@ -95,6 +275,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Sync",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "push",
@@ -103,6 +284,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Sync",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "force-push",
@@ -111,6 +293,25 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Sync",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "push-with-annotated-tags",
+        label: "Push with Annotated Tags",
+        shortcut: Shortcut::None,
+        category: "Sync",
+        keywords: "push tags follow-tags annotated",
+        requires_repo: true,
+        needs: Needs::PushWithTags(TagPushMode::FollowAnnotated),
+    },
+    CommandEntry {
+        id: "push-with-all-tags",
+        label: "Push with All Tags",
+        shortcut: Shortcut::None,
+        category: "Sync",
+        keywords: "push tags all",
+        requires_repo: true,
+        needs: Needs::PushWithTags(TagPushMode::All),
     },
     CommandEntry {
         id: "stash",
@@ -119,6 +320,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Stash",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "stash-pop",
@@ -127,6 +329,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Stash",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "stash-apply",
@@ -135,6 +338,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Stash",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "stash-drop",
@@ -143,6 +347,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Stash",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "open-repository",
@@ -151,6 +356,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "switch-repository",
@@ -162,6 +368,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "recent reopen",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "clone-repository",
@@ -170,6 +377,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "initialize-repository",
+        label: crate::menu_labels::INITIALIZE_REPOSITORY,
+        shortcut: Shortcut::None,
+        category: "Repository",
+        keywords: "init new create empty",
+        requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "close-repo-tab",
@@ -178,6 +395,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "reload-repository",
@@ -186,6 +404,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "fetch-ref",
+        label: "Fetch ref…",
+        shortcut: Shortcut::None,
+        category: "Repository",
+        keywords: "fetch refspec branch tag change",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "fetch-all",
@@ -194,6 +422,34 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Repository",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "apply-patch",
+        label: crate::menu_labels::APPLY_PATCH,
+        shortcut: Shortcut::None,
+        category: "Repository",
+        keywords: "patch diff apply import",
+        requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "open-in-code-editor",
+        label: crate::menu_labels::OPEN_IN_CODE_EDITOR,
+        shortcut: Shortcut::Secondary("Shift+E"),
+        category: "Repository",
+        keywords: "editor ide vscode external",
+        requires_repo: true,
+        needs: Needs::ExternalEditor,
+    },
+    CommandEntry {
+        id: "open-external-terminal",
+        label: "Open in External Terminal",
+        shortcut: Shortcut::None,
+        category: "Repository",
+        keywords: "terminal shell console external",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-sidebar",
@@ -202,6 +458,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-details",
@@ -210,6 +467,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-diff-view",
@@ -218,6 +476,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-diff-word-wrap",
@@ -226,6 +485,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-line-numbers",
@@ -234,6 +494,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-whitespace-chars",
@@ -242,6 +503,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "View",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "toggle-terminal",
+        label: "Toggle Terminal",
+        shortcut: Shortcut::None,
+        category: "View",
+        keywords: "terminal shell console show hide panel",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "previous-repo-tab",
@@ -253,6 +524,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Navigation",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "next-repo-tab",
@@ -264,6 +536,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Navigation",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "locate-file-in-explorer",
@@ -272,14 +545,44 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Navigation",
         keywords: "show locate reveal find sidebar tree folder current",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "reveal-commit",
+        label: "Go to",
+        shortcut: Shortcut::Secondary("G"),
+        category: "Navigation",
+        // "reveal commit" keeps the previous label findable.
+        keywords: "reveal commit sha hash jump find locate revision branch tag head",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "open-active-view-search",
         label: "Search in Current View",
         shortcut: Shortcut::Secondary("F"),
         category: "Navigation",
+        keywords: "find commit history sha diff file",
+        requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "back",
+        label: "Navigate Back",
+        shortcut: Shortcut::Alt("Left"),
+        category: "Navigation",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "forward",
+        label: "Navigate Forward",
+        shortcut: Shortcut::Alt("Right"),
+        category: "Navigation",
+        keywords: "",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "create-tag",
@@ -288,6 +591,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Tags",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "prune-local-tags",
+        label: "Prune Local Tags",
+        shortcut: Shortcut::None,
+        category: "Tags",
+        keywords: "delete cleanup tags",
+        requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "new-window",
@@ -296,6 +609,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "open-workspace",
+        label: "Open Workspace",
+        shortcut: Shortcut::Secondary("Shift+R"),
+        category: "Window",
+        keywords: "workspace switch window restore saved",
+        requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "open-settings",
@@ -304,14 +627,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "quit",
-        label: "Quit GitComet",
+        label: "Quit {app}",
         shortcut: Shortcut::Secondary("Q"),
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "minimize-window",
@@ -320,6 +645,25 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "hide",
+        label: "Hide {app}",
+        shortcut: Shortcut::MacOs("Cmd+H"),
+        category: "Window",
+        keywords: "hide application",
+        requires_repo: false,
+        needs: Needs::MacOs,
+    },
+    CommandEntry {
+        id: "hide-others",
+        label: "Hide Others",
+        shortcut: Shortcut::MacOs("Option+Cmd+H"),
+        category: "Window",
+        keywords: "hide other applications",
+        requires_repo: false,
+        needs: Needs::MacOs,
     },
     CommandEntry {
         id: "zoom-window",
@@ -328,6 +672,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "toggle-fullscreen",
@@ -339,6 +684,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "increase-ui-scale",
@@ -347,6 +693,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "decrease-ui-scale",
@@ -355,6 +702,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "reset-ui-scale",
@@ -363,6 +711,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "close-window",
@@ -371,6 +720,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Window",
         keywords: "",
         requires_repo: false,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "install-desktop-integration",
+        label: "Install Desktop Integration",
+        shortcut: Shortcut::None,
+        category: "Window",
+        keywords: "desktop launcher menu icon linux",
+        requires_repo: false,
+        needs: Needs::Linux,
     },
     CommandEntry {
         id: "add-remote",
@@ -379,6 +738,16 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Remotes",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
+    },
+    CommandEntry {
+        id: "open-remote-in-browser",
+        label: crate::menu_labels::OPEN_REMOTE_IN_BROWSER,
+        shortcut: Shortcut::Secondary("K"),
+        category: "Remotes",
+        keywords: "github gitlab bitbucket forge website url view page issues",
+        requires_repo: true,
+        needs: Needs::RemoteWebPage,
     },
     CommandEntry {
         id: "add-submodule",
@@ -387,6 +756,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Submodules",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "update-submodules",
@@ -395,6 +765,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Submodules",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "add-worktree",
@@ -403,6 +774,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "Worktrees",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "blame",
@@ -411,6 +783,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "History",
         keywords: "",
         requires_repo: true,
+        needs: Needs::Nothing,
     },
     CommandEntry {
         id: "show-reflog",
@@ -419,22 +792,7 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
         category: "History",
         keywords: "reflog log restore reset recover",
         requires_repo: true,
-    },
-    CommandEntry {
-        id: "back",
-        label: "Navigate Back",
-        shortcut: Shortcut::Alt("Left"),
-        category: "Navigation",
-        keywords: "",
-        requires_repo: true,
-    },
-    CommandEntry {
-        id: "forward",
-        label: "Navigate Forward",
-        shortcut: Shortcut::Alt("Right"),
-        category: "Navigation",
-        keywords: "",
-        requires_repo: true,
+        needs: Needs::Nothing,
     },
     // TODO: "undo"              - Undo (Edit)
     // TODO: "redo"              - Redo (Edit)
@@ -450,6 +808,159 @@ pub(crate) const COMMANDS: &[CommandEntry] = &[
     // TODO: "remove-submodule"       - Remove Submodule
     // TODO: "remove-worktree"        - Remove Worktree
     // TODO: "discard-all"        - Discard All Changes (Working Copy)
+    CommandEntry {
+        id: "lfs-download-all",
+        label: "Download All LFS Content",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs pull large files smudge",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-fetch-all",
+        label: "Fetch LFS Objects for All Refs",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs fetch large files",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-prune",
+        label: "Prune Old LFS Objects",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs prune cleanup disk space",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-fsck",
+        label: "Check LFS Objects",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs fsck verify integrity",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-refresh-locks",
+        label: "Refresh LFS Locks",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs locks lockable",
+        requires_repo: true,
+        needs: Needs::GitLfsRepo,
+    },
+    CommandEntry {
+        id: "lfs-install",
+        label: "Enable Git LFS in This Repository",
+        shortcut: Shortcut::None,
+        category: "Git LFS",
+        keywords: "lfs install setup hooks filters",
+        requires_repo: true,
+        needs: Needs::GitLfsTool,
+    },
+    CommandEntry {
+        id: "annex-sync",
+        label: "Sync with git-annex Remotes",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex sync pull push remotes",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-pull",
+        label: "Pull with git-annex",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex pull fetch merge",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-push",
+        label: "Push with git-annex",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex push upload",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-get-all",
+        label: "Get All Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex get download content",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-fsck",
+        label: "Check Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex fsck verify integrity",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-adjust-unlocked",
+        label: "Switch to Adjusted Branch (Unlocked)",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex adjust unlock editable",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-leave-adjusted",
+        label: "Leave git-annex Adjusted Branch",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex adjusted base branch",
+        requires_repo: true,
+        needs: Needs::GitAnnexAdjusted,
+    },
+    CommandEntry {
+        id: "annex-unused",
+        label: "Find Unused Annexed Content",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex unused dropunused clean old versions disk space",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-webapp",
+        label: "Open git-annex Webapp",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex webapp assistant browser",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-restage",
+        label: "Refresh Annexed Files Left Stale",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex restage refresh index modified interrupted",
+        requires_repo: true,
+        needs: Needs::GitAnnexInitialized,
+    },
+    CommandEntry {
+        id: "annex-init",
+        label: "Initialize git-annex in This Clone",
+        shortcut: Shortcut::None,
+        category: "git-annex",
+        keywords: "annex init setup",
+        requires_repo: true,
+        needs: Needs::GitAnnexRepo,
+    },
 ];
 
 /// A palette entry that survived filtering, plus the label byte positions the
@@ -473,9 +984,20 @@ impl std::ops::Deref for CommandMatch {
 /// two raw scores are.
 const KEYWORD_MATCH_PENALTY: i32 = 100_000;
 
+#[cfg(test)]
 pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<CommandMatch> {
+    filtered_commands_with(&[], has_active_repo, query)
+}
+
+/// The built-in commands followed by `extensions`, filtered and ranked.
+pub(crate) fn filtered_commands_with(
+    extensions: &'static [CommandEntry],
+    has_active_repo: bool,
+    query: &str,
+) -> Vec<CommandMatch> {
     let available = COMMANDS
         .iter()
+        .chain(extensions)
         .filter(|cmd| !cmd.requires_repo || has_active_repo);
 
     if query.is_empty() {
@@ -490,7 +1012,7 @@ pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<Comma
     let mut out: Vec<(i32, usize, CommandMatch)> = available
         .enumerate()
         .filter_map(|(order, entry)| {
-            fuzzy_subsequence_match(entry.label, query)
+            fuzzy_subsequence_match(&entry.label(), query)
                 .map(|(score, positions)| (score, order, CommandMatch { entry, positions }))
                 .or_else(|| {
                     // Keyword hits carry no highlight positions and sort behind
@@ -511,7 +1033,7 @@ pub(crate) fn filtered_commands(has_active_repo: bool, query: &str) -> Vec<Comma
 
     out.sort_by(|a, b| {
         a.0.cmp(&b.0)
-            .then_with(|| a.2.label.len().cmp(&b.2.label.len()))
+            .then_with(|| a.2.label().len().cmp(&b.2.label().len()))
             .then_with(|| a.1.cmp(&b.1))
     });
     out.into_iter().map(|(_, _, m)| m).collect()
@@ -552,8 +1074,10 @@ pub(crate) struct CommandPaletteView {
     pub(crate) restore_focus: Option<FocusHandle>,
     fallback_focus: Option<FocusHandle>,
     root_view: WeakEntity<GitCometView>,
+    /// Extension commands, fixed when the window is built.
+    extension_commands: &'static [CommandEntry],
     theme: AppTheme,
-    has_active_repo: bool,
+    context: PaletteContext,
     open: bool,
     query: SharedString,
     matches: Vec<CommandMatch>,
@@ -594,8 +1118,12 @@ impl CommandPaletteView {
             restore_focus: None,
             fallback_focus: None,
             root_view,
+            extension_commands: super::extension_host::palette_entries(cx),
             theme,
-            has_active_repo,
+            context: PaletteContext {
+                has_active_repo,
+                ..PaletteContext::default()
+            },
             open: false,
             query: SharedString::default(),
             matches: Vec::new(),
@@ -614,34 +1142,40 @@ impl CommandPaletteView {
         cx.notify();
     }
 
-    pub(crate) fn set_has_active_repo(
-        &mut self,
-        has_active_repo: bool,
-        cx: &mut gpui::Context<Self>,
-    ) {
-        if self.has_active_repo == has_active_repo {
+    /// Refresh what commands are enabled against. Only a repository change
+    /// alters which commands are listed; the rest only greys rows out.
+    pub(crate) fn set_context(&mut self, context: PaletteContext, cx: &mut gpui::Context<Self>) {
+        if self.context == context {
             return;
         }
-        self.has_active_repo = has_active_repo;
+        let relist = self.context.has_active_repo != context.has_active_repo;
+        self.context = context;
         if self.open {
-            self.rebuild_cached_results();
-            self.clamp_selection();
+            if relist {
+                self.rebuild_cached_results();
+                self.clamp_selection();
+            }
             cx.notify();
         }
+    }
+
+    /// Why `command` cannot run right now, if it cannot.
+    fn unavailable(&self, command: &CommandEntry) -> Option<&'static str> {
+        unavailable_reason(command.needs, &self.context)
     }
 
     pub(crate) fn open(
         &mut self,
         restore_focus: Option<FocusHandle>,
         fallback_focus: FocusHandle,
-        has_active_repo: bool,
+        context: PaletteContext,
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
         self.open = true;
         self.restore_focus = restore_focus;
         self.fallback_focus = Some(fallback_focus);
-        self.has_active_repo = has_active_repo;
+        self.context = context;
         self.query = SharedString::default();
         self.selected_index = None;
         self.rebuild_cached_results();
@@ -678,7 +1212,11 @@ impl CommandPaletteView {
     }
 
     fn rebuild_cached_results(&mut self) {
-        self.matches = filtered_commands(self.has_active_repo, self.query.as_ref());
+        self.matches = filtered_commands_with(
+            self.extension_commands,
+            self.context.has_active_repo,
+            self.query.as_ref(),
+        );
         self.rows.clear();
         self.command_row_indices.clear();
 
@@ -792,11 +1330,17 @@ impl CommandPaletteView {
         }
 
         if enter_pressed {
-            let command = self
-                .selected_index
-                .and_then(|index| self.matches.get(index))
-                .or_else(|| self.matches.first())
-                .map(|command| SharedString::from(command.id));
+            // A selected but disabled command does nothing — falling through to
+            // another match would run something the user did not pick.
+            let command = match self.selected_index {
+                Some(index) => self.matches.get(index),
+                None => self
+                    .matches
+                    .iter()
+                    .find(|command| self.unavailable(command).is_none()),
+            }
+            .filter(|command| self.unavailable(command).is_none())
+            .map(|command| SharedString::from(command.id));
             if let Some(command) = command {
                 self.close_and_notify_root(Some(command), window, cx);
             }
@@ -823,6 +1367,7 @@ impl CommandPaletteView {
         &self,
         label: &str,
         positions: &[usize],
+        color: gpui::Rgba,
         cx: &gpui::Context<Self>,
     ) -> AnyElement {
         let highlight = gpui::HighlightStyle {
@@ -838,10 +1383,9 @@ impl CommandPaletteView {
             }
         }
         let focus_range = ranges.first().map(|(range, _)| range.clone());
-        let mut text = components::TruncatedText::new(label.to_owned())
+        let mut text = components::TruncatedText::new(label.to_owned(), self.theme.ui_text(14.0))
             .profile(components::TextTruncationProfile::End)
-            .text_color(self.theme.colors.foreground.primary)
-            .text_sm();
+            .text_color(color);
         if let Some(focus_range) = focus_range {
             text = text.focus_range(Some(focus_range));
         }
@@ -859,9 +1403,8 @@ impl CommandPaletteView {
     ) -> Vec<AnyElement> {
         let theme = self.theme;
         let ui_scale = ui_scale::UiScale::current(cx);
-        let scaled_px = |value: f32| ui_scale.px(value);
+        let scaled_px = crate::ui_scale::scaler(ui_scale);
         let row_height = scaled_px(36.0);
-        let hover_overlay = theme.hover_overlay();
         let selected_overlay = theme.active_overlay();
 
         range
@@ -875,7 +1418,7 @@ impl CommandPaletteView {
                             .flex()
                             .items_center()
                             .px(scaled_px(14.0))
-                            .text_xs()
+                            .text_size(theme.ui_text(12.0))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(theme.colors.foreground.secondary)
                             .child(title)
@@ -886,21 +1429,51 @@ impl CommandPaletteView {
                         let command = self.matches.get(command_index)?;
                         let command_id: SharedString = command.id.into();
                         let command_id_for_click = command_id.clone();
+                        let selected = self.selected_index == Some(command_index);
+                        let unavailable = self.unavailable(command);
                         let command_row = div()
                             // Without an id gpui never repaints on mouse-move,
                             // so the hover fill below would be computed and
-                            // dropped every frame.
+                            // dropped every frame. The tooltip needs it too.
                             .id(("command_palette_row", command_index))
                             .h(row_height)
                             .w_full()
                             .flex()
                             .items_center()
                             .justify_between()
+                            .gap(scaled_px(12.0))
                             .px(scaled_px(10.0))
                             .rounded(px(theme.radii.row))
-                            .hover(move |style| style.bg(hover_overlay))
-                            .cursor(CursorStyle::PointingHand);
+                            .control_interaction(
+                                controls::InteractionStyle::new(theme),
+                                controls::InteractionState::default()
+                                    .selected(selected, selected_overlay)
+                                    .disabled(unavailable.is_some()),
+                            );
+                        let command_row = match unavailable {
+                            None => command_row.on_activate(
+                                false,
+                                controls::ControlActivation::Composite,
+                                cx.listener(move |this, _: &gpui::ClickEvent, window, cx| {
+                                    this.close_and_notify_root(
+                                        Some(command_id_for_click.clone()),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            ),
+                            Some(reason) => command_row
+                                .debug_selector(move || {
+                                    format!("command_palette_disabled_{command_id}")
+                                })
+                                .gitcomet_tooltip(theme, reason.into()),
+                        };
 
+                        let label_color = if unavailable.is_some() {
+                            theme.colors.foreground.disabled
+                        } else {
+                            theme.colors.foreground.primary
+                        };
                         let label = div()
                             .flex()
                             .items_center()
@@ -908,32 +1481,43 @@ impl CommandPaletteView {
                             .overflow_hidden()
                             .flex_1()
                             .min_w(px(0.0))
-                            .child(self.render_label(command.label, &command.positions, cx));
+                            .child(self.render_label(
+                                &command.label(),
+                                &command.positions,
+                                label_color,
+                                cx,
+                            ));
 
                         let mut content = command_row.child(label);
-                        if let Some(shortcut_text) = command.shortcut.label() {
-                            content = content.child(components::shortcut_keys(
-                                &shortcut_text,
-                                theme,
-                                ui_scale,
-                            ));
+                        match unavailable {
+                            // The palette is keyboard-first and a hover tooltip
+                            // never shows for an arrow-key selection, so the
+                            // selected disabled row spells out why in place.
+                            Some(reason) if selected => {
+                                content = content.child(
+                                    div()
+                                        .debug_selector(|| {
+                                            "command_palette_unavailable_reason".to_string()
+                                        })
+                                        .flex_none()
+                                        .text_size(theme.ui_text(12.0))
+                                        .text_color(theme.colors.foreground.secondary)
+                                        .child(reason),
+                                );
+                            }
+                            Some(_) => {}
+                            None => {
+                                if let Some(shortcut_text) = command.shortcut.label() {
+                                    content = content.child(components::shortcut_keys(
+                                        &shortcut_text,
+                                        theme,
+                                        ui_scale,
+                                    ));
+                                }
+                            }
                         }
 
-                        (
-                            content
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        this.close_and_notify_root(
-                                            Some(command_id_for_click.clone()),
-                                            window,
-                                            cx,
-                                        );
-                                    }),
-                                )
-                                .into_any_element(),
-                            self.selected_index == Some(command_index),
-                        )
+                        (content.into_any_element(), selected)
                     }
                 };
                 Some(
@@ -944,7 +1528,6 @@ impl CommandPaletteView {
                         .when(selected, |row| {
                             row.rounded_tr(px(theme.radii.row))
                                 .rounded_br(px(theme.radii.row))
-                                .bg(selected_overlay)
                                 .child(
                                     div()
                                         .absolute()
@@ -974,7 +1557,7 @@ impl Render for CommandPaletteView {
 
         let theme = self.theme;
         let ui_scale = ui_scale::UiScale::current(cx);
-        let scaled_px = |value: f32| ui_scale.px(value);
+        let scaled_px = crate::ui_scale::scaler(ui_scale);
         let palette_width = scaled_px(620.0);
         let top_offset = scaled_px(56.0);
         let input_height = scaled_px(48.0);
@@ -993,7 +1576,7 @@ impl Render for CommandPaletteView {
                 .items_center()
                 .justify_center()
                 .px(scaled_px(12.0))
-                .text_sm()
+                .text_size(theme.ui_text(14.0))
                 .text_color(theme.colors.foreground.secondary)
                 .child("No matching commands")
                 .into_any_element()
@@ -1036,12 +1619,14 @@ impl Render for CommandPaletteView {
             )
             .child(list_body);
 
-        let scrim = components::modal_scrim(theme).on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                this.close_and_notify_root(None, window, cx);
-            }),
-        );
+        let scrim = components::modal_scrim(theme)
+            .id("command_palette_scrim")
+            .on_pointer_click(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_and_notify_root(None, window, cx);
+                }),
+            );
 
         div()
             .absolute()
@@ -1105,7 +1690,102 @@ fn fuzzy_subsequence_match(label: &str, query: &str) -> Option<(i32, Vec<usize>)
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn git_annex_commands_explain_each_missing_precondition() {
+        let base = PaletteContext {
+            has_active_repo: true,
+            repo_uses_annex: true,
+            annex_initialized: true,
+            ..Default::default()
+        };
+        assert_eq!(unavailable_reason(Needs::GitAnnexInitialized, &base), None);
+        assert_eq!(
+            unavailable_reason(Needs::GitAnnexAdjusted, &base),
+            Some("Only available on a git-annex adjusted branch")
+        );
+        let uninitialized = PaletteContext {
+            annex_initialized: false,
+            ..base.clone()
+        };
+        assert_eq!(
+            unavailable_reason(Needs::GitAnnexRepo, &uninitialized),
+            None
+        );
+        assert!(unavailable_reason(Needs::GitAnnexInitialized, &uninitialized).is_some());
+        let missing = PaletteContext {
+            git_annex_missing: true,
+            ..base
+        };
+        assert!(
+            unavailable_reason(Needs::GitAnnexRepo, &missing)
+                .unwrap()
+                .contains("Install git-annex")
+        );
+    }
+
+    #[test]
+    fn annex_restage_needs_an_initialized_annex() {
+        let entry = COMMANDS
+            .iter()
+            .find(|entry| entry.id == "annex-restage")
+            .expect("palette lists the restage command");
+        assert!(matches!(entry.needs, Needs::GitAnnexInitialized));
+        assert!(entry.requires_repo);
+    }
+
+    #[test]
+    fn git_lfs_commands_explain_missing_tool_and_unused_repo() {
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            git_lfs_missing: true,
+            ..Default::default()
+        };
+        assert!(
+            unavailable_reason(Needs::GitLfsTool, &ctx)
+                .unwrap()
+                .contains("Install Git LFS")
+        );
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            ..Default::default()
+        };
+        assert_eq!(unavailable_reason(Needs::GitLfsTool, &ctx), None);
+        assert_eq!(
+            unavailable_reason(Needs::GitLfsRepo, &ctx),
+            Some("This repository does not use Git LFS")
+        );
+        let ctx = PaletteContext {
+            repo_uses_lfs: true,
+            ..ctx
+        };
+        assert_eq!(unavailable_reason(Needs::GitLfsRepo, &ctx), None);
+    }
     use super::*;
+
+    #[test]
+    fn sequencer_commands_are_unavailable_while_one_is_running() {
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            sequencer: true,
+            sequencer_busy: true,
+            ..PaletteContext::default()
+        };
+
+        for needs in [Needs::Sequencer, Needs::SequencerResolved] {
+            assert_eq!(
+                unavailable_reason(needs, &ctx),
+                Some("Wait for the running Git operation to finish"),
+                "the action bar disables these; the palette must agree"
+            );
+        }
+
+        let idle = PaletteContext {
+            sequencer_busy: false,
+            ..ctx
+        };
+        assert_eq!(unavailable_reason(Needs::Sequencer, &idle), None);
+    }
 
     #[test]
     fn keyword_matches_find_commands_their_label_no_longer_spells_out() {
@@ -1214,6 +1894,206 @@ mod tests {
         assert!(
             filtered_commands(false, "open in file explorer").is_empty(),
             "there is no file to open without a repository"
+        );
+    }
+
+    /// The unfiltered palette prints a header each time the category changes,
+    /// so a category split across the table shows its header twice. That had
+    /// happened to Navigation before this test existed.
+    #[test]
+    fn every_category_is_one_contiguous_run() {
+        let mut seen: Vec<&str> = Vec::new();
+        for command in COMMANDS {
+            if seen.last() != Some(&command.category) {
+                assert!(
+                    !seen.contains(&command.category),
+                    "{:?} is split: its entries must sit together in COMMANDS",
+                    command.category
+                );
+                seen.push(command.category);
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_reasons_follow_the_state_they_depend_on() {
+        let ctx = PaletteContext {
+            has_active_repo: true,
+            ..PaletteContext::default()
+        };
+        assert_eq!(unavailable_reason(Needs::Nothing, &ctx), None);
+        for (needs, met) in [
+            (
+                Needs::ExternalEditor,
+                PaletteContext {
+                    external_editor: true,
+                    ..ctx.clone()
+                },
+            ),
+            (
+                Needs::Merge,
+                PaletteContext {
+                    merging: true,
+                    ..ctx.clone()
+                },
+            ),
+            (
+                Needs::Sequencer,
+                PaletteContext {
+                    sequencer: true,
+                    ..ctx.clone()
+                },
+            ),
+        ] {
+            assert!(
+                unavailable_reason(needs, &ctx).is_some(),
+                "{needs:?} should be disabled without its state"
+            );
+            assert_eq!(
+                unavailable_reason(needs, &met),
+                None,
+                "{needs:?} should be enabled once its state holds"
+            );
+        }
+    }
+
+    /// Continue has a second way to be unavailable, mirroring the action bar.
+    #[test]
+    fn continue_stays_disabled_while_conflicts_remain() {
+        let sequencing = PaletteContext {
+            sequencer: true,
+            ..PaletteContext::default()
+        };
+        assert_eq!(
+            unavailable_reason(Needs::SequencerResolved, &sequencing),
+            None
+        );
+        assert_eq!(
+            unavailable_reason(
+                Needs::SequencerResolved,
+                &PaletteContext {
+                    unresolved_conflicts: true,
+                    ..sequencing
+                }
+            ),
+            Some("Resolve all conflicts before continuing")
+        );
+        assert!(unavailable_reason(Needs::SequencerResolved, &PaletteContext::default()).is_some());
+    }
+
+    #[test]
+    fn each_tag_push_mode_has_its_own_availability() {
+        let mut ctx = PaletteContext::default();
+        ctx.push_with_tags_unavailable[TagPushMode::All.index()] = Some("no remote");
+        assert_eq!(
+            unavailable_reason(Needs::PushWithTags(TagPushMode::All), &ctx),
+            Some("no remote")
+        );
+        assert_eq!(
+            unavailable_reason(Needs::PushWithTags(TagPushMode::FollowAnnotated), &ctx),
+            None
+        );
+    }
+
+    /// Asked for explicitly: platform-only commands are listed everywhere and
+    /// greyed out where they cannot run, not hidden.
+    #[test]
+    fn platform_commands_are_listed_everywhere_and_disabled_elsewhere() {
+        let ctx = PaletteContext::default();
+        assert_eq!(
+            unavailable_reason(Needs::MacOs, &ctx).is_none(),
+            cfg!(target_os = "macos")
+        );
+        assert_eq!(
+            unavailable_reason(Needs::Linux, &ctx).is_none(),
+            cfg!(any(target_os = "linux", target_os = "freebsd"))
+        );
+        let listed = filtered_commands(true, "")
+            .iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        for id in ["hide", "hide-others", "install-desktop-integration"] {
+            assert!(
+                listed.contains(&id),
+                "{id} should be listed on every platform"
+            );
+        }
+    }
+
+    #[test]
+    fn go_to_is_findable_by_its_label_and_by_its_old_reveal_wording() {
+        assert_eq!(
+            filtered_commands(true, "go to")
+                .first()
+                .map(|command| command.id),
+            Some("reveal-commit")
+        );
+        for query in ["reveal", "sha", "revision"] {
+            assert!(
+                filtered_commands(true, query)
+                    .iter()
+                    .any(|command| command.id == "reveal-commit"),
+                "{query:?} should still find Go to"
+            );
+        }
+        assert!(
+            filtered_commands(false, "go to").is_empty(),
+            "there is nothing to go to without a repository"
+        );
+    }
+
+    #[test]
+    fn open_remote_in_browser_is_findable_by_forge_words() {
+        assert_eq!(
+            filtered_commands(true, "open remote")
+                .first()
+                .map(|command| command.id),
+            Some("open-remote-in-browser")
+        );
+        for query in ["browser", "github", "gitlab", "web"] {
+            assert!(
+                filtered_commands(true, query)
+                    .iter()
+                    .any(|command| command.id == "open-remote-in-browser"),
+                "{query:?} should find Open remote in web browser"
+            );
+        }
+        assert!(
+            !filtered_commands(false, "open remote")
+                .iter()
+                .any(|command| command.id == "open-remote-in-browser"),
+            "there is no remote without a repository"
+        );
+    }
+
+    #[test]
+    fn open_remote_in_browser_shows_the_chord_it_is_bound_to() {
+        let entry = COMMANDS
+            .iter()
+            .find(|command| command.id == "open-remote-in-browser")
+            .expect("the palette offers Open remote in web browser");
+        // `bind_app_keys` binds `secondary-k`; the label is kept in sync by hand.
+        assert_eq!(entry.shortcut, Shortcut::Secondary("K"));
+        let expected = if cfg!(target_os = "macos") {
+            "Cmd+K"
+        } else {
+            "Ctrl+K"
+        };
+        assert_eq!(entry.shortcut.label().as_deref(), Some(expected));
+        assert_eq!(entry.label, crate::menu_labels::OPEN_REMOTE_IN_BROWSER);
+        assert_eq!(entry.category, "Remotes");
+        assert!(entry.requires_repo);
+        assert_eq!(entry.needs, Needs::RemoteWebPage);
+    }
+
+    #[test]
+    fn remote_web_page_need_reports_its_context_reason() {
+        let mut ctx = PaletteContext::default();
+        assert_eq!(unavailable_reason(Needs::RemoteWebPage, &ctx), None);
+        ctx.remote_web_page_unavailable = Some("Add a remote first");
+        assert_eq!(
+            unavailable_reason(Needs::RemoteWebPage, &ctx),
+            Some("Add a remote first")
         );
     }
 

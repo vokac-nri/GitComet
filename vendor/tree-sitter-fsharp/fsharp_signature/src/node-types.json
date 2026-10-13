@@ -86,6 +86,10 @@
           "named": true
         },
         {
+          "type": "class_as_reference",
+          "named": true
+        },
+        {
           "type": "conjunct_pattern",
           "named": true
         },
@@ -1715,6 +1719,10 @@
           "named": true
         },
         {
+          "type": "curried_spec",
+          "named": true
+        },
+        {
           "type": "flexible_type",
           "named": true
         },
@@ -2099,7 +2107,7 @@
     "fields": {
       "name": {
         "multiple": false,
-        "required": true,
+        "required": false,
         "types": [
           {
             "type": "identifier",
@@ -4880,6 +4888,10 @@
           {
             "type": "identifier",
             "named": true
+          },
+          {
+            "type": "op_identifier",
+            "named": true
           }
         ]
       }
@@ -4911,10 +4923,6 @@
       "multiple": true,
       "required": true,
       "types": [
-        {
-          "type": "access_modifier",
-          "named": true
-        },
         {
           "type": "anon_record_type",
           "named": true
@@ -6369,23 +6377,11 @@
           "named": true
         },
         {
-          "type": "byref_type",
-          "named": true
-        },
-        {
-          "type": "compound_type",
-          "named": true
-        },
-        {
           "type": "constrained_type",
           "named": true
         },
         {
           "type": "flexible_type",
-          "named": true
-        },
-        {
-          "type": "function_type",
           "named": true
         },
         {

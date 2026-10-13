@@ -1,6 +1,20 @@
 use super::*;
+use crate::kit::interaction as controls;
+use crate::view::components::{ControlInteractionExt, InteractionState, InteractionStyle};
+
+/// The settings window's scale, carrying the appearance so anything sized
+/// through it follows the UI zoom and the density selection.
+const SETTINGS_LICENSE_ROW_HEIGHT_PX: f32 = 24.0;
+const SETTINGS_LICENSE_ROW_COMFORTABLE_HEIGHT_PX: f32 = 32.0;
+pub(super) const SETTINGS_LICENSE_NAME_COLUMN_PX: f32 = 200.0;
+pub(super) const SETTINGS_LICENSE_VERSION_COLUMN_PX: f32 = 90.0;
+use crate::view::components::SETTINGS_NAV_COLUMN_WIDTH_PX;
 
 impl SettingsWindowView {
+    pub(super) fn row_scale(&self, theme: AppTheme) -> crate::ui_scale::UiScale {
+        crate::ui_scale::UiScale::from_percent(self.ui_scale_percent).with_appearance(theme.metrics)
+    }
+
     pub(super) fn option_row(
         &self,
         id: impl Into<SharedString>,
@@ -9,94 +23,7 @@ impl SettingsWindowView {
         selected: bool,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        let id: SharedString = id.into();
-        let debug_id = id.clone();
-        let text_color = if selected {
-            theme.colors.foreground.primary
-        } else {
-            theme.colors.foreground.secondary
-        };
-        let selected_bg = with_alpha(
-            theme.colors.accent.foreground,
-            if theme.is_dark { 0.16 } else { 0.10 },
-        );
-        let hover_bg = theme.hover_overlay();
-        let active_bg = theme.active_overlay();
-
-        div()
-            .id(id)
-            .debug_selector(move || debug_id.to_string())
-            .w_full()
-            .px_2()
-            .py_1()
-            .flex()
-            .items_start()
-            .gap_2()
-            .rounded(px(theme.radii.row))
-            .cursor(CursorStyle::PointingHand)
-            .bg(if selected {
-                selected_bg
-            } else {
-                gpui::rgba(0x00000000)
-            })
-            .hover(move |s| {
-                if selected {
-                    s.bg(selected_bg)
-                } else {
-                    s.bg(hover_bg)
-                }
-            })
-            .active(move |s| {
-                if selected {
-                    s.bg(selected_bg)
-                } else {
-                    s.bg(active_bg)
-                }
-            })
-            .child(
-                div()
-                    .w(px(16.0))
-                    // Match the label's line box so the check mark centers on
-                    // the first text line instead of hugging the row's top.
-                    .h(px(20.0))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .when(selected, |d| {
-                        d.child(svg_icon(
-                            "icons/check.svg",
-                            theme.colors.accent.foreground,
-                            px(12.0),
-                        ))
-                    }),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .flex()
-                    .flex_col()
-                    .gap_0p5()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_height(px(20.0))
-                            .text_color(text_color)
-                            .child(label.into()),
-                    )
-                    .when_some(detail, |this, detail| {
-                        this.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.colors.foreground.secondary)
-                                .line_clamp(1)
-                                .whitespace_nowrap()
-                                .overflow_hidden()
-                                .child(detail),
-                        )
-                    }),
-            )
+        components::settings_option_row(id, label, detail, selected, theme, self.row_scale(theme))
     }
 
     pub(super) fn setting_option_row(
@@ -122,6 +49,7 @@ impl SettingsWindowView {
         selected: bool,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
+        let ui_scale = self.row_scale(theme);
         let id: SharedString = id.into();
         let debug_id = id.clone();
         let text_color = if selected {
@@ -133,43 +61,26 @@ impl SettingsWindowView {
             theme.colors.accent.foreground,
             if theme.is_dark { 0.16 } else { 0.10 },
         );
-        let hover_bg = theme.hover_overlay();
-        let active_bg = theme.active_overlay();
 
         div()
             .id(id)
             .debug_selector(move || debug_id.to_string())
             .w_full()
-            .min_h(px(SETTINGS_DROPDOWN_DENSE_DETAIL_ROW_HEIGHT_PX))
+            .min_h(ui_scale.px(SETTINGS_DROPDOWN_DENSE_DETAIL_ROW_HEIGHT_PX))
             .px_2()
-            .py(px(2.0))
+            .py(ui_scale.px(2.0))
             .flex()
             .items_center()
             .gap_2()
             .rounded(px(theme.radii.row))
             .cursor(CursorStyle::PointingHand)
-            .bg(if selected {
-                selected_bg
-            } else {
-                gpui::rgba(0x00000000)
-            })
-            .hover(move |s| {
-                if selected {
-                    s.bg(selected_bg)
-                } else {
-                    s.bg(hover_bg)
-                }
-            })
-            .active(move |s| {
-                if selected {
-                    s.bg(selected_bg)
-                } else {
-                    s.bg(active_bg)
-                }
-            })
+            .control_interaction(
+                InteractionStyle::new(theme),
+                InteractionState::default().selected(selected, selected_bg),
+            )
             .child(
                 div()
-                    .w(px(16.0))
+                    .w(ui_scale.px(16.0))
                     .flex()
                     .items_center()
                     .justify_center()
@@ -177,7 +88,7 @@ impl SettingsWindowView {
                         d.child(svg_icon(
                             "icons/check.svg",
                             theme.colors.accent.foreground,
-                            px(12.0),
+                            ui_scale.px(12.0),
                         ))
                     }),
             )
@@ -190,7 +101,7 @@ impl SettingsWindowView {
                     .gap_2()
                     .child(
                         div()
-                            .text_sm()
+                            .text_size(theme.ui_text(14.0))
                             .text_color(text_color)
                             .line_clamp(1)
                             .whitespace_nowrap()
@@ -201,7 +112,7 @@ impl SettingsWindowView {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_xs()
+                            .text_size(theme.ui_text(12.0))
                             .text_color(theme.colors.foreground.secondary)
                             .line_clamp(1)
                             .whitespace_nowrap()
@@ -219,7 +130,7 @@ impl SettingsWindowView {
             .min_h(px(0.0))
             .px_2()
             .py_1()
-            .text_sm()
+            .text_size(theme.ui_text(14.0))
             .text_color(theme.colors.foreground.secondary)
             .child(message)
             .into_any_element()
@@ -283,18 +194,7 @@ impl SettingsWindowView {
         container_id: &'static str,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        div()
-            .id(container_id)
-            .debug_selector(move || container_id.to_string())
-            .w_full()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .rounded(px(theme.radii.row))
-            .border_1()
-            .border_color(settings_dropdown_border_color(theme))
-            .bg(settings_dropdown_background(theme))
-            .overflow_hidden()
+        components::settings_detail_container(container_id, theme)
     }
 
     pub(super) fn summary_row(
@@ -305,69 +205,28 @@ impl SettingsWindowView {
         expanded: bool,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        let label_debug_id = format!("{id}_label");
-        let value_debug_id = format!("{id}_value");
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .px_2()
-            .pt_1()
-            .pb_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(theme.radii.row))
-            .border_b_1()
-            .border_color(settings_row_separator_color(theme))
-            .cursor(CursorStyle::PointingHand)
-            .overflow_hidden()
-            .hover(move |s| s.bg(theme.colors.interaction.hover_background))
-            .active(move |s| s.bg(theme.colors.interaction.pressed_background))
-            .child(
-                div()
-                    .debug_selector(move || label_debug_id.clone())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(label),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(move || value_debug_id.clone())
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.colors.foreground.secondary)
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(value),
-                    )
-                    .child(div().flex_shrink_0().child(svg_icon(
-                        if expanded {
-                            "icons/chevron_down.svg"
-                        } else {
-                            "icons/arrow_right.svg"
-                        },
-                        theme.colors.foreground.secondary,
-                        px(12.0),
-                    ))),
-            )
+        self.summary_row_with_value_prefix(id, label, None, value, expanded, theme)
+    }
+
+    /// A summary row whose value leads with a small visual, such as a theme orb.
+    pub(super) fn summary_row_with_value_prefix(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        prefix: Option<AnyElement>,
+        value: SharedString,
+        expanded: bool,
+        theme: AppTheme,
+    ) -> Stateful<gpui::Div> {
+        components::settings_summary_row_with_value_prefix(
+            id,
+            label,
+            prefix,
+            value,
+            expanded,
+            theme,
+            self.row_scale(theme),
+        )
     }
 
     pub(super) fn toggle_row(
@@ -377,132 +236,106 @@ impl SettingsWindowView {
         enabled: bool,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        let label_debug_id = format!("{id}_label");
-        let value_debug_id = format!("{id}_value");
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .px_2()
-            .pt_1()
-            .pb_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(theme.radii.row))
-            .border_b_1()
-            .border_color(settings_row_separator_color(theme))
-            .cursor(CursorStyle::PointingHand)
-            .overflow_hidden()
-            .hover(move |s| s.bg(theme.colors.interaction.hover_background))
-            .active(move |s| s.bg(theme.colors.interaction.pressed_background))
-            .child(
-                div()
-                    .debug_selector(move || label_debug_id.clone())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(label),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(move || value_debug_id.clone())
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .child(
-                        // Toggle-switch visual; the whole row stays the click
-                        // target, so this carries no handlers of its own.
-                        div()
-                            .w(px(28.0))
-                            .h(px(16.0))
-                            .rounded(px(theme.radii.pill))
-                            .flex()
-                            .items_center()
-                            .p(px(2.0))
-                            .when(enabled, |track| {
-                                track.justify_end().bg(theme.colors.accent.foreground)
-                            })
-                            .when(!enabled, |track| {
-                                track.justify_start().bg(with_alpha(
-                                    theme.colors.foreground.secondary,
-                                    if theme.is_dark { 0.35 } else { 0.30 },
-                                ))
-                            })
-                            .child(
-                                div()
-                                    .size(px(12.0))
-                                    .rounded(px(theme.radii.pill))
-                                    .bg(gpui::rgba(0xFFFFFFF2)),
-                            ),
-                    ),
-            )
+        components::settings_toggle_row(id, label, enabled, theme, self.row_scale(theme))
     }
 
     pub(super) fn info_row(
         &self,
-        id: &'static str,
+        id: impl Into<SharedString>,
         label: &'static str,
-        value: SharedString,
+        value: impl IntoElement,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        let label_debug_id = format!("{id}_label");
-        let value_debug_id = format!("{id}_value");
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .px_2()
-            .pt_1()
-            .pb_3()
-            .flex()
-            .items_center()
-            .gap_2()
-            .border_b_1()
-            .border_color(settings_row_separator_color(theme))
-            .overflow_hidden()
-            .child(
+        components::settings_info_row(id, label, value, theme)
+    }
+
+    /// Environment rows hold read-only fields so their values can be selected.
+    pub(super) fn environment_card(
+        &mut self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let copy_button = components::Button::new("settings_window_copy_environment", "Copy")
+            .style(components::ButtonStyle::Outlined)
+            .start_slot(svg_icon(
+                "icons/copy.svg",
+                theme.colors.foreground.secondary,
+                self.row_scale(theme).px(12.0),
+            ))
+            .on_click(theme, cx, |this, _, window, cx| {
+                this.copy_environment_details(window, cx);
+            });
+        let mut card = self.card_with_action(
+            "settings_window_environment",
+            "Environment",
+            copy_button,
+            theme,
+        );
+        let mut shown = FxHashSet::default();
+        for (index, section) in self
+            .runtime_info
+            .environment
+            .sections()
+            .into_iter()
+            .enumerate()
+        {
+            card = card.child(
                 div()
-                    .debug_selector(move || label_debug_id.clone())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(label),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(move || value_debug_id.clone())
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_center()
-                    .justify_end()
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .min_w(px(0.0))
-                            .text_sm()
-                            .font_family(UI_MONOSPACE_FONT_FAMILY)
-                            .text_color(theme.colors.foreground.secondary)
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child(value),
-                    ),
-            )
+                    .px_2()
+                    .pt_3()
+                    .pb_2()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(section.title),
+            );
+            for row in section.rows {
+                let id: SharedString = if index == 0 {
+                    format!("settings_window_{}", row.key)
+                } else {
+                    format!("settings_window_{}_{}", row.key, index)
+                }
+                .into();
+                let input = self.environment_value_input(id.clone(), row.value, theme, cx);
+                shown.insert(id.clone());
+                card = card.child(self.info_row(id, row.label, input, theme));
+            }
+        }
+        // Graphics sections follow the open windows.
+        self.environment_value_inputs
+            .retain(|id, _| shown.contains(id));
+        card
+    }
+
+    fn environment_value_input(
+        &mut self,
+        id: SharedString,
+        value: String,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> Entity<components::TextInput> {
+        let input = self
+            .environment_value_inputs
+            .entry(id)
+            .or_insert_with(|| {
+                cx.new(|cx| {
+                    let mut input = components::TextInput::new_inert(
+                        components::TextInputOptions {
+                            read_only: true,
+                            chromeless: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    );
+                    input.set_display_text(cx);
+                    input.set_display_truncation(Some(components::TextTruncationProfile::End), cx);
+                    input
+                })
+            })
+            .clone();
+        input.update(cx, |input, cx| {
+            input.set_theme(theme, cx);
+            input.set_text(value, cx);
+        });
+        input
     }
 
     pub(super) fn link_row(
@@ -512,49 +345,7 @@ impl SettingsWindowView {
         value: SharedString,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        let label_debug_id = format!("{id}_label");
-        let value_debug_id = format!("{id}_value");
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .px_2()
-            .pt_1()
-            .pb_3()
-            .flex()
-            .flex_col()
-            .items_stretch()
-            .gap_0p5()
-            .rounded(px(theme.radii.row))
-            .border_b_1()
-            .border_color(settings_row_separator_color(theme))
-            .cursor(CursorStyle::PointingHand)
-            .hover(move |s| s.bg(theme.colors.interaction.hover_background))
-            .active(move |s| s.bg(theme.colors.interaction.pressed_background))
-            .child(
-                div()
-                    .debug_selector(move || label_debug_id.clone())
-                    .min_w(px(0.0))
-                    .text_sm()
-                    .child(label),
-            )
-            .child(
-                div()
-                    .debug_selector(move || value_debug_id.clone())
-                    .w_full()
-                    .min_w(px(0.0))
-                    .flex()
-                    .items_start()
-                    .gap_2()
-                    .text_sm()
-                    .text_color(theme.colors.accent.foreground)
-                    .child(div().flex_1().min_w(px(0.0)).child(value))
-                    .child(div().flex_shrink_0().child(svg_icon(
-                        "icons/open_external.svg",
-                        theme.colors.accent.foreground,
-                        px(13.0),
-                    ))),
-            )
+        components::settings_link_row(id, label, value, theme, self.row_scale(theme))
     }
 
     /// One row per theme file the loader refused, named and with its reason.
@@ -563,8 +354,12 @@ impl SettingsWindowView {
     /// app falls back to a bundled theme, and the account of why only ever
     /// reaches stderr. After a schema break every custom theme in the folder is
     /// rejected at once, and "my theme is gone" has to be answerable from here.
-    pub(super) fn rejected_theme_rows(&self, theme: AppTheme) -> Vec<AnyElement> {
-        crate::theme::runtime_theme_issues()
+    pub(super) fn rejected_theme_rows(
+        &self,
+        issues: &[crate::theme::RuntimeThemeIssue],
+        theme: AppTheme,
+    ) -> Vec<AnyElement> {
+        issues
             .iter()
             .enumerate()
             .map(|(ix, issue)| {
@@ -595,11 +390,11 @@ impl SettingsWindowView {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .text_sm()
+                            .text_size(theme.ui_text(14.0))
                             .child(svg_icon(
                                 "icons/warning.svg",
                                 theme.colors.status.warning.foreground,
-                                px(13.0),
+                                self.row_scale(theme).px(13.0),
                             ))
                             .child(div().flex_1().min_w(px(0.0)).child(name)),
                     )
@@ -607,7 +402,7 @@ impl SettingsWindowView {
                         div()
                             .w_full()
                             .min_w(px(0.0))
-                            .text_sm()
+                            .text_size(theme.ui_text(14.0))
                             .text_color(theme.colors.foreground.secondary)
                             .child(message),
                     )
@@ -617,12 +412,17 @@ impl SettingsWindowView {
     }
 
     pub(super) fn git_runtime_row(&self, theme: AppTheme) -> Stateful<gpui::Div> {
-        let min_git_version = format!("{MIN_GIT_MAJOR}.{MIN_GIT_MINOR}");
+        let min_git_version = gitcomet_core::process::GitVersion::MINIMUM;
         let (git_icon_path, git_icon_color, git_status_text): (
             &'static str,
             gpui::Rgba,
             SharedString,
         ) = match self.runtime_info.git.compatibility {
+            GitCompatibility::Checking => (
+                "icons/question.svg",
+                theme.colors.foreground.secondary,
+                "Checking...".into(),
+            ),
             GitCompatibility::Supported => (
                 "icons/check.svg",
                 theme.colors.status.success.foreground,
@@ -645,68 +445,159 @@ impl SettingsWindowView {
             ),
         };
 
+        self.runtime_tool_row(
+            "settings_window_git_runtime",
+            "Git",
+            None,
+            Some((git_icon_path, git_icon_color)),
+            self.runtime_info.git.version_display.clone(),
+            (git_status_text, git_icon_color),
+            theme,
+        )
+    }
+
+    pub(super) fn signing_tool_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        description: &'static str,
+        info: &SigningToolInfo,
+        theme: AppTheme,
+    ) -> Stateful<gpui::Div> {
+        let (icon, status_color, status_text) = match info.status {
+            SigningToolStatus::Found => (
+                Some("icons/check.svg"),
+                theme.colors.status.success.foreground,
+                "Found",
+            ),
+            SigningToolStatus::NotFound => (
+                Some("icons/warning.svg"),
+                theme.colors.status.warning.foreground,
+                "Not found",
+            ),
+            SigningToolStatus::Unknown => (
+                Some("icons/warning.svg"),
+                theme.colors.foreground.secondary,
+                "Unknown",
+            ),
+            SigningToolStatus::NotChecked => {
+                (None, theme.colors.foreground.secondary, "Not checked")
+            }
+            SigningToolStatus::Detecting => (None, theme.colors.foreground.secondary, "Detecting…"),
+        };
+
+        self.runtime_tool_row(
+            id,
+            label,
+            Some(description),
+            icon.map(|icon| (icon, status_color)),
+            info.version_display.clone(),
+            (status_text.into(), status_color),
+            theme,
+        )
+    }
+
+    /// One detected executable, stacked so narrow windows never squeeze it: the
+    /// program name and its status, then the detected version, then why GitComet
+    /// needs the program.
+    fn runtime_tool_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        description: Option<&'static str>,
+        icon: Option<(&'static str, gpui::Rgba)>,
+        version_display: SharedString,
+        (status_text, status_color): (SharedString, gpui::Rgba),
+        theme: AppTheme,
+    ) -> Stateful<gpui::Div> {
         div()
-            .id("settings_window_git_runtime")
-            .debug_selector(|| "settings_window_git_runtime".to_string())
+            .id(id)
+            .debug_selector(move || id.to_string())
             .w_full()
             .px_2()
             .pt_1()
             .pb_3()
             .flex()
-            .items_center()
-            .gap_2()
+            .flex_col()
+            .gap_1()
             .overflow_hidden()
             .child(
                 div()
-                    .debug_selector(|| "settings_window_git_runtime_label".to_string())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .text_sm()
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
-                            .child("Detected runtime"),
-                    ),
-            )
-            .child(
-                div()
-                    .debug_selector(|| "settings_window_git_runtime_value".to_string())
+                    .w_full()
                     .min_w(px(0.0))
                     .flex()
                     .items_center()
-                    .justify_end()
                     .gap_2()
-                    .overflow_hidden()
-                    .child(svg_icon(git_icon_path, git_icon_color, px(14.0)))
                     .child(
                         div()
+                            .debug_selector(move || format!("{id}_label"))
+                            .flex_1()
                             .min_w(px(0.0))
-                            .text_sm()
-                            .font_family(UI_MONOSPACE_FONT_FAMILY)
-                            .text_color(theme.colors.foreground.secondary)
+                            .text_size(theme.ui_text(14.0))
                             .line_clamp(1)
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .child(self.runtime_info.git.version_display.clone()),
+                            .child(label),
                     )
                     .child(
                         div()
-                            .min_w(px(0.0))
-                            .text_xs()
-                            .text_color(git_icon_color)
-                            .line_clamp(1)
-                            .whitespace_nowrap()
-                            .overflow_hidden()
+                            .debug_selector(move || format!("{id}_status"))
                             .flex_shrink_0()
-                            .child(git_status_text),
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .when_some(icon, |this, (path, color)| {
+                                this.child(svg_icon(path, color, self.row_scale(theme).px(14.0)))
+                            })
+                            .child(
+                                div()
+                                    .text_size(theme.ui_text(12.0))
+                                    .text_color(status_color)
+                                    .whitespace_nowrap()
+                                    .child(status_text),
+                            ),
                     ),
             )
+            .when(!version_display.is_empty(), |this| {
+                this.child(
+                    div()
+                        .debug_selector(move || format!("{id}_value"))
+                        .w_full()
+                        .min_w(px(0.0))
+                        .text_size(theme.ui_text(14.0))
+                        .font_family(UI_MONOSPACE_FONT_FAMILY)
+                        .text_color(theme.colors.foreground.secondary)
+                        .child(version_display),
+                )
+            })
+            .when_some(description, |this, description| {
+                this.child(
+                    div()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .text_size(theme.ui_text(12.0))
+                        .text_color(theme.colors.foreground.secondary)
+                        .child(description),
+                )
+            })
     }
 
-    pub(super) fn overflow_probe_content(&self, theme: AppTheme) -> Stateful<gpui::Div> {
+    pub(super) fn overflow_probe_content(
+        &mut self,
+        theme: AppTheme,
+        cx: &mut gpui::Context<Self>,
+    ) -> Stateful<gpui::Div> {
+        let info_value = self.environment_value_input(
+            "settings_window_overflow_info".into(),
+            self.runtime_info
+                .environment
+                .system
+                .operating_system
+                .clone()
+                .unwrap_or_default(),
+            theme,
+            cx,
+        );
         div()
             .id("settings_window_overflow_probe_view")
             .w_full()
@@ -736,7 +627,7 @@ impl SettingsWindowView {
                     .child(self.info_row(
                         "settings_window_overflow_info",
                         "Deliberately long info label for overflow coverage",
-                        self.runtime_info.operating_system.clone(),
+                        info_value,
                         theme,
                     ))
                     .child(self.link_row(
@@ -746,7 +637,14 @@ impl SettingsWindowView {
                             .into(),
                         theme,
                     ))
-                    .child(self.git_runtime_row(theme)),
+                    .child(self.git_runtime_row(theme))
+                    .child(self.signing_tool_row(
+                        "settings_window_gpg_runtime",
+                        "GPG",
+                        GPG_DESCRIPTION,
+                        &gpg_info(self.runtime_info.signing_tools.as_ref()),
+                        theme,
+                    )),
             )
     }
 
@@ -756,16 +654,20 @@ impl SettingsWindowView {
         row: crate::view::open_source_licenses_data::OpenSourceLicenseRow,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
+        let ui_scale = self.row_scale(theme);
         div()
             .id(("settings_window_open_source_license_row", ix))
             .w_full()
             .px_2()
             .py_1()
-            .h(px(24.0))
+            .h(ui_scale.row_height(
+                SETTINGS_LICENSE_ROW_HEIGHT_PX,
+                SETTINGS_LICENSE_ROW_COMFORTABLE_HEIGHT_PX,
+            ))
             .flex()
             .items_center()
             .rounded(px(theme.radii.row))
-            .hover(move |s| s.bg(theme.colors.interaction.hover_background))
+            .control_interaction(InteractionStyle::new(theme), InteractionState::default())
             .child(
                 div()
                     .flex()
@@ -773,8 +675,8 @@ impl SettingsWindowView {
                     .gap_2()
                     .child(
                         div()
-                            .w(px(200.0))
-                            .text_sm()
+                            .w(ui_scale.px(SETTINGS_LICENSE_NAME_COLUMN_PX))
+                            .text_size(theme.ui_text(14.0))
                             .line_clamp(1)
                             .whitespace_nowrap()
                             .overflow_hidden()
@@ -782,8 +684,8 @@ impl SettingsWindowView {
                     )
                     .child(
                         div()
-                            .w(px(90.0))
-                            .text_xs()
+                            .w(ui_scale.px(SETTINGS_LICENSE_VERSION_COLUMN_PX))
+                            .text_size(theme.ui_text(12.0))
                             .font_family(UI_MONOSPACE_FONT_FAMILY)
                             .text_color(theme.colors.foreground.secondary)
                             .whitespace_nowrap()
@@ -793,7 +695,7 @@ impl SettingsWindowView {
                         div()
                             .flex_1()
                             .min_w(px(0.0))
-                            .text_xs()
+                            .text_size(theme.ui_text(12.0))
                             .font_family(UI_MONOSPACE_FONT_FAMILY)
                             .text_color(theme.colors.foreground.secondary)
                             .line_clamp(1)
@@ -844,35 +746,13 @@ impl SettingsWindowView {
                     this.ui_font_family == family,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_ui_font_family(family.clone(), cx);
-                }))
-                .into_any_element()
-            })
-            .collect()
-    }
-
-    pub(super) fn render_theme_option_rows(
-        this: &mut Self,
-        range: Range<usize>,
-        _window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) -> Vec<AnyElement> {
-        let theme = this.theme;
-        let modes = settings_theme_mode_options();
-        range
-            .filter_map(|ix| modes.get(ix).cloned())
-            .map(|(mode, label)| {
-                this.option_row(
-                    format!("settings_window_theme_{}", mode.key()),
-                    label,
-                    None,
-                    this.theme_mode == mode,
-                    theme,
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_ui_font_family(family.clone(), cx);
+                    }),
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
-                    this.set_theme_mode(mode.clone(), window, cx);
-                }))
                 .into_any_element()
             })
             .collect()
@@ -900,9 +780,13 @@ impl SettingsWindowView {
                     this.editor_font_family == family,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_editor_font_family(family.clone(), cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_editor_font_family(family.clone(), cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -938,19 +822,31 @@ impl SettingsWindowView {
                 );
                 match option.kind {
                     crate::external_editor::ExternalEditorOptionKind::None => row
-                        .on_click(cx.listener(|this, _e: &ClickEvent, _window, cx| {
-                            this.set_external_editor_setting(None, cx);
-                        }))
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Action,
+                            cx.listener(|this, _e: &ClickEvent, _window, cx| {
+                                this.set_external_editor_setting(None, cx);
+                            }),
+                        )
                         .into_any_element(),
                     crate::external_editor::ExternalEditorOptionKind::Detected(setting) => row
-                        .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                            this.set_external_editor_setting(Some(setting.clone()), cx);
-                        }))
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Action,
+                            cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                                this.set_external_editor_setting(Some(setting.clone()), cx);
+                            }),
+                        )
                         .into_any_element(),
                     crate::external_editor::ExternalEditorOptionKind::Custom => row
-                        .on_click(cx.listener(|this, _e: &ClickEvent, _window, cx| {
-                            this.select_custom_external_editor(cx);
-                        }))
+                        .on_activate(
+                            false,
+                            controls::ControlActivation::Action,
+                            cx.listener(|this, _e: &ClickEvent, _window, cx| {
+                                this.select_custom_external_editor(cx);
+                            }),
+                        )
                         .into_any_element(),
                 }
             })
@@ -984,9 +880,13 @@ impl SettingsWindowView {
                     this.date_time_format == format,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_date_time_format(format, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_date_time_format(format, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1014,9 +914,13 @@ impl SettingsWindowView {
                     this.timezone == timezone,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_timezone(timezone, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_timezone(timezone, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1039,9 +943,100 @@ impl SettingsWindowView {
                     this.change_tracking_view == option,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_change_tracking_view(option, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_change_tracking_view(option, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn render_file_list_layout_option_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = this.theme;
+        range
+            .filter_map(|ix| FILE_LIST_LAYOUT_OPTIONS.get(ix).copied())
+            .map(|(id, option, detail)| {
+                this.option_row(
+                    id,
+                    option.label(),
+                    Some(detail.into()),
+                    this.file_list_layout == option,
+                    theme,
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_file_list_layout(option, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn render_file_list_sort_option_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = this.theme;
+        range
+            .filter_map(|ix| FILE_LIST_SORT_OPTIONS.get(ix).copied())
+            .map(|(id, option, detail)| {
+                this.option_row(
+                    id,
+                    option.label(),
+                    Some(detail.into()),
+                    this.file_list_sort == option,
+                    theme,
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_file_list_sort(option, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn render_diff_tab_size_option_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = this.theme;
+        range
+            .filter_map(|ix| DIFF_TAB_SIZE_OPTIONS.get(ix).copied())
+            .map(|(id, size)| {
+                this.option_row(
+                    id,
+                    format!("{size} spaces"),
+                    None,
+                    this.diff_tab_size == size,
+                    theme,
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_diff_tab_size(size, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1064,9 +1059,13 @@ impl SettingsWindowView {
                     this.diff_scroll_sync == option,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_diff_scroll_sync(option, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_diff_scroll_sync(option, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1089,9 +1088,13 @@ impl SettingsWindowView {
                     this.diff_view_mode == option,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_diff_view_mode(option, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_diff_view_mode(option, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1114,9 +1117,71 @@ impl SettingsWindowView {
                     this.diff_content_mode == option,
                     theme,
                 )
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
-                    this.set_diff_content_mode(option, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_diff_content_mode(option, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn render_remote_markdown_image_option_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = this.theme;
+        range
+            .filter_map(|ix| REMOTE_MARKDOWN_IMAGE_OPTIONS.get(ix).copied())
+            .map(|(id, option, detail)| {
+                this.option_row(
+                    id,
+                    option.settings_label(),
+                    Some(detail.into()),
+                    this.remote_markdown_image_policy == option,
+                    theme,
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.set_remote_markdown_image_policy(option, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect()
+    }
+
+    pub(super) fn render_remote_protocol_option_rows(
+        this: &mut Self,
+        range: Range<usize>,
+        _window: &mut Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> Vec<AnyElement> {
+        let theme = this.theme;
+        range
+            .filter_map(|ix| REMOTE_PROTOCOL_OPTIONS.get(ix).copied())
+            .map(|(id, protocol, label, detail)| {
+                this.option_row(
+                    id,
+                    label,
+                    Some(detail.into()),
+                    this.remote_url_policy.allows(protocol),
+                    theme,
+                )
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Action,
+                    cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+                        this.toggle_remote_protocol(protocol, cx);
+                    }),
+                )
                 .into_any_element()
             })
             .collect()
@@ -1128,23 +1193,18 @@ impl SettingsWindowView {
         title: &'static str,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .min_w(px(0.0))
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .px_2()
-                    .pb_2()
-                    .text_lg()
-                    .font_weight(FontWeight::BOLD)
-                    .text_color(theme.colors.foreground.primary)
-                    .child(title),
-            )
+        components::settings_card(id, title, theme)
+    }
+
+    /// A card whose title row ends in one compact action.
+    pub(super) fn card_with_action(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        action: impl IntoElement,
+        theme: AppTheme,
+    ) -> Stateful<gpui::Div> {
+        components::settings_card_with_action(id, title, action, theme)
     }
 
     pub(super) fn subsection_heading(
@@ -1153,17 +1213,7 @@ impl SettingsWindowView {
         title: &'static str,
         theme: AppTheme,
     ) -> Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .debug_selector(move || id.to_string())
-            .w_full()
-            .px_2()
-            .pt(px(24.0))
-            .pb_2()
-            .text_sm()
-            .font_weight(FontWeight::BOLD)
-            .text_color(theme.colors.foreground.primary)
-            .child(title)
+        components::settings_subsection_heading(id, title, theme, self.row_scale(theme))
     }
 
     pub(super) fn settings_nav_item(
@@ -1173,49 +1223,21 @@ impl SettingsWindowView {
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
     ) -> Stateful<gpui::Div> {
-        let icon_color = if selected {
-            theme.colors.accent.foreground
-        } else {
-            theme.colors.foreground.secondary
-        };
-        div()
-            .id(category.nav_id())
-            .debug_selector(move || category.nav_id().to_string())
-            .w_full()
-            .px_2()
-            .py_1()
-            .flex()
-            .items_center()
-            .gap_2()
-            .rounded(px(theme.radii.row))
-            .cursor(CursorStyle::PointingHand)
-            .overflow_hidden()
-            .when(selected, |d| {
-                d.bg(theme.colors.interaction.pressed_background)
-            })
-            .when(!selected, |d| {
-                d.hover(move |s| s.bg(theme.colors.interaction.hover_background))
-            })
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .child(svg_icon(category.icon(), icon_color, px(15.0))),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_sm()
-                    .when(selected, |d| d.font_weight(FontWeight::MEDIUM))
-                    .text_color(theme.colors.foreground.primary)
-                    .line_clamp(1)
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .child(category.label()),
-            )
-            .on_click(cx.listener(move |this, _e: &ClickEvent, _window, cx| {
+        components::settings_nav_item(
+            category.nav_id(),
+            category.icon(),
+            category.label(),
+            selected,
+            theme,
+            self.row_scale(theme),
+        )
+        .on_activate(
+            false,
+            controls::ControlActivation::Action,
+            cx.listener(move |this, _e: &ClickEvent, _window, cx| {
                 this.select_category(category, cx);
-            }))
+            }),
+        )
     }
 
     pub(super) fn render_settings_nav(
@@ -1239,20 +1261,29 @@ impl SettingsWindowView {
             .gap(px(1.0));
 
         let mut any_match = false;
+        let extension_selected = self.extension_page.is_some();
         for category in SettingsCategory::ALL.iter().copied() {
             if !category.matches_query(&query) {
                 continue;
             }
             any_match = true;
-            list = list.child(self.settings_nav_item(category, category == active, theme, cx));
+            list = list.child(self.settings_nav_item(
+                category,
+                !extension_selected && category == active,
+                theme,
+                cx,
+            ));
         }
+        let extension_items = self.extension_nav_items(&query, theme, cx);
+        any_match |= !extension_items.is_empty();
+        list = list.children(extension_items);
 
         if !any_match {
             list = list.child(
                 div()
                     .px_2()
                     .py_1()
-                    .text_sm()
+                    .text_size(theme.ui_text(14.0))
                     .text_color(theme.colors.foreground.secondary)
                     .child("No matching settings"),
             );
@@ -1262,7 +1293,7 @@ impl SettingsWindowView {
             .id("settings_window_nav")
             .debug_selector(|| "settings_window_nav".to_string())
             .flex_none()
-            .w(px(200.0))
+            .w(self.row_scale(theme).px(SETTINGS_NAV_COLUMN_WIDTH_PX))
             .h_full()
             .min_h(px(0.0))
             .flex()

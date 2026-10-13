@@ -2,6 +2,7 @@ use super::*;
 use gitcomet_core::domain::{
     Branch, CommitDetails, CommitId, LogPage, ReflogEntry, RepoSpec, RepoStatus, StashEntry,
 };
+use gitcomet_core::error::{GitFailure, GitFailureId};
 use gitcomet_core::path_utils::canonicalize_or_original;
 use gitcomet_core::services::{CommandOutput, PullMode};
 use gitcomet_state::model::Loadable;
@@ -28,6 +29,8 @@ pub(super) struct TrackingRepo {
     spec: RepoSpec,
     branches: Arc<Mutex<Vec<String>>>,
     current_branch: Arc<Mutex<String>>,
+    worktrees: Arc<Mutex<Vec<gitcomet_core::domain::Worktree>>>,
+    create_attempts: Arc<Mutex<Vec<String>>>,
     actions: Arc<Mutex<Vec<String>>>,
 }
 
@@ -37,8 +40,34 @@ impl TrackingRepo {
             spec: RepoSpec { workdir },
             branches: Arc::new(Mutex::new(vec!["main".to_string()])),
             current_branch: Arc::new(Mutex::new("main".to_string())),
+            worktrees: Arc::new(Mutex::new(Vec::new())),
+            create_attempts: Arc::new(Mutex::new(Vec::new())),
             actions: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    fn add_branch(&self, name: &str) {
+        let mut branches = self
+            .branches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !branches.iter().any(|branch| branch == name) {
+            branches.push(name.to_string());
+        }
+    }
+
+    fn set_worktrees(&self, worktrees: Vec<gitcomet_core::domain::Worktree>) {
+        *self
+            .worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = worktrees;
+    }
+
+    fn create_attempts(&self) -> Vec<String> {
+        self.create_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(super) fn actions(&self) -> Vec<String> {
@@ -58,11 +87,11 @@ impl GitRepository for TrackingRepo {
         &self,
         _limit: usize,
         _cursor: Option<&gitcomet_core::domain::LogCursor>,
-    ) -> Result<LogPage> {
-        Ok(LogPage {
+    ) -> Result<std::sync::Arc<LogPage>> {
+        Ok(std::sync::Arc::new(LogPage {
             commits: Vec::new(),
             next_cursor: None,
-        })
+        }))
     }
 
     fn commit_details(&self, _id: &CommitId) -> Result<CommitDetails> {
@@ -117,7 +146,28 @@ impl GitRepository for TrackingRepo {
         )))
     }
 
-    fn create_branch(&self, name: &str, _target: &CommitId) -> Result<()> {
+    fn create_branch(&self, name: &str, target: &CommitId) -> Result<()> {
+        self.create_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!("{name}@{}", target.as_ref()));
+        if self
+            .branches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|branch| branch == name)
+        {
+            return Err(Error::new(ErrorKind::Git(GitFailure::new(
+                "git branch",
+                GitFailureId::BranchAlreadyExists,
+                Some(128),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("a branch named '{name}' already exists")),
+            ))));
+        }
+
         self.actions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -130,6 +180,26 @@ impl GitRepository for TrackingRepo {
         if !branches.iter().any(|branch| branch == name) {
             branches.push(name.to_string());
         }
+        Ok(())
+    }
+
+    fn create_branch_force_and_checkout(&self, name: &str, _target: &CommitId) -> Result<()> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!("force-create-and-checkout:{name}"));
+
+        let mut branches = self
+            .branches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !branches.iter().any(|branch| branch == name) {
+            branches.push(name.to_string());
+        }
+        *self
+            .current_branch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = name.to_string();
         Ok(())
     }
 
@@ -154,16 +224,93 @@ impl GitRepository for TrackingRepo {
         Ok(())
     }
 
+    fn checkout_remote_branch(
+        &self,
+        remote: &str,
+        branch: &str,
+        local_branch: &str,
+        mode: CheckoutRemoteBranchMode,
+    ) -> Result<()> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!(
+                "checkout-remote:{remote}/{branch}:{local_branch}:{mode:?}"
+            ));
+        *self
+            .current_branch
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = local_branch.to_string();
+        Ok(())
+    }
+
     fn checkout_commit(&self, _id: &CommitId) -> Result<()> {
         Ok(())
+    }
+
+    fn rename_branch(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!("rename:{old_name}:{new_name}"));
+        let mut branches = self
+            .branches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if branches.iter().any(|branch| branch == new_name) {
+            return Err(Error::new(ErrorKind::Git(GitFailure::new(
+                "git branch -m",
+                GitFailureId::BranchAlreadyExists,
+                Some(128),
+                Vec::new(),
+                Vec::new(),
+                Some(format!("a branch named '{new_name}' already exists")),
+            ))));
+        }
+        branches.retain(|branch| branch != old_name);
+        branches.push(new_name.to_string());
+        Ok(())
+    }
+
+    fn rename_branch_force(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!("rename-force:{old_name}:{new_name}"));
+        let mut branches = self
+            .branches
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        branches.retain(|branch| branch != old_name && branch != new_name);
+        branches.push(new_name.to_string());
+        Ok(())
+    }
+
+    fn list_worktrees(&self) -> Result<Vec<gitcomet_core::domain::Worktree>> {
+        Ok(self
+            .worktrees
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone())
     }
 
     fn cherry_pick(&self, _id: &CommitId) -> Result<()> {
         Ok(())
     }
 
-    fn revert(&self, _id: &CommitId) -> Result<()> {
-        Ok(())
+    fn interactive_cherry_pick_with_output(
+        &self,
+        entries: &[gitcomet_core::services::InteractiveRebaseEntry],
+        commit: bool,
+    ) -> Result<CommandOutput> {
+        self.actions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(format!(
+                "interactive-cherry-pick:{}:commit={commit}",
+                entries.len()
+            ));
+        Ok(CommandOutput::empty_success("git cherry-pick"))
     }
 
     fn stash_create(&self, message: &str, include_untracked: bool) -> Result<()> {
@@ -271,6 +418,28 @@ pub(super) fn wait_until(description: &str, ready: impl Fn() -> bool) {
     }
 }
 
+fn wait_for_branch_exists_prompt(
+    store: &AppStore,
+    view: &gpui::Entity<GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    wait_until("shared branch-exists prompt state", || {
+        store.snapshot().branch_exists_prompt.is_some()
+    });
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            crate::view::test_support::sync_store_snapshot(this, cx)
+        });
+    });
+    crate::view::test_support::redraw(cx);
+    cx.update(|_window, app| {
+        assert!(matches!(
+            view.read(app).popover_host.read(app).popover,
+            Some(PopoverKind::BranchExistsPrompt { .. })
+        ));
+    });
+}
+
 pub(super) fn create_tracking_store(
     label: &str,
 ) -> (
@@ -282,11 +451,14 @@ pub(super) fn create_tracking_store(
     let workdir = unique_temp_dir(label);
     let expected_workdir = normalize_store_workdir(&workdir);
     let repo = Arc::new(TrackingRepo::new(workdir.clone()));
-    let (store, events) = AppStore::new(Arc::new(TrackingBackend {
+    let (store, events) = AppStore::new_test(Arc::new(TrackingBackend {
         repo: Arc::clone(&repo),
     }));
     store.dispatch(Msg::OpenRepo(workdir.clone()));
-    wait_until("tracked test repo to open", || {
+    // Branches load after `open` turns Ready. The ref pickers index rows by
+    // position (HEAD, then branches), so a view built before they land is
+    // missing rows; slow CI runners (Windows) hit that.
+    wait_until("tracked test repo to open and list branches", || {
         let snapshot = store.snapshot();
         snapshot
             .active_repo
@@ -299,9 +471,146 @@ pub(super) fn create_tracking_store(
             .is_some_and(|repo_state| {
                 repo_state.spec.workdir == expected_workdir
                     && matches!(repo_state.open, Loadable::Ready(()))
+                    && matches!(repo_state.branches, Loadable::Ready(_))
             })
     });
     (store, events, repo, workdir)
+}
+
+fn open_checkout_remote_collision_prompt(
+    cx: &mut gpui::TestAppContext,
+) -> (
+    gpui::Entity<GitCometView>,
+    &mut gpui::VisualTestContext,
+    Arc<TrackingRepo>,
+    AppStore,
+) {
+    let (store, events, repo, _workdir) = create_tracking_store("checkout-remote-branch-collision");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    wait_until("local branches to load", || {
+        store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|state| state.id == repo_id)
+            .is_some_and(|state| {
+                matches!(
+                    &state.branches,
+                    Loadable::Ready(branches) if branches.iter().any(|branch| branch.name == "main")
+                )
+            })
+    });
+
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    cx.update(|window, app| {
+        crate::app::bind_text_input_keys_for_test(app);
+        let _ = window.draw(app);
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.open_popover_at(
+                    PopoverKind::CheckoutRemoteBranchPrompt {
+                        repo_id,
+                        remote: "origin".to_string(),
+                        branch: "feature".to_string(),
+                    },
+                    gpui::point(gpui::px(120.0), gpui::px(72.0)),
+                    window,
+                    cx,
+                );
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+                host.submit_checkout_remote_branch(cx);
+            });
+        });
+    });
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    let kind = cx.update(|_window, app| {
+        view.read(app)
+            .popover_host
+            .read(app)
+            .popover_kind_for_tests()
+    });
+    assert!(
+        matches!(
+            kind,
+            Some(PopoverKind::BranchExistsPrompt {
+                ref name,
+                ref target,
+                operation: BranchExistsPromptOperation::CheckoutRemoteBranch {
+                    ref remote,
+                    ref branch,
+                },
+                ..
+            }) if remote == "origin"
+                && branch == "feature"
+                && name == "main"
+                && target == "origin/feature"
+        ),
+        "expected the branch collision dialog, got {kind:?}"
+    );
+    assert!(repo.actions().is_empty());
+
+    (view, cx, repo, store)
+}
+
+#[gpui::test]
+fn checkout_remote_branch_collision_dialog_escape_cancels(cx: &mut gpui::TestAppContext) {
+    let (view, cx, repo, store) = open_checkout_remote_collision_prompt(cx);
+
+    assert!(
+        cx.debug_bounds("branch_exists_cancel_hint").is_some(),
+        "expected a visible Cancel action"
+    );
+    assert!(
+        cx.debug_bounds("branch_exists_checkout_existing").is_some(),
+        "expected a visible Checkout existing action"
+    );
+    assert!(
+        cx.debug_bounds("branch_exists_overwrite").is_some(),
+        "expected a visible Overwrite and checkout action"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    wait_until("branch collision prompt cancellation", || {
+        store.snapshot().branch_exists_prompt.is_none()
+    });
+
+    let is_open = cx.update(|_window, app| view.read(app).popover_host.read(app).is_open());
+    assert!(!is_open, "expected Escape to dismiss the collision dialog");
+    assert!(repo.actions().is_empty());
+}
+
+#[gpui::test]
+fn checkout_remote_branch_collision_dialog_checks_out_existing_branch(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (view, cx, repo, _store) = open_checkout_remote_collision_prompt(cx);
+
+    click_debug_selector(cx, "branch_exists_checkout_existing");
+    wait_until("existing branch checkout", || {
+        repo.actions() == vec!["checkout:main".to_string()]
+    });
+
+    let is_open = cx.update(|_window, app| view.read(app).popover_host.read(app).is_open());
+    assert!(!is_open, "expected checkout to close the collision dialog");
+}
+
+#[gpui::test]
+fn checkout_remote_branch_collision_dialog_overwrites_from_remote(cx: &mut gpui::TestAppContext) {
+    let (view, cx, repo, _store) = open_checkout_remote_collision_prompt(cx);
+
+    click_debug_selector(cx, "branch_exists_overwrite");
+    wait_until("remote branch overwrite checkout", || {
+        repo.actions() == vec!["checkout-remote:origin/feature:main:Overwrite".to_string()]
+    });
+
+    let is_open = cx.update(|_window, app| view.read(app).popover_host.read(app).is_open());
+    assert!(!is_open, "expected overwrite to close the collision dialog");
 }
 
 #[gpui::test]
@@ -319,15 +628,15 @@ fn create_branch_popover_escape_cancels(cx: &mut gpui::TestAppContext) {
 
     cx.update(|window, app| {
         view.update(app, |this, cx| {
-            this.set_active_context_menu_invoker(Some("create_branch_btn".into()), cx);
             this.popover_host.update(cx, |host, cx| {
                 host.open_popover_at(
-                    PopoverKind::CreateBranchFromRefPrompt {
+                    (PopoverKind::CreateBranchFromRefPrompt {
                         repo_id,
                         target: "HEAD".to_string(),
                         source_selectable: false,
                         name_prefix: String::new(),
-                    },
+                    })
+                    .invoked_by("create_branch_btn".into()),
                     gpui::point(gpui::px(120.0), gpui::px(72.0)),
                     window,
                     cx,
@@ -384,7 +693,9 @@ fn create_branch_popover_escape_cancels(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn create_branch_source_picker_selects_items_on_mouse_down(cx: &mut gpui::TestAppContext) {
+fn create_branch_source_picker_preserves_focus_and_selects_on_completed_click(
+    cx: &mut gpui::TestAppContext,
+) {
     let (store, events, _repo, _workdir) = create_tracking_store("create-branch-source-click");
     let repo_id = store.snapshot().active_repo.expect("expected active repo");
     let store_for_view = store.clone();
@@ -424,6 +735,48 @@ fn create_branch_source_picker_selects_items_on_mouse_down(cx: &mut gpui::TestAp
     });
     cx.update(|window, app| {
         let _ = window.draw(app);
+    });
+
+    let target = cx.debug_bounds("picker_prompt_item_1").unwrap().center();
+    cx.simulate_mouse_move(target, None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(target, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        let host = view.read(app).popover_host.read(app);
+        assert_eq!(host.create_branch_source_target, "HEAD");
+        assert_window_focus(
+            window,
+            app,
+            host.branch_picker_search_input
+                .as_ref()
+                .unwrap()
+                .read(app)
+                .focus_handle(),
+            "a suggestion press must retain input focus until release",
+        );
+    });
+    assert!(cx.debug_bounds("picker_prompt_item_1").is_some());
+    let other_row = cx.debug_bounds("picker_prompt_item_0").unwrap().center();
+    cx.simulate_mouse_move(
+        other_row,
+        Some(gpui::MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        other_row,
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+    cx.update(|_, app| {
+        assert_eq!(
+            view.read(app)
+                .popover_host
+                .read(app)
+                .create_branch_source_target,
+            "HEAD"
+        );
     });
 
     click_debug_selector(cx, "picker_prompt_item_1");
@@ -635,7 +988,7 @@ fn worktree_ref_picker_enter_selects_and_focuses_add(cx: &mut gpui::TestAppConte
 
 #[gpui::test]
 fn rename_branch_prompt_cancel_button_and_escape_close(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -729,7 +1082,7 @@ fn create_branch_popover_renders_shortcut_hints_and_separators(cx: &mut gpui::Te
 
 #[gpui::test]
 fn create_branch_from_ref_popover_tabs_to_checkout_and_wraps(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let store_for_view = store.clone();
     let (view, cx) = cx
         .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
@@ -859,15 +1212,15 @@ fn create_branch_popover_enter_creates_and_closes(cx: &mut gpui::TestAppContext)
 
     cx.update(|window, app| {
         view.update(app, |this, cx| {
-            this.set_active_context_menu_invoker(Some("create_branch_btn".into()), cx);
             this.popover_host.update(cx, |host, cx| {
                 host.open_popover_at(
-                    PopoverKind::CreateBranchFromRefPrompt {
+                    (PopoverKind::CreateBranchFromRefPrompt {
                         repo_id,
                         target: "HEAD".to_string(),
                         source_selectable: false,
                         name_prefix: String::new(),
-                    },
+                    })
+                    .invoked_by("create_branch_btn".into()),
                     gpui::point(gpui::px(120.0), gpui::px(72.0)),
                     window,
                     cx,
@@ -921,6 +1274,366 @@ fn create_branch_popover_enter_creates_and_closes(cx: &mut gpui::TestAppContext)
     });
 }
 
+fn open_create_branch_prompt_for_enter_test(
+    cx: &mut gpui::VisualTestContext,
+    view: &gpui::Entity<GitCometView>,
+    repo_id: RepoId,
+) {
+    cx.update(|window, app| {
+        app.bind_keys([gpui::KeyBinding::new(
+            "enter",
+            crate::kit::Enter,
+            Some("TextInput"),
+        )]);
+        let _ = window.draw(app);
+    });
+
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.open_popover_at(
+                    PopoverKind::CreateBranchFromRefPrompt {
+                        repo_id,
+                        target: "HEAD".to_string(),
+                        source_selectable: false,
+                        name_prefix: String::new(),
+                    },
+                    gpui::point(gpui::px(120.0), gpui::px(72.0)),
+                    window,
+                    cx,
+                );
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+}
+
+/// Typing an existing branch name into "Create branch from…" with Checkout on
+/// used to fail with git's "already exists" error. Instead the prompt should
+/// hand over to the BranchExistsPrompt, and "Overwrite & checkout" should
+/// dispatch the force create-and-checkout action.
+#[gpui::test]
+fn create_branch_popover_existing_name_offers_overwrite_and_checkout(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events, repo, _workdir) = create_tracking_store("branch-exists-overwrite");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    wait_until("tracked repo branches to load", || {
+        store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .is_some_and(|r| matches!(r.branches, Loadable::Ready(_)))
+    });
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    open_create_branch_prompt_for_enter_test(cx, &view, repo_id);
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                // Deliberately hide `main` from this window's branch snapshot.
+                // The backend remains authoritative and reports the collision,
+                // covering another process creating the ref after UI preflight.
+                let mut stale_state = host.state.as_ref().clone();
+                stale_state
+                    .repos
+                    .iter_mut()
+                    .find(|repo| repo.id == repo_id)
+                    .expect("active repo in stale UI snapshot")
+                    .branches = Loadable::Ready(Arc::new(Vec::new()));
+                host.state = Arc::new(stale_state);
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+
+    cx.simulate_keystrokes("enter");
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    cx.update(|_window, app| {
+        let host = view.read(app).popover_host.read(app);
+        assert!(
+            host.is_open(),
+            "expected the existing-name submit to keep a popover open"
+        );
+        assert!(
+            matches!(host.popover, Some(PopoverKind::BranchExistsPrompt { .. })),
+            "expected the BranchExistsPrompt, got {:?}",
+            host.popover
+        );
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        repo.actions().is_empty(),
+        "expected no git actions before the user chooses"
+    );
+    assert_eq!(
+        repo.create_attempts(),
+        vec!["main@HEAD".to_string()],
+        "the prompt must come from the repository collision, not a stale UI preflight"
+    );
+
+    click_debug_selector(cx, "branch_exists_overwrite");
+
+    wait_until("force create-and-checkout repo action", || {
+        repo.actions() == vec!["force-create-and-checkout:main".to_string()]
+    });
+    let is_open = cx.update(|_window, app| view.read(app).popover_host.read(app).is_open());
+    assert!(!is_open, "expected Overwrite to close the popover");
+}
+
+/// The other BranchExistsPrompt choice: check out the existing branch as-is
+/// rather than moving it.
+#[gpui::test]
+fn create_branch_popover_existing_name_can_checkout_existing_branch(cx: &mut gpui::TestAppContext) {
+    let (store, events, repo, _workdir) = create_tracking_store("branch-exists-checkout");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    wait_until("tracked repo branches to load", || {
+        store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|r| r.id == repo_id)
+            .is_some_and(|r| matches!(r.branches, Loadable::Ready(_)))
+    });
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    open_create_branch_prompt_for_enter_test(cx, &view, repo_id);
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+
+    cx.simulate_keystrokes("enter");
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    click_debug_selector(cx, "branch_exists_checkout_existing");
+
+    wait_until("checkout-existing repo action", || {
+        repo.actions() == vec!["checkout:main".to_string()]
+    });
+    let is_open = cx.update(|_window, app| view.read(app).popover_host.read(app).is_open());
+    assert!(!is_open, "expected Checkout existing to close the popover");
+}
+
+#[gpui::test]
+fn replacing_branch_exists_prompt_cancels_it_and_allows_the_same_collision_to_retry(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events, repo, _workdir) = create_tracking_store("branch-exists-replaced");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    open_create_branch_prompt_for_enter_test(cx, &view, repo_id);
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+    cx.simulate_keystrokes("enter");
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.open_repository_switcher_centered(window, cx);
+        });
+    });
+    wait_until("replaced branch collision prompt to be cancelled", || {
+        store.snapshot().branch_exists_prompt.is_none()
+    });
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            crate::view::test_support::sync_store_snapshot(this, cx)
+        });
+        assert!(matches!(
+            view.read(app).popover_host.read(app).popover,
+            Some(PopoverKind::RepoPicker {
+                scope: RepoPickerScope::All
+            })
+        ));
+        view.update(app, |this, cx| {
+            this.popover_host
+                .update(cx, |host, cx| host.close_popover(cx));
+        });
+    });
+
+    open_create_branch_prompt_for_enter_test(cx, &view, repo_id);
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+    cx.simulate_keystrokes("enter");
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    assert_eq!(
+        repo.create_attempts(),
+        vec!["main@HEAD".to_string(), "main@HEAD".to_string()],
+        "the same collision should prompt again after the replacement was cancelled"
+    );
+}
+
+#[gpui::test]
+fn branch_exists_prompt_owns_focus_tabs_within_actions_and_escape_cancels(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events, repo, _workdir) = create_tracking_store("branch-exists-keyboard");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    cx.update(|window, app| {
+        crate::app::bind_text_input_keys_for_test(app);
+        let _ = window.draw(app);
+    });
+    open_create_branch_prompt_for_enter_test(cx, &view, repo_id);
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+            });
+        });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
+    cx.simulate_keystrokes("enter");
+    wait_for_branch_exists_prompt(&store, &view, cx);
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        let host = view.read(app).popover_host.read(app);
+        assert!(matches!(
+            host.popover,
+            Some(PopoverKind::BranchExistsPrompt { .. })
+        ));
+        assert_window_focus(
+            window,
+            app,
+            host.prompt_tab_group_focus_handle.clone(),
+            "expected the confirmation dialog to take focus from the hidden branch input",
+        );
+    });
+    assert!(store.snapshot().branch_exists_prompt.is_some());
+    let bounds = cx
+        .debug_bounds("app_popover")
+        .expect("expected branch-exists dialog bounds");
+    assert!(
+        bounds.size.width >= gpui::px(540.0),
+        "expected rendered three-action dialog to be at least 540px wide, got {:?}",
+        bounds.size.width
+    );
+
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let cancel_focus = cx.update(|window, app| window.focused(app).expect("Cancel should focus"));
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let checkout_focus =
+        cx.update(|window, app| window.focused(app).expect("Checkout existing should focus"));
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    let overwrite_focus =
+        cx.update(|window, app| window.focused(app).expect("Overwrite should focus"));
+    assert_ne!(cancel_focus, checkout_focus);
+    assert_ne!(checkout_focus, overwrite_focus);
+    assert_ne!(cancel_focus, overwrite_focus);
+
+    cx.simulate_keystrokes("tab");
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        assert_eq!(
+            window.focused(app),
+            Some(cancel_focus),
+            "expected Tab to wrap within the three dialog actions"
+        );
+    });
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        assert!(!view.read(app).popover_host.read(app).is_open());
+    });
+    wait_until("branch collision prompt cancellation", || {
+        store.snapshot().branch_exists_prompt.is_none()
+    });
+    assert!(repo.actions().is_empty());
+}
+
+#[gpui::test]
+fn branch_picker_create_collision_reaches_shared_prompt(cx: &mut gpui::TestAppContext) {
+    let (store, events, repo, _workdir) = create_tracking_store("branch-picker-collision");
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                branch_picker::activate(
+                    host,
+                    repo_id,
+                    branch_picker::BranchPickerNavTarget::CreateBranch("main".to_string()),
+                    window,
+                    cx,
+                );
+            });
+        });
+    });
+    wait_for_branch_exists_prompt(&store, &view, cx);
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+        assert!(matches!(
+            view.read(app).popover_host.read(app).popover,
+            Some(PopoverKind::BranchExistsPrompt { .. })
+        ));
+    });
+    assert!(store.snapshot().branch_exists_prompt.is_some());
+    assert_eq!(repo.create_attempts().len(), 1);
+    assert!(
+        repo.actions().is_empty(),
+        "branch-picker collisions must wait for confirmation before mutating a ref or checking out"
+    );
+}
+
 #[gpui::test]
 fn create_branch_popover_enter_with_empty_input_does_not_close_or_create(
     cx: &mut gpui::TestAppContext,
@@ -942,15 +1655,15 @@ fn create_branch_popover_enter_with_empty_input_does_not_close_or_create(
 
     cx.update(|window, app| {
         view.update(app, |this, cx| {
-            this.set_active_context_menu_invoker(Some("create_branch_btn".into()), cx);
             this.popover_host.update(cx, |host, cx| {
                 host.open_popover_at(
-                    PopoverKind::CreateBranchFromRefPrompt {
+                    (PopoverKind::CreateBranchFromRefPrompt {
                         repo_id,
                         target: "HEAD".to_string(),
                         source_selectable: false,
                         name_prefix: String::new(),
-                    },
+                    })
+                    .invoked_by("create_branch_btn".into()),
                     gpui::point(gpui::px(120.0), gpui::px(72.0)),
                     window,
                     cx,
@@ -1140,9 +1853,11 @@ mod checkout_picker {
         repo: RepoState,
         repo_id: RepoId,
     ) -> (gpui::Entity<GitCometView>, &mut gpui::VisualTestContext) {
-        let (store, events) = AppStore::new(Arc::new(TestBackend));
-        let (view, cx) =
-            cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+        let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            window.activate();
+            GitCometView::new(store, events, None, window, cx)
+        });
 
         cx.update(|window, app| {
             crate::app::bind_text_input_keys_for_test(app);
@@ -1776,6 +2491,15 @@ mod checkout_picker {
             click_count: 1,
             first_mouse: false,
         });
+        let moved = at + gpui::point(gpui::px(1.0), gpui::px(1.0));
+        cx.simulate_mouse_move(
+            moved,
+            Some(gpui::MouseButton::Right),
+            gpui::Modifiers::default(),
+        );
+        redraw(cx);
+        assert!(cx.debug_bounds("picker_row_menu").is_none());
+        cx.simulate_mouse_up(moved, gpui::MouseButton::Right, gpui::Modifiers::default());
         cx.run_until_parked();
         redraw(cx);
 
@@ -1812,8 +2536,7 @@ mod checkout_picker {
                         host.context_menu_model(
                             &PopoverKind::BranchMenu {
                                 repo_id,
-                                section: BranchSection::Local,
-                                name: "feat/badges".to_string(),
+                                target: BranchMenuTarget::local("feat/badges"),
                             },
                             cx,
                         )
@@ -1918,6 +2641,78 @@ fn branch_group_entry_action(model: &ContextMenuModel, starts_with: &str) -> Con
         })
 }
 
+#[gpui::test]
+fn review_ancestor_collapse_during_search_preserves_saved_collapse(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo_id = RepoId(529);
+    let mut repo = RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/ancestor-collapse"),
+        },
+    );
+    repo.head_branch = Loadable::Ready("feat/a".into());
+    repo.branches = Loadable::Ready(Arc::new(vec![Branch {
+        name: "feat/a".into(),
+        target: CommitId("a".into()),
+        upstream: None,
+        divergence: None,
+    }]));
+    let state = Arc::new(AppState {
+        active_repo: Some(repo_id),
+        repos: vec![repo],
+        ..AppState::test_default()
+    });
+    let (pane, host) = cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.store.replace_snapshot_for_test(state.clone());
+            crate::view::test_support::push_test_state(view, state, cx);
+            (view.sidebar_pane.clone(), view.popover_host.clone())
+        })
+    });
+    cx.update(|_, app| {
+        pane.update(app, |pane, _| {
+            pane.set_collapsed_keys_for_test(&["group:local:feat"]);
+            pane.set_branch_filter_query_for_test("feat");
+            let presentation = pane.branch_sidebar_presentation_cached().unwrap();
+            assert!(
+                presentation.rows.iter().any(|row| matches!(
+                    row,
+                    BranchSidebarRow::GroupHeader { path, collapsed: false, .. } if path == "feat"
+                )),
+                "search must reveal the saved collapsed group"
+            );
+        })
+    });
+    // Activate the action taken from the real menu model. A synthetic pointer
+    // click can dismiss a popover without ever invoking its entry.
+    cx.update(|window, app| {
+        host.update(app, |host, cx| {
+            let model = host
+                .context_menu_model(
+                    &PopoverKind::SidebarAncestorMenu {
+                        repo_id,
+                        section: BranchSection::Local,
+                    },
+                    cx,
+                )
+                .unwrap();
+            let action = branch_group_entry_action(&model, "Collapse feat/");
+            host.context_menu_activate_action(action, window, cx);
+        })
+    });
+    cx.update(|_, app| {
+        assert!(
+            pane.read(app)
+                .collapsed_items_for_test()
+                .contains("group:local:feat"),
+            "Collapse must leave the saved group collapsed even while search reveals it"
+        )
+    });
+}
+
 /// Builds a repo whose branch list is `main`, `feat/a`, `feat/b/c` and
 /// `features/x`, plus `origin/feat/a`, then returns the group menu's model.
 fn branch_group_menu_model(
@@ -1938,7 +2733,7 @@ fn branch_group_menu_model_filtered(
     filter: &str,
     configure: impl FnOnce(&mut RepoState),
 ) -> ContextMenuModel {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -1983,7 +2778,7 @@ fn branch_group_menu_model_filtered(
             let state = Arc::new(AppState {
                 repos: vec![repo],
                 active_repo: Some(repo_id),
-                ..Default::default()
+                ..AppState::test_default()
             });
             this.state = Arc::clone(&state);
             this.ui_model
@@ -2037,7 +2832,7 @@ fn branch_group_delete_confirm_names_with_head(
     head: &str,
     configure: impl FnOnce(&mut RepoState),
 ) -> Vec<String> {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -2077,7 +2872,7 @@ fn branch_group_delete_confirm_names_with_head(
             let state = Arc::new(AppState {
                 repos: vec![repo],
                 active_repo: Some(repo_id),
-                ..Default::default()
+                ..AppState::test_default()
             });
             this.state = Arc::clone(&state);
             this.ui_model
@@ -2317,13 +3112,13 @@ fn branch_group_menu_create_entry_seeds_the_group_prefix(cx: &mut gpui::TestAppC
     }
 }
 
-/// Builds the pinned-header menu for `section` with `pins` already pinned.
-fn pinned_section_menu_model(
+/// Builds the branch section menu with `pins` already pinned.
+fn branch_section_menu_model(
     cx: &mut gpui::TestAppContext,
     section: BranchSection,
     pins: &[(BranchSection, &str)],
 ) -> ContextMenuModel {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -2368,7 +3163,7 @@ fn pinned_section_menu_model(
             let state = Arc::new(AppState {
                 repos: vec![repo],
                 active_repo: Some(repo_id),
-                ..Default::default()
+                ..AppState::test_default()
             });
             this.state = Arc::clone(&state);
             this.ui_model
@@ -2388,16 +3183,16 @@ fn pinned_section_menu_model(
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
             this.popover_host.update(cx, |host, cx| {
-                host.context_menu_model(&PopoverKind::PinnedSectionMenu { repo_id, section }, cx)
+                host.context_menu_model(&PopoverKind::BranchSectionMenu { repo_id, section }, cx)
             })
         })
-        .expect("expected a pinned section context menu model")
+        .expect("expected a branch section context menu model")
     })
 }
 
 #[gpui::test]
-fn pinned_section_menu_counts_only_its_own_section(cx: &mut gpui::TestAppContext) {
-    let model = pinned_section_menu_model(
+fn branch_section_menu_counts_only_its_own_section(cx: &mut gpui::TestAppContext) {
+    let model = branch_section_menu_model(
         cx,
         BranchSection::Local,
         &[
@@ -2408,18 +3203,22 @@ fn pinned_section_menu_counts_only_its_own_section(cx: &mut gpui::TestAppContext
         ],
     );
 
-    assert_eq!(branch_group_entry(&model, "Unpin all").0, "Unpin all (2)");
+    assert_eq!(
+        branch_group_entry(&model, "Unpin all").0,
+        "Unpin all local (2)"
+    );
     assert!(!branch_group_entry(&model, "Unpin all").1);
 }
 
 #[gpui::test]
-fn pinned_section_menu_disables_unpin_all_when_nothing_is_pinned(cx: &mut gpui::TestAppContext) {
-    let model = pinned_section_menu_model(cx, BranchSection::Local, &[]);
+fn branch_section_menu_disables_unpin_all_when_nothing_is_pinned(cx: &mut gpui::TestAppContext) {
+    let model = branch_section_menu_model(cx, BranchSection::Local, &[]);
 
-    assert_eq!(branch_group_entry(&model, "Unpin all").0, "Unpin all (0)");
+    assert_eq!(
+        branch_group_entry(&model, "Unpin all").0,
+        "Unpin all local (0)"
+    );
     assert!(branch_group_entry(&model, "Unpin all").1);
-    // The collapse toggle stays live regardless of pins.
-    assert!(!branch_group_entry(&model, "Collapse").1);
 }
 
 /// Drives a context-menu action through the real host → sidebar-pane path and
@@ -2453,7 +3252,7 @@ fn activate_sidebar_action_with(
     collapsed_keys: &[&str],
     pick: impl FnOnce(&mut PopoverHost, &mut gpui::Context<PopoverHost>) -> ContextMenuAction,
 ) -> (BTreeSet<String>, BTreeSet<String>) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -2484,10 +3283,24 @@ fn activate_sidebar_action_with(
                 branch("feat/b/c"),
                 branch("features/x"),
             ]));
+            repo.remote_branches = Loadable::Ready(Arc::new(
+                ["origin", "upstream", "team/origin"]
+                    .into_iter()
+                    .flat_map(|remote| {
+                        ["feat/a", "feat/b/c", "features/x", "main"]
+                            .into_iter()
+                            .map(move |name| gitcomet_core::domain::RemoteBranch {
+                                remote: remote.into(),
+                                name: name.into(),
+                                target: CommitId("aaaaaaaaaaaa".into()),
+                            })
+                    })
+                    .collect(),
+            ));
             let state = Arc::new(AppState {
                 repos: vec![repo],
                 active_repo: Some(repo_id),
-                ..Default::default()
+                ..AppState::test_default()
             });
             this.state = Arc::clone(&state);
             this.ui_model
@@ -2666,73 +3479,6 @@ fn unpin_all_action_leaves_pins_for_branches_that_no_longer_exist(cx: &mut gpui:
     );
 }
 
-/// A live filter force-expands the pinned section regardless of the stored key,
-/// so the menu reads "Collapse" while the key already says collapsed. A blind
-/// toggle would clear the key there and leave the section expanded once the
-/// filter cleared — the opposite of the label the user clicked.
-#[gpui::test]
-fn pinned_section_collapse_entry_matches_its_label_under_a_filter(cx: &mut gpui::TestAppContext) {
-    let (collapsed, _pins) = activate_sidebar_action_with(
-        cx,
-        &[(BranchSection::Local, "feat/a")],
-        "feat",
-        &["section:pinned/local"],
-        |host, cx| {
-            let model = host
-                .context_menu_model(
-                    &PopoverKind::PinnedSectionMenu {
-                        repo_id: RepoId(83),
-                        section: BranchSection::Local,
-                    },
-                    cx,
-                )
-                .expect("expected a pinned section context menu model");
-            let labels = branch_group_entry_labels(&model);
-            assert!(
-                labels.iter().any(|label| label == "Collapse"),
-                "a force-expanded section must offer to collapse, got {labels:?}"
-            );
-            branch_group_entry_action(&model, "Collapse")
-        },
-    );
-
-    assert!(
-        collapsed.contains("section:pinned/local"),
-        "activating Collapse must leave the section collapsed, got {collapsed:?}"
-    );
-}
-
-/// The same entry from the other side: with nothing stored the section renders
-/// expanded, so "Collapse" has to write the key.
-#[gpui::test]
-fn pinned_section_collapse_entry_stores_the_key_when_nothing_is_stored(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (collapsed, _pins) = activate_sidebar_action_with(
-        cx,
-        &[(BranchSection::Local, "feat/a")],
-        "",
-        &[],
-        |host, cx| {
-            let model = host
-                .context_menu_model(
-                    &PopoverKind::PinnedSectionMenu {
-                        repo_id: RepoId(83),
-                        section: BranchSection::Local,
-                    },
-                    cx,
-                )
-                .expect("expected a pinned section context menu model");
-            branch_group_entry_action(&model, "Collapse")
-        },
-    );
-
-    assert!(
-        collapsed.contains("section:pinned/local"),
-        "got {collapsed:?}"
-    );
-}
-
 /// The tree filters branch names before building the group tree, so a filtered
 /// `feat/` row lists only its matches. A menu counting the whole group would
 /// offer to delete branches that are not on screen.
@@ -2768,83 +3514,13 @@ fn branch_group_menu_treats_a_blank_filter_as_no_filter(cx: &mut gpui::TestAppCo
     );
 }
 
-/// The pinned section force-expands under a live filter, so reading the stored
-/// collapse key alone would offer "Expand" on a visibly open section.
-#[gpui::test]
-fn pinned_section_menu_reports_expanded_while_a_filter_is_live(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) =
-        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
-
-    let repo_id = RepoId(84);
-    let workdir = std::env::temp_dir().join(format!(
-        "gitcomet_ui_test_{}_pinned_filter",
-        std::process::id()
-    ));
-
-    cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            let repo = RepoState::new_opening(
-                repo_id,
-                RepoSpec {
-                    workdir: workdir.clone(),
-                },
-            );
-            let state = Arc::new(AppState {
-                repos: vec![repo],
-                active_repo: Some(repo_id),
-                ..Default::default()
-            });
-            this.state = Arc::clone(&state);
-            this.ui_model
-                .update(cx, |model, cx| model.set_state(state, cx));
-            this.popover_host.update(cx, |host, cx| {
-                // Persisted as collapsed…
-                host.set_collapsed_items(
-                    [(
-                        workdir.clone(),
-                        ["section:pinned/local".to_string()].into_iter().collect(),
-                    )]
-                    .into_iter()
-                    .collect(),
-                    cx,
-                );
-                // …but a filter is live, so the row renders expanded.
-                host.set_branch_filter_query("feat".to_string(), cx);
-            });
-            cx.notify();
-        });
-    });
-
-    let model = cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            this.popover_host.update(cx, |host, cx| {
-                host.context_menu_model(
-                    &PopoverKind::PinnedSectionMenu {
-                        repo_id,
-                        section: BranchSection::Local,
-                    },
-                    cx,
-                )
-            })
-        })
-        .expect("expected a pinned section context menu model")
-    });
-
-    let labels = branch_group_entry_labels(&model);
-    assert!(
-        labels.iter().any(|label| label == "Collapse"),
-        "a force-expanded section must offer to collapse, got {labels:?}"
-    );
-}
-
 /// The row builder drops a pin whose branch is gone, so counting raw keys would
 /// put "Unpin all (3)" above a single row.
 #[gpui::test]
-fn pinned_section_menu_ignores_pins_for_branches_that_no_longer_exist(
+fn branch_section_menu_ignores_pins_for_branches_that_no_longer_exist(
     cx: &mut gpui::TestAppContext,
 ) {
-    let model = pinned_section_menu_model(
+    let model = branch_section_menu_model(
         cx,
         BranchSection::Local,
         &[
@@ -2855,7 +3531,10 @@ fn pinned_section_menu_ignores_pins_for_branches_that_no_longer_exist(
         ],
     );
 
-    assert_eq!(branch_group_entry(&model, "Unpin all").0, "Unpin all (1)");
+    assert_eq!(
+        branch_group_entry(&model, "Unpin all").0,
+        "Unpin all local (1)"
+    );
 }
 
 /// The create prompt can open pre-filled with a group prefix, and git rejects a
@@ -2927,4 +3606,284 @@ fn branch_group_delete_keeps_a_remote_member_matching_the_current_branch(
     );
 
     assert_eq!(names, vec!["feat/a".to_string()]);
+}
+
+/// Renames `old_name` onto `main` (which always exists) and waits for the
+/// collision dialog. `worktrees` is what the repo lists before the prompt opens.
+fn open_rename_collision_prompt<'cx>(
+    cx: &'cx mut gpui::TestAppContext,
+    label: &str,
+    old_name: &str,
+    worktrees: Vec<gitcomet_core::domain::Worktree>,
+) -> (
+    gpui::Entity<GitCometView>,
+    &'cx mut gpui::VisualTestContext,
+    Arc<TrackingRepo>,
+    AppStore,
+) {
+    let (store, events, repo, _workdir) = create_tracking_store(label);
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    repo.add_branch(old_name);
+    let expect_listed_worktrees = worktrees.len();
+    repo.set_worktrees(worktrees);
+    store.dispatch(Msg::RefreshBranches { repo_id });
+    store.dispatch(Msg::LoadWorktrees { repo_id });
+    wait_until("branches and worktrees to load", || {
+        store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|state| state.id == repo_id)
+            .is_some_and(|state| {
+                matches!(
+                    &state.branches,
+                    Loadable::Ready(branches) if branches.iter().any(|branch| branch.name == old_name)
+                ) && matches!(
+                    &state.worktrees,
+                    Loadable::Ready(worktrees) if worktrees.len() == expect_listed_worktrees
+                )
+            })
+    });
+
+    let store_for_view = store.clone();
+    let (view, cx) = cx
+        .add_window_view(|window, cx| GitCometView::new(store_for_view, events, None, window, cx));
+
+    let old_name = old_name.to_string();
+    cx.update(|window, app| {
+        crate::app::bind_text_input_keys_for_test(app);
+        let _ = window.draw(app);
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.open_popover_at(
+                    PopoverKind::RenameBranchPrompt {
+                        repo_id,
+                        name: old_name.clone(),
+                        is_current_branch: false,
+                    },
+                    gpui::point(gpui::px(120.0), gpui::px(72.0)),
+                    window,
+                    cx,
+                );
+                host.create_branch_input
+                    .update(cx, |input, cx| input.set_text("main", cx));
+                host.submit_rename_branch(window, cx);
+            });
+        });
+    });
+    wait_for_branch_exists_prompt(&store, &view, cx);
+
+    let kind = cx.update(|_window, app| {
+        view.read(app)
+            .popover_host
+            .read(app)
+            .popover_kind_for_tests()
+    });
+    assert!(
+        matches!(
+            kind,
+            Some(PopoverKind::BranchExistsPrompt {
+                ref name,
+                ref target,
+                operation: BranchExistsPromptOperation::RenameBranch { old_name: ref old },
+                ..
+            }) if name == "main" && target == &old_name && old == &old_name
+        ),
+        "expected the rename collision dialog, got {kind:?}"
+    );
+    assert_eq!(repo.actions(), vec![format!("rename:{old_name}:main")]);
+
+    (view, cx, repo, store)
+}
+
+#[gpui::test]
+fn rename_branch_prompt_existing_name_opens_collision_dialog(cx: &mut gpui::TestAppContext) {
+    let (view, cx, _repo, store) =
+        open_rename_collision_prompt(cx, "rename-collision-dialog", "old", Vec::new());
+
+    let repo_id = store.snapshot().active_repo.expect("expected active repo");
+    let snapshot = store.snapshot();
+    let repo_state = snapshot
+        .repos
+        .iter()
+        .find(|state| state.id == repo_id)
+        .expect("active repo state");
+    assert!(
+        !repo_state
+            .feedback
+            .diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic.message.contains("already exists")),
+        "a collision is a prompt, not an error banner: {:?}",
+        repo_state.feedback.diagnostics
+    );
+    assert!(
+        cx.debug_bounds("branch_exists_worktree_note").is_none(),
+        "no worktree note when no other worktree holds the branch"
+    );
+
+    cx.simulate_keystrokes("escape");
+    cx.run_until_parked();
+    assert!(!cx.update(|_window, app| view.read(app).popover_host.read(app).is_open()));
+    wait_until("rename collision prompt cancellation", || {
+        store.snapshot().branch_exists_prompt.is_none()
+    });
+}
+
+#[gpui::test]
+fn rename_collision_dialog_overwrite_dispatches_force_rename(cx: &mut gpui::TestAppContext) {
+    let (view, cx, repo, _store) =
+        open_rename_collision_prompt(cx, "rename-collision-overwrite", "old", Vec::new());
+
+    click_debug_selector(cx, "branch_exists_overwrite");
+    wait_until("forced rename repo action", || {
+        repo.actions()
+            == vec![
+                "rename:old:main".to_string(),
+                "rename-force:old:main".to_string(),
+            ]
+    });
+    assert!(!cx.update(|_window, app| view.read(app).popover_host.read(app).is_open()));
+}
+
+#[gpui::test]
+fn rename_collision_dialog_checkout_existing_checks_out_target(cx: &mut gpui::TestAppContext) {
+    let (view, cx, repo, _store) =
+        open_rename_collision_prompt(cx, "rename-collision-checkout", "old", Vec::new());
+
+    click_debug_selector(cx, "branch_exists_checkout_existing");
+    wait_until("existing branch checkout", || {
+        repo.actions() == vec!["rename:old:main".to_string(), "checkout:main".to_string()]
+    });
+    assert!(!cx.update(|_window, app| view.read(app).popover_host.read(app).is_open()));
+}
+
+#[gpui::test]
+fn branch_exists_dialog_notes_worktree_holding_the_branch(cx: &mut gpui::TestAppContext) {
+    let worktrees = vec![gitcomet_core::domain::Worktree {
+        path: PathBuf::from("/tmp/gitcomet-ui-other-worktree"),
+        head: None,
+        branch: Some("main".to_string()),
+        detached: false,
+    }];
+    let (_view, cx, _repo, _store) =
+        open_rename_collision_prompt(cx, "rename-collision-worktree-note", "old", worktrees);
+
+    assert!(
+        cx.debug_bounds("branch_exists_worktree_note").is_some(),
+        "expected the dialog to say the branch lives in another worktree"
+    );
+}
+
+#[gpui::test]
+fn remote_root_menu_expands_and_collapses_only_its_remote(cx: &mut gpui::TestAppContext) {
+    for remote in ["origin", "team/origin"] {
+        for collapsed in [true, false] {
+            let own = [
+                branch_sidebar::remote_header_storage_key(remote),
+                branch_sidebar::remote_group_storage_key(remote, "feat"),
+                branch_sidebar::remote_group_storage_key(remote, "feat/b"),
+                branch_sidebar::remote_group_storage_key(remote, "features"),
+            ];
+            let others = [
+                "group:local:feat",
+                "group:remote:upstream:feat",
+                "group:remote-header:upstream",
+            ];
+            let seed: Vec<&str> = others
+                .iter()
+                .copied()
+                .chain(own.iter().filter(|_| !collapsed).map(String::as_str))
+                .collect();
+            let (keys, _) = activate_sidebar_action_with(
+                cx,
+                &[],
+                "only one matching branch",
+                &seed,
+                |host, cx| {
+                    let menu = host
+                        .context_menu_model(
+                            &PopoverKind::remote(
+                                RepoId(83),
+                                RemotePopoverKind::Menu {
+                                    name: remote.into(),
+                                },
+                            ),
+                            cx,
+                        )
+                        .unwrap();
+                    branch_group_entry_action(
+                        &menu,
+                        if collapsed {
+                            "Collapse all"
+                        } else {
+                            "Expand all"
+                        },
+                    )
+                },
+            );
+            for key in &own {
+                assert_eq!(keys.contains(key), collapsed, "{key}: {keys:?}");
+            }
+            for key in others {
+                assert!(keys.contains(key), "unrelated group changed: {key}");
+            }
+            assert_eq!(
+                keys.len(),
+                others.len() + if collapsed { own.len() } else { 0 }
+            );
+        }
+    }
+}
+
+#[gpui::test]
+fn branch_group_menu_pin_action_persists_the_group_key(cx: &mut gpui::TestAppContext) {
+    for (section, remote, expected) in [
+        (BranchSection::Local, None, "group:local:feat"),
+        (
+            BranchSection::Remote,
+            Some("team/origin"),
+            "group:remote:team/origin:feat",
+        ),
+    ] {
+        let (_, pins) = activate_sidebar_action_with(cx, &[], "", &[], |host, cx| {
+            let menu = host
+                .context_menu_model(
+                    &PopoverKind::BranchGroupMenu {
+                        repo_id: RepoId(83),
+                        section,
+                        remote: remote.map(str::to_owned),
+                        path: "feat".into(),
+                    },
+                    cx,
+                )
+                .unwrap();
+            branch_group_entry_action(&menu, "Pin group")
+        });
+        assert_eq!(pins, BTreeSet::from([expected.to_owned()]));
+    }
+}
+
+#[gpui::test]
+fn pinned_branch_group_actions_use_the_shared_branch_filter(cx: &mut gpui::TestAppContext) {
+    let local = branch_group_delete_confirm_names_with_head(
+        cx,
+        BranchSection::Local,
+        None,
+        "feat",
+        "b/c",
+        "main",
+        |_| {},
+    );
+    assert_eq!(local, vec!["feat/b/c".to_string()]);
+    let remote = branch_group_delete_confirm_names_with_head(
+        cx,
+        BranchSection::Remote,
+        Some("origin"),
+        "feat",
+        "origin/feat/",
+        "main",
+        |_| {},
+    );
+    assert_eq!(remote, vec!["feat/a".to_string()]);
 }

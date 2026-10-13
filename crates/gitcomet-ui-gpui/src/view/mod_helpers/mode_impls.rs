@@ -36,6 +36,7 @@ pub(crate) struct ConflictResolverJoinTarget {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct TerminalMenuContext {
     pub(crate) has_session: bool,
+    pub(crate) has_buffer: bool,
     pub(crate) has_selection: bool,
     pub(crate) connected: bool,
 }
@@ -76,15 +77,55 @@ impl AutosquashMode {
     }
 }
 
+/// What the repository picker lists. `WorkspacesOnly` is the Open Workspace chooser.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum RepoPickerScope {
+    All,
+    WorkspacesOnly,
+}
+
+/// The version of the repository a local markdown link opens.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum LocalFileLinkSource {
+    Version(gitcomet_core::domain::FileSource),
+    /// The version before this commit: a link on the old side of its diff.
+    ParentOf(CommitId),
+}
+
+/// Which status-strip chip a [`PopoverKind::TextFormatMenu`] belongs to.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub(crate) enum TextFormatMenuSection {
+    Encoding,
+    LineEnding,
+    TabSize,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum PopoverKind {
+    /// A dialog an extension opened; its content lives on the popover host.
+    Hosted {
+        menu: bool,
+        id: u64,
+    },
     HookActivity {
         repo_id: RepoId,
         operation_id: Option<GitOperationId>,
     },
-    RepoPicker,
+    /// The errors on screen, opened on the one toast `toast_id` shows.
+    ErrorDetails {
+        toast_id: u64,
+    },
+    RepoPicker {
+        scope: RepoPickerScope,
+    },
     BranchPicker {
         purpose: BranchPickerPurpose,
+    },
+    /// Selects or clears the live remote-tracking branch for the captured
+    /// checked-out local branch.
+    UpstreamPicker {
+        repo_id: RepoId,
+        branch: String,
     },
     CreateBranchFromRefPrompt {
         repo_id: RepoId,
@@ -158,6 +199,9 @@ pub(crate) enum PopoverKind {
     PushSetUpstreamPrompt {
         repo_id: RepoId,
         remote: String,
+        /// `Some` configures this local branch without pushing. `None` is the
+        /// first-push flow that creates the remote branch immediately.
+        configure_only_for: Option<String>,
     },
     ForcePushConfirm {
         repo_id: RepoId,
@@ -166,12 +210,36 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
         commit_id: CommitId,
     },
+    /// Commit-or-not choice for a multi-commit cherry-pick; `entries` is the
+    /// editor's plan as it was when Start was clicked.
+    InteractiveCherryPickConfirm {
+        repo_id: RepoId,
+        entries: Vec<gitcomet_core::services::InteractiveRebaseEntry>,
+    },
+    RevertCommitConfirm {
+        repo_id: RepoId,
+        commit_id: CommitId,
+    },
+    /// "Apply change": `target` names the files whose change is applied.
+    ApplyFileChangeConfirm {
+        repo_id: RepoId,
+        target: gitcomet_core::domain::ApplyChangeTarget,
+    },
     MergeCommitConfirm {
         repo_id: RepoId,
         commit_id: CommitId,
     },
     MergeAbortConfirm {
         repo_id: RepoId,
+    },
+    /// Shown when a branch-creation checkout names a branch that already exists
+    /// locally. Asks whether to check out the existing branch, overwrite it
+    /// with the target commit and check it out, or cancel.
+    BranchExistsPrompt {
+        repo_id: RepoId,
+        name: String,
+        target: String,
+        operation: BranchExistsPromptOperation,
     },
     ForceDeleteBranchConfirm {
         repo_id: RepoId,
@@ -219,7 +287,32 @@ pub(crate) enum PopoverKind {
     CommitOptionsMenu {
         repo_id: RepoId,
     },
-    CommitFileSortMenu,
+    CommitFileSortMenu {
+        list: crate::view::rows::FileListId,
+    },
+    /// Right-click menu of a changed-file list's layout icon.
+    FileListLayoutMenu {
+        repo_id: RepoId,
+        list: crate::view::rows::FileListId,
+    },
+    /// Right-click menu of a folder row in a file list's tree view.
+    FileListFolderMenu {
+        repo_id: RepoId,
+        list: crate::view::rows::FileListId,
+        /// The folder's path; for a folded chain, its deepest segment.
+        key: std::sync::Arc<std::path::Path>,
+        chain: std::sync::Arc<[std::sync::Arc<std::path::Path>]>,
+        collapsed: bool,
+        /// Where "Apply changes" takes the folder's files from; `None` for a
+        /// list with no change to apply.
+        apply_source: Option<gitcomet_core::domain::ApplyChangeSource>,
+    },
+    /// Confirms discarding every change under a status tree folder.
+    DiscardFolderChangesConfirm {
+        repo_id: RepoId,
+        section: StatusSection,
+        folder: std::sync::Arc<std::path::Path>,
+    },
     PreviousCommitMessagesMenu {
         repo_id: RepoId,
     },
@@ -230,8 +323,16 @@ pub(crate) enum PopoverKind {
     AddRepoMenu,
     TerminalShutdownConfirm(TerminalShutdownPrompt),
     UnsavedFileEditsConfirm(UnsavedFileEditsPrompt),
+    /// A file operation found an item with the same name at its destination.
+    FilesystemConflict(FilesystemConflictPrompt),
+    DeletePermanentlyConfirm(DeletePermanentlyPrompt),
+    /// A file operation would remove or replace items with unsaved edits.
+    FilesystemUnsavedEditsConfirm(FilesystemUnsavedEditsPrompt),
+    /// Running Git operations or an extension asked before a close.
+    CloseGuardConfirm(CloseGuardPrompt),
     TerminalMenu {
         repo_id: RepoId,
+        session_seq: u64,
         context: TerminalMenuContext,
     },
     DiffActionMenu,
@@ -244,6 +345,23 @@ pub(crate) enum PopoverKind {
     /// commit message.
     WebLinkMenu {
         url: SharedString,
+        /// Exact remote image URL represented by a linked image, but only
+        /// while Ask mode is waiting for approval. Ordinary text links and
+        /// images under either other policy leave this empty.
+        load_remote_image_url: Option<SharedString>,
+    },
+    /// "Open in GitComet" for a link in the rendered markdown preview whose
+    /// destination is a file inside this repository.
+    LocalFileLinkMenu {
+        repo_id: RepoId,
+        source: LocalFileLinkSource,
+        /// Repo-relative, with `.`/`..` folded.
+        path: std::path::PathBuf,
+        /// The working tree has no such file; the entry is shown greyed out.
+        missing: bool,
+        /// Same Ask-mode carrier as `WebLinkMenu`: a linked badge can only be
+        /// approved through its link menu.
+        load_remote_image_url: Option<SharedString>,
     },
     /// Actions for a commit id clicked in a commit message or a SHA field.
     CommitShaLinkMenu {
@@ -256,10 +374,10 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
         area: DiffArea,
         path: Option<std::path::PathBuf>,
-        hunk_patch: Option<String>,
+        hunk_patch: Option<gitcomet_state::msg::ContentBytes>,
         hunks_count: usize,
-        lines_patch: Option<String>,
-        discard_lines_patch: Option<String>,
+        lines_patch: Option<gitcomet_state::msg::ContentBytes>,
+        discard_lines_patch: Option<gitcomet_state::msg::ContentBytes>,
         lines_count: usize,
         copy_text: Option<String>,
         copy_target: Option<(usize, DiffTextRegion)>,
@@ -313,17 +431,15 @@ pub(crate) enum PopoverKind {
         area: DiffArea,
         path: std::path::PathBuf,
     },
+    /// Opened by a conflicted row's "Resolve…" button: only the resolve actions.
+    StatusConflictMenu {
+        repo_id: RepoId,
+        area: DiffArea,
+        path: std::path::PathBuf,
+    },
     BranchMenu {
         repo_id: RepoId,
-        section: BranchSection,
-        name: String,
-    },
-    /// Disambiguates a compact history chip that represents more than one
-    /// exact branch ref before handing off to the ordinary branch menu.
-    BranchRefsMenu {
-        repo_id: RepoId,
-        display_name: String,
-        targets: Vec<BranchMenuTarget>,
+        target: BranchMenuTarget,
     },
     BranchSectionMenu {
         repo_id: RepoId,
@@ -338,8 +454,13 @@ pub(crate) enum PopoverKind {
         /// Full slash path with no trailing separator (`feat`, `feat/sub`).
         path: String,
     },
-    /// Menu for the "Pinned Local/Remote Branches" header row.
-    PinnedSectionMenu {
+    /// Pinned roots that do not fit in the sidebar's sticky pin budget.
+    SidebarPinnedOverflow {
+        repo_id: RepoId,
+        bottom: bool,
+    },
+    /// Folder toggles for active paths when the sidebar is too short to stack them.
+    SidebarAncestorMenu {
         repo_id: RepoId,
         section: BranchSection,
     },
@@ -358,6 +479,19 @@ pub(crate) enum PopoverKind {
         commit_id: CommitId,
         path: std::path::PathBuf,
     },
+    WorktreeFileMenu {
+        repo_id: RepoId,
+        worktree_path: std::path::PathBuf,
+        target: DiffTarget,
+    },
+    /// A file row of the comparison view; `to_commit_id` is `None` when the
+    /// comparison runs to the working tree.
+    CommitRangeFileMenu {
+        repo_id: RepoId,
+        from_commit_id: CommitId,
+        to_commit_id: Option<CommitId>,
+        path: std::path::PathBuf,
+    },
     FileBrowserFileMenu {
         repo_id: RepoId,
         path: std::path::PathBuf,
@@ -365,6 +499,10 @@ pub(crate) enum PopoverKind {
     FileBrowserFolderMenu {
         repo_id: RepoId,
         path: std::path::PathBuf,
+    },
+    /// The Files tab's cog: which rows the explorer lists.
+    ExplorerSettingsMenu {
+        repo_id: RepoId,
     },
     BrowseHistoryMenu {
         repo_id: RepoId,
@@ -379,11 +517,6 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
         commit_id: CommitId,
     },
-    TagRefMenu {
-        repo_id: RepoId,
-        commit_id: CommitId,
-        name: String,
-    },
     HistoryBranchFilter {
         repo_id: RepoId,
     },
@@ -391,7 +524,12 @@ pub(crate) enum PopoverKind {
         repo_id: RepoId,
     },
     DiffContentModeSettings,
+    /// A chip of the file views' status strip.
+    TextFormatMenu {
+        section: TextFormatMenuSection,
+    },
     ChangeTrackingSettings,
+    /// The bottom bar's zoom menu for this window.
     UiScalePicker,
     RebaseOntoConfirm {
         repo_id: RepoId,
@@ -410,23 +548,53 @@ pub(crate) enum PopoverKind {
     InteractiveRebaseAutosquashMenu,
 }
 
-impl BranchMenuTarget {
-    pub(in crate::view) fn popover_kind(&self, repo_id: RepoId) -> PopoverKind {
-        PopoverKind::BranchMenu {
-            repo_id,
-            section: self.section,
-            name: self.name.clone(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RepoPopoverKind {
     Remote(RemotePopoverKind),
     Worktree(WorktreePopoverKind),
     Submodule(SubmodulePopoverKind),
+    Annex(AnnexPopoverKind),
 }
 
+/// The git-annex sidebar section's menus and its one text prompt.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum AnnexPopoverKind {
+    SectionMenu,
+    /// Menu for one repository or special remote, by annex UUID.
+    RepositoryMenu {
+        uuid: String,
+    },
+    Prompt(AnnexPrompt),
+}
+
+/// What the annex prompt asks for. `ForceDrop` is a confirmation without text.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum AnnexPrompt {
+    AddSpecialRemote,
+    EnableSpecialRemote {
+        name: String,
+    },
+    Describe {
+        repository: String,
+        current: String,
+    },
+    Numcopies {
+        current: Option<u32>,
+    },
+    Trust {
+        repository: String,
+    },
+    ForceDrop {
+        paths: Vec<std::path::PathBuf>,
+    },
+    /// Lists `git annex unused` and drops it.
+    Unused,
+    /// Explains the assistant before starting the webapp.
+    Webapp,
+}
+
+/// `OpenInBrowserMenu` picks which remote's web page to open when several
+/// remotes have one; its rows are rebuilt from the remotes on every render.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum RemotePopoverKind {
     AddPrompt,
@@ -434,6 +602,7 @@ pub(crate) enum RemotePopoverKind {
     RemoveConfirm { name: String },
     Menu { name: String },
     DeleteBranchConfirm { remote: String, branch: String },
+    OpenInBrowserMenu,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -446,7 +615,7 @@ pub(crate) enum WorktreePopoverKind {
     AddPrompt,
     OpenPicker,
     RemovePicker,
-    /// The action bar's workspace badge picker: every worktree including the
+    /// The action bar's worktree badge picker: every worktree including the
     /// current one, plus a create row. Distinct from `OpenPicker`, which hides
     /// the current worktree and has no create affordance.
     BadgePicker,
@@ -489,6 +658,13 @@ impl PopoverKind {
             kind: RepoPopoverKind::Submodule(kind),
         }
     }
+
+    pub(crate) fn annex(repo_id: RepoId, kind: AnnexPopoverKind) -> Self {
+        Self::Repo {
+            repo_id,
+            kind: RepoPopoverKind::Annex(kind),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -523,6 +699,7 @@ pub enum GitCometViewMode {
     #[default]
     Normal,
     FocusedMergetool,
+    FocusedDiff,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -533,13 +710,25 @@ pub enum InitialRepositoryLaunchMode {
 }
 
 #[derive(Clone, Debug, Default)]
+pub enum WorkspaceBootstrap {
+    /// Compatibility path for focused tools and directly-constructed test
+    /// views. Normal application windows always choose Empty or Saved.
+    #[default]
+    LegacySession,
+    Empty,
+    Saved(Box<gitcomet_state::session::Workspace>),
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct GitCometViewConfig {
     pub initial_path: Option<std::path::PathBuf>,
     pub initial_repository_launch_mode: InitialRepositoryLaunchMode,
     pub view_mode: GitCometViewMode,
+    pub focused_diff: Option<crate::FocusedDiffConfig>,
     pub focused_mergetool: Option<FocusedMergetoolViewConfig>,
     pub focused_mergetool_exit_code: Option<Arc<AtomicI32>>,
     pub startup_crash_report: Option<StartupCrashReport>,
+    pub workspace: WorkspaceBootstrap,
 }
 
 impl GitCometViewConfig {
@@ -548,9 +737,11 @@ impl GitCometViewConfig {
             initial_path: None,
             initial_repository_launch_mode: InitialRepositoryLaunchMode::RestoreSession,
             view_mode: GitCometViewMode::Normal,
+            focused_diff: None,
             focused_mergetool: None,
             focused_mergetool_exit_code: None,
             startup_crash_report,
+            workspace: WorkspaceBootstrap::LegacySession,
         }
     }
 
@@ -562,9 +753,11 @@ impl GitCometViewConfig {
             initial_path: Some(initial_path),
             initial_repository_launch_mode: InitialRepositoryLaunchMode::OpenExplicitly,
             view_mode: GitCometViewMode::Normal,
+            focused_diff: None,
             focused_mergetool: None,
             focused_mergetool_exit_code: None,
             startup_crash_report,
+            workspace: WorkspaceBootstrap::Empty,
         }
     }
 }
@@ -621,13 +814,20 @@ pub(crate) enum FocusedMergetoolBootstrapAction {
     Complete,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(in crate::view) struct PendingRepoOpen {
+    pub(in crate::view) failure_revision: u64,
+    /// External drops own their path immediately, but are saved only after validation.
+    pub(in crate::view) persist_in_workspace: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum DeferredRepoBootstrap {
     RestoreSession {
         open_repos: Vec<std::path::PathBuf>,
         active_repo: Option<std::path::PathBuf>,
     },
-    OpenRepo(std::path::PathBuf),
+    OpenRepos(Vec<std::path::PathBuf>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -685,25 +885,28 @@ pub(crate) fn normalize_bootstrap_diff_target(
     repo_path: &std::path::Path,
     target: DiffTarget,
 ) -> DiffTarget {
+    let old_path = target
+        .old_file_path()
+        .map(|path| normalize_bootstrap_target_path(repo_path, path.to_path_buf()));
     match target {
-        DiffTarget::WorkingTree { path, area } => DiffTarget::WorkingTree {
-            path: normalize_bootstrap_target_path(repo_path, path),
-            area,
-        },
-        DiffTarget::Commit { commit_id, path } => DiffTarget::Commit {
-            commit_id,
-            path: path.map(|path| normalize_bootstrap_target_path(repo_path, path)),
-        },
+        DiffTarget::WorkingTree { path, area, .. } => {
+            DiffTarget::working_tree(normalize_bootstrap_target_path(repo_path, path), area)
+        }
+        DiffTarget::Commit {
+            commit_id, path, ..
+        } => DiffTarget::commit(commit_id, normalize_bootstrap_target_path(repo_path, path)),
         DiffTarget::CommitRange {
             from_commit_id,
             to_commit_id,
             path,
-        } => DiffTarget::CommitRange {
+            ..
+        } => DiffTarget::commit_range(
             from_commit_id,
             to_commit_id,
-            path: path.map(|path| normalize_bootstrap_target_path(repo_path, path)),
-        },
+            path.map(|path| normalize_bootstrap_target_path(repo_path, path)),
+        ),
     }
+    .with_old_path(old_path)
 }
 
 pub(crate) fn focused_mergetool_target_path(
@@ -786,6 +989,8 @@ pub(crate) struct TerminalRenderCache {
 pub(crate) struct TerminalViewportView {
     pub(crate) theme: AppTheme,
     pub(crate) focus_handle: FocusHandle,
+    pub(crate) focus_subscriptions: Option<[gpui::Subscription; 2]>,
+    pub(crate) took_press: bool,
     pub(crate) term_lock: Option<AlacrittyTermLock>,
     pub(crate) pty_sender: Option<super::terminal_alacritty::PtySender>,
     pub(crate) layout_cache: Option<TerminalLayoutCache>,
@@ -795,7 +1000,10 @@ pub(crate) struct TerminalViewportView {
     pub(crate) cursor_blink_active: bool,
     pub(crate) cursor_blink_task_scheduled: bool,
     pub(crate) cursor_blink_seq: u64,
+    /// Blinks since the last keystroke, click or focus.
+    pub(crate) cursor_idle_blinks: u32,
     pub(crate) content_epoch: u64,
+    pub(crate) paint_retry_scheduled: bool,
     pub(crate) last_content: Option<super::terminal_alacritty::TerminalContent>,
     pub(crate) viewport_bounds: Option<Bounds<Pixels>>,
     pub(crate) pressed_mouse_button: Option<gpui::MouseButton>,
@@ -829,6 +1037,10 @@ pub(crate) struct TerminalViewportView {
     pub(crate) selection_drag_moved: bool,
     /// Bumped whenever a drag starts or ends so a stale autoscroll ticker exits.
     pub(crate) selection_autoscroll_seq: u64,
+    /// Which window's text selection this viewport owns, if any.
+    /// See [`crate::text_selection_owner`].
+    pub(crate) selection_owner: crate::text_selection_owner::SelectionOwnerToken,
+    pub(crate) _selection_owner_observer: gpui::Subscription,
     pub(crate) ime_state: Option<super::terminal_alacritty::TerminalImeState>,
 }
 
@@ -885,11 +1097,40 @@ pub(crate) struct TerminalShutdownSummary {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(in crate::view) enum TerminalShutdownAction {
-    CloseRepo { repo_id: RepoId },
-    CloseTerminalForRepo { repo_id: RepoId },
-    CloseTerminalTab { repo_id: RepoId, session_seq: u64 },
+    CloseRepo {
+        repo_id: RepoId,
+    },
+    /// Several tabs at once (close others / to the right).
+    CloseRepos {
+        repo_ids: Vec<RepoId>,
+        activate_after: Option<RepoId>,
+    },
+    MoveRepo {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        target_workspace: Option<gitcomet_state::session::WorkspaceId>,
+    },
+    CloseTerminalForRepo {
+        repo_id: RepoId,
+    },
+    CloseTerminalTab {
+        repo_id: RepoId,
+        session_seq: u64,
+    },
     CloseWindow,
+    /// Closes the window (or empties the last one) and forgets its workspace.
+    DeleteWorkspace {
+        workspace_id: gitcomet_state::session::WorkspaceId,
+    },
     QuitApp,
+}
+
+/// A close the Git-operation or extension guards asked about. Confirming it
+/// performs the close: every earlier guard has already passed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) struct CloseGuardPrompt {
+    pub(in crate::view) action: TerminalShutdownAction,
+    pub(in crate::view) reasons: Vec<SharedString>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -902,19 +1143,73 @@ pub(in crate::view) struct TerminalShutdownPrompt {
 ///
 /// Only the two irreversible ones: switching files keeps the buffer, so it
 /// needs no prompt.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(in crate::view) enum UnsavedFileEditsAction {
     /// Carries the window that asked: the retry can run seconds later, after a
     /// slow write drains, by which time "the active window" may be another one.
     CloseWindow(gpui::WindowId),
+    DeleteWorkspace {
+        window_id: gpui::WindowId,
+        workspace_id: gitcomet_state::session::WorkspaceId,
+    },
     QuitApp,
+    MoveRepo {
+        window_id: gpui::WindowId,
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        target_workspace: Option<gitcomet_state::session::WorkspaceId>,
+    },
+}
+
+impl UnsavedFileEditsAction {
+    /// A move only concerns its own repository's buffers.
+    pub(in crate::view) fn moving_repo(&self) -> Option<RepoId> {
+        match self {
+            Self::MoveRepo { repo_id, .. } => Some(*repo_id),
+            Self::CloseWindow(_) | Self::DeleteWorkspace { .. } | Self::QuitApp => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::view) struct UnsavedFileEditsPrompt {
     pub(in crate::view) action: UnsavedFileEditsAction,
+    /// Buffers were discarded, but a move still needs outstanding writes to finish.
+    pub(in crate::view) waiting_for_writes: bool,
     /// Display labels, repo-qualified when the list spans more than one repo.
     pub(in crate::view) files: Vec<SharedString>,
+}
+
+/// Display data for a filesystem dialog; the request it answers stays in the
+/// root view, keyed by `prompt_id`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) struct FilesystemConflictPrompt {
+    pub(in crate::view) prompt_id: u64,
+    pub(in crate::view) destination: std::path::PathBuf,
+    pub(in crate::view) can_merge: bool,
+    /// Other queued collisions of the same operation when the dialog opened.
+    pub(in crate::view) remaining: usize,
+    /// A folder merge is running; more collisions may follow one by one.
+    pub(in crate::view) in_directory_merge: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) struct DeletePermanentlyPrompt {
+    pub(in crate::view) prompt_id: u64,
+    pub(in crate::view) names: Vec<SharedString>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) struct FilesystemUnsavedEditsPrompt {
+    pub(in crate::view) prompt_id: u64,
+    pub(in crate::view) files: Vec<SharedString>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::view) enum FilesystemUnsavedEditsChoice {
+    Cancel,
+    Save,
+    Discard,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -931,6 +1226,8 @@ pub(crate) struct TerminalPanelResizeState {
 pub(crate) enum BottomPanelTab {
     Terminal,
     Reflog,
+    /// An extension's panel, by its index in the registry.
+    Extension(usize),
 }
 
 /// A cell in alacritty's grid coordinate space. `row` is a `Line`: `0` is the
@@ -972,10 +1269,7 @@ pub(crate) fn focused_mergetool_bootstrap_action(
         return None;
     }
 
-    let target = DiffTarget::WorkingTree {
-        area: DiffArea::Unstaged,
-        path: bootstrap.target_path.clone(),
-    };
+    let target = DiffTarget::working_tree(bootstrap.target_path.clone(), DiffArea::Unstaged);
     if repo.diff_state.diff_target.as_ref() != Some(&target) {
         return Some(FocusedMergetoolBootstrapAction::SelectConflictDiff {
             repo_id: repo.id,
@@ -1073,7 +1367,7 @@ pub(crate) fn should_show_startup_repository_loading_screen(
     repository_entry_interstitial_active(view_mode, has_repo_tabs) && startup_repo_bootstrap_pending
 }
 
-pub(crate) fn should_show_splash_screen(
+pub(crate) fn should_show_home_screen(
     view_mode: GitCometViewMode,
     has_repo_tabs: bool,
     startup_repo_bootstrap_pending: bool,
@@ -1082,7 +1376,7 @@ pub(crate) fn should_show_splash_screen(
         && !startup_repo_bootstrap_pending
 }
 
-pub(crate) fn titlebar_workspace_actions_enabled(
+pub(crate) fn titlebar_repo_tab_actions_enabled(
     view_mode: GitCometViewMode,
     has_repo_tabs: bool,
 ) -> bool {
@@ -1105,6 +1399,15 @@ impl ThemeMode {
     }
 
     pub(crate) fn from_key(raw: &str) -> Option<Self> {
+        Self::parse_key(raw, crate::theme::has_theme_key)
+    }
+
+    /// [`Self::from_key`] against an already-read theme list.
+    pub(crate) fn from_catalog_key(raw: &str, themes: &crate::theme::ThemeCatalog) -> Option<Self> {
+        Self::parse_key(raw, |key| themes.get(key).is_some())
+    }
+
+    fn parse_key(raw: &str, known: impl FnOnce(&str) -> bool) -> Option<Self> {
         match raw {
             "automatic" => Some(Self::Automatic),
             "light" => Some(Self::Named(
@@ -1113,7 +1416,7 @@ impl ThemeMode {
             "dark" => Some(Self::Named(
                 crate::theme::DEFAULT_DARK_THEME_KEY.to_string(),
             )),
-            _ if crate::theme::has_theme_key(raw) => Some(Self::Named(raw.to_string())),
+            _ if known(raw) => Some(Self::Named(raw.to_string())),
             _ => None,
         }
     }
@@ -1122,6 +1425,16 @@ impl ThemeMode {
         match self {
             Self::Automatic => "Automatic".to_string(),
             Self::Named(key) => crate::theme::theme_label(key).unwrap_or_else(|| key.clone()),
+        }
+    }
+
+    /// [`Self::label`] against an already-read theme list.
+    pub(crate) fn catalog_label(&self, themes: &crate::theme::ThemeCatalog) -> String {
+        match self {
+            Self::Automatic => "Automatic".to_string(),
+            Self::Named(key) => themes
+                .get(key)
+                .map_or_else(|| key.clone(), |option| option.label.clone()),
         }
     }
 
@@ -1137,6 +1450,11 @@ impl ThemeMode {
         matches!(self, Self::Automatic)
     }
 }
+
+/// How a changed-file list arranges its files: flat, under folders, or under
+/// group headers. The global default is a persisted preference; each list may
+/// override it transiently.
+pub(crate) type FileListLayout = crate::kit::components::ListLayout;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ChangeTrackingView {
@@ -1293,5 +1611,19 @@ impl DiffWhitespaceMode {
             Self::Show => Self::Ignore,
             Self::Ignore => Self::Show,
         }
+    }
+}
+
+impl PopoverKind {
+    pub(in crate::view) fn survives_gate(&self) -> bool {
+        matches!(
+            self,
+            Self::Hosted { .. }
+                | Self::AppMenu
+                | Self::CloseGuardConfirm(_)
+                | Self::UnsavedFileEditsConfirm(_)
+                | Self::TerminalShutdownConfirm(_)
+                | Self::ErrorDetails { .. }
+        )
     }
 }

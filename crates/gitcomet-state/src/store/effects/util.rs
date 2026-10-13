@@ -14,6 +14,13 @@ use super::super::{
 
 pub(super) type RepoMap = FxHashMap<RepoId, Arc<dyn GitRepository>>;
 
+pub(super) fn missing_repo_error(repo_id: RepoId) -> Error {
+    Error::new(ErrorKind::Backend(format!(
+        "Repository handle not found for repo_id {}",
+        repo_id.0
+    )))
+}
+
 /// Keeps operation context safe for a one-line UI subtitle. Git permits odd
 /// characters in paths and user-authored messages, so never let those create
 /// extra layout rows or carry terminal controls into the activity view.
@@ -88,6 +95,17 @@ impl GitOperationTask {
         display_context: Option<String>,
         msg_tx: &StoreWorkerSender,
     ) -> Self {
+        Self::start_with_progress_lane(repo_id, label, display_context, false, msg_tx)
+    }
+
+    /// [`Self::start`] for work the UI shows as a progress card.
+    pub(super) fn start_with_progress_lane(
+        repo_id: RepoId,
+        label: impl Into<String>,
+        display_context: Option<String>,
+        progress_lane: bool,
+        msg_tx: &StoreWorkerSender,
+    ) -> Self {
         let label = label.into();
         let event_tx = msg_tx.clone();
         let context = GitOperationContext::new(label.clone(), move |operation_id, event| {
@@ -109,6 +127,7 @@ impl GitOperationTask {
                 label,
                 context: display_context,
                 time: SystemTime::now(),
+                progress_lane,
             }),
         );
         Self {

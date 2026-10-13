@@ -10,6 +10,10 @@ pub(in crate::view) struct MainPaneInit {
 }
 
 impl MainPaneView {
+    pub(in crate::view) fn external_editor_available(&self) -> bool {
+        self.extension_editor_available || crate::external_editor::configured_setting().is_some()
+    }
+
     pub(in crate::view) fn new(
         store: Arc<AppStore>,
         ui_model: Entity<AppUiModel>,
@@ -38,9 +42,10 @@ impl MainPaneView {
         let annotate_enabled = preferences.diff.annotate_enabled;
         let diff_reveal_whitespace_chars = preferences.diff.reveal_whitespace_chars;
         let diff_word_wrap = preferences.diff.word_wrap;
+        let default_tab_size = preferences.diff.tab_size;
         let diff_show_line_numbers = preferences.diff.show_line_numbers;
+        let remote_markdown_image_policy = preferences.security.remote_markdown_images;
         let auto_save_file_edits = preferences.file_editing.auto_save;
-        let markdown_preview_load_remote_images = preferences.privacy.load_remote_markdown_images;
         let history_show_graph = preferences.history.show_graph;
         let history_show_author = preferences.history.show_author;
         let history_show_date = preferences.history.show_date;
@@ -52,8 +57,18 @@ impl MainPaneView {
         );
         let state = Arc::clone(&ui_model.read(cx).state);
         let initial_fingerprint = Self::notify_fingerprint_for(&state);
+        let text_selection_owner_subscription =
+            crate::text_selection_owner::observe(cx, |this, cx| {
+                // Guarded on a real span: a collapsed anchor left by a plain
+                // click is not a highlight and costs nothing to keep.
+                if this.diff_text_selection_owner.is_stale(cx) && this.diff_text_has_selection() {
+                    this.clear_diff_text_selection_span();
+                    cx.notify();
+                }
+            });
         let subscription = cx.observe(&ui_model, |this, model, cx| {
             let next = Arc::clone(&model.read(cx).state);
+            this.process_file_editor_saves(&next, cx);
             let next_fingerprint = Self::notify_fingerprint_for(&next);
             if next_fingerprint == this.notify_fingerprint {
                 this.state = next;
@@ -65,8 +80,9 @@ impl MainPaneView {
             cx.notify();
         });
 
+        let diff_raw_scroll = ScrollHandle::new();
         let diff_raw_input = cx.new(|cx| {
-            components::TextInput::new(
+            let mut input = components::TextInput::new(
                 components::TextInputOptions {
                     multiline: true,
                     read_only: true,
@@ -74,7 +90,10 @@ impl MainPaneView {
                 },
                 window,
                 cx,
-            )
+            );
+            input.set_editor_font(cx);
+            input.set_vertical_scroll_handle(Some(diff_raw_scroll.clone()));
+            input
         });
         let submodule_hash_inputs = (0..4)
             .map(|_| {
@@ -112,6 +131,7 @@ impl MainPaneView {
                 )),
                 cx,
             );
+            input.set_editor_font(cx);
             input
         });
 
@@ -197,6 +217,7 @@ impl MainPaneView {
                 )),
                 cx,
             );
+            input.set_editor_font(cx);
             input
         });
         let file_editor_subscription = cx.observe(&file_editor_input, |this, _input, cx| {
@@ -216,7 +237,7 @@ impl MainPaneView {
             );
             input.set_submit_on_enter(true);
             input.set_vertical_scroll_handle(Some(diff_search_scroll.clone()));
-            input.set_vertical_padding(Some(px(4.0)), cx);
+            input.set_vertical_padding(Some(4.0), cx);
             input.set_line_height(
                 Some(ui_scale::design_px_from_percent(
                     18.0,
@@ -226,7 +247,8 @@ impl MainPaneView {
             );
             input
         });
-        let diff_search_subscription = cx.observe(&diff_search_input, |this, input, cx| {
+        let mut search_input_snapshot = diff_search_input.read(cx).text_snapshot();
+        let diff_search_subscription = cx.observe(&diff_search_input, move |this, input, cx| {
             if input.update(cx, |input, _| input.take_enter_pressed()) {
                 if this.diff_search_active {
                     this.diff_search_next_match();
@@ -234,6 +256,11 @@ impl MainPaneView {
                 }
                 return;
             }
+            let snapshot = input.read(cx).text_snapshot();
+            if snapshot == search_input_snapshot {
+                return;
+            }
+            search_input_snapshot = snapshot;
             let next: SharedString = input.read(cx).text().to_string().into();
             if this.diff_search_query != next {
                 let previous_query = this.diff_search_query.clone();
@@ -279,6 +306,7 @@ impl MainPaneView {
                 history_show_tags,
                 history_auto_fetch_tags_on_repo_activation,
                 root_view.clone(),
+                tooltip_host.clone(),
                 last_window_size,
                 window,
                 cx,
@@ -286,7 +314,9 @@ impl MainPaneView {
         });
 
         let mut pane = Self {
-            store,
+            store: store.into(),
+            hosted_content_width: None,
+            hosted_decor: None,
             state,
             view_mode,
             focused_mergetool_labels,
@@ -294,7 +324,9 @@ impl MainPaneView {
             theme,
             date_time_format,
             _ui_model_subscription: subscription,
+            _text_selection_owner_subscription: text_selection_owner_subscription,
             root_view,
+            extension_editor_available: false,
             tooltip_host,
             notify_fingerprint: initial_fingerprint,
             active_context_menu_invoker: None,
@@ -318,7 +350,11 @@ impl MainPaneView {
             diff_stage_gutter_cells: FxHashMap::default(),
             blame_time_range_cache: None,
             rendered_preview_modes: RenderedPreviewModes::default(),
+            diagram_search_target: None,
+            remote_markdown_images: RemoteMarkdownImages::new(remote_markdown_image_policy),
             diff_word_wrap,
+            default_tab_size,
+            display_tab_width: usize::from(default_tab_size),
             diff_show_line_numbers,
             diff_scroll_sync,
             diff_content_mode,
@@ -331,8 +367,9 @@ impl MainPaneView {
             diff_cache_repo_id: None,
             diff_cache_rev: 0,
             diff_cache_content_signature: None,
+            patch_signature_memo: None,
             diff_cache_target: None,
-            diff_cache: Vec::new(),
+            diff_cache: Arc::from([]),
             diff_row_provider: None,
             diff_split_row_provider: None,
             diff_file_for_src_ix: Vec::new(),
@@ -343,20 +380,22 @@ impl MainPaneView {
             diff_visual_line_kind_for_src_ix: Vec::new(),
             diff_hide_unified_header_for_src_ix: Vec::new(),
             diff_header_display_cache: FxHashMap::default(),
-            diff_split_cache: Vec::new(),
+            diff_split_cache: Arc::from([]),
             diff_split_cache_len: 0,
             diff_panel_focus_handle,
             diff_autoscroll_pending: false,
             diff_raw_input,
+            diff_raw_scroll,
             submodule_hash_inputs,
-            diff_visible_indices: Vec::new(),
+            submodule_summary_cache: None,
+            diff_visible_indices: Arc::from([]),
             diff_visible_inline_map: None,
-            diff_wrap_visible_rows: Vec::new(),
+            diff_wrap_visible_rows: Arc::from([]),
             diff_wrap_visible_cache_key: None,
             collapsed_diff_hunks: Vec::new(),
             collapsed_diff_hunk_ix_by_src_ix: FxHashMap::default(),
             collapsed_diff_reveals: FxHashMap::default(),
-            collapsed_diff_visible_rows: Vec::new(),
+            collapsed_diff_visible_rows: Arc::from([]),
             collapsed_diff_hunk_visible_indices: Vec::new(),
             collapsed_diff_header_display_cache: FxHashMap::default(),
             collapsed_diff_projection_identity: None,
@@ -373,11 +412,16 @@ impl MainPaneView {
             diff_text_query_segments_cache: Vec::new(),
             diff_text_query_cache_query: SharedString::default(),
             diff_text_query_cache_options: Default::default(),
-            diff_text_query_cache_matcher: None,
+            diff_text_query_cache_matcher_shared: None,
+            blame_label_cache: std::rc::Rc::new(std::cell::RefCell::new(
+                crate::view::rows::BlameLabelCache::default(),
+            )),
             diff_text_query_cache_generation: 0,
             diff_selection_anchor: None,
             diff_selection_range: None,
+            diff_focused_change_block: None,
             diff_text_selecting: false,
+            diff_text_selection_owner: Default::default(),
             diff_text_anchor: None,
             diff_text_head: None,
             diff_text_autoscroll_seq: 0,
@@ -402,6 +446,15 @@ impl MainPaneView {
             diff_search_match_ix: None,
             diff_search_debounce_seq: 0,
             diff_search_pending_previous_query: None,
+            diff_search_worker_running: false,
+            diff_search_worker_seq: 0,
+            diff_search_pending_finalize:
+                super::super::diff_search::DiffSearchFinalizeMode::ScrollToFirst,
+            diff_search_cancellation: None,
+            diff_search_document: None,
+            diff_search_pending_navigation: 0,
+            diff_search_probe_action: 0,
+            diff_search_probe_render: 0,
             diff_search_scroll,
             diff_search_input,
             _diff_search_subscription: diff_search_subscription,
@@ -413,12 +466,14 @@ impl MainPaneView {
             file_diff_cache_error: None,
             file_diff_cache_path: None,
             file_diff_cache_language: None,
-            file_diff_cache_rows: Vec::new(),
+            file_diff_cache_rows: Arc::from([]),
             file_diff_row_provider: None,
             file_diff_old_text: SharedString::default(),
             file_diff_old_line_starts: Arc::default(),
             file_diff_pair_syntax_text: FxHashMap::default(),
             file_diff_click_syntax_inflight: FxHashMap::default(),
+            #[cfg(test)]
+            eager_source_backed_syntax_prepare: true,
             #[cfg(test)]
             file_diff_click_syntax_after_prepare_hook: None,
             #[cfg(test)]
@@ -433,7 +488,7 @@ impl MainPaneView {
             file_diff_new_line_starts: Arc::default(),
             file_diff_new_line_to_row: Arc::default(),
             file_diff_new_line_to_inline_row: Arc::default(),
-            file_diff_inline_cache: Vec::new(),
+            file_diff_inline_cache: Arc::from([]),
             file_diff_inline_row_provider: None,
             file_diff_inline_text: SharedString::default(),
             file_diff_inline_word_highlights: rows::new_lru_cache(
@@ -450,15 +505,17 @@ impl MainPaneView {
             prepared_syntax_documents: FxHashMap::default(),
             #[cfg(test)]
             diff_syntax_budget_override: None,
-            file_markdown_preview_cache_repo_id: None,
-            file_markdown_preview_cache_rev: 0,
-            file_markdown_preview_cache_content_signature: None,
-            file_markdown_preview_cache_target: None,
-            file_markdown_preview: Loadable::NotLoaded,
-            markdown_preview_wrap: MarkdownPreviewWrapCache::default(),
-            markdown_preview_reveal: Default::default(),
-            file_markdown_preview_seq: 0,
-            file_markdown_preview_inflight: None,
+            #[cfg(test)]
+            live_syntax_unbounded_for_tests: false,
+            #[cfg(test)]
+            live_syntax_background_gate_for_tests: None,
+            #[cfg(test)]
+            live_syntax_background_jobs_started: 0,
+            diff_markdown: DiffMarkdownPreview::default(),
+            markdown_interaction: MarkdownPreviewInteraction::default(),
+            worktree_markdown: WorktreeMarkdownPreview::default(),
+            main_pane_surface_frame: 0,
+            main_pane_surface_memo: std::cell::RefCell::new(None),
             file_image_diff_cache_repo_id: None,
             file_image_diff_cache_rev: 0,
             file_image_diff_cache_content_signature: None,
@@ -480,6 +537,8 @@ impl MainPaneView {
             conflict_image_preview_cancel: None,
             worktree_preview_path: None,
             worktree_preview_source_path: None,
+            worktree_preview_decode_key: None,
+            worktree_preview_text_format: None,
             worktree_preview: Loadable::NotLoaded,
             worktree_preview_source_len: 0,
             worktree_preview_text: SharedString::default(),
@@ -487,32 +546,38 @@ impl MainPaneView {
             worktree_preview_line_flags: Arc::default(),
             worktree_preview_search_trigram_index: None,
             worktree_preview_content_rev: 0,
-            worktree_markdown_preview_path: None,
-            worktree_markdown_preview_source_rev: 0,
-            worktree_markdown_preview: Loadable::NotLoaded,
-            worktree_markdown_preview_picture_sizes: Default::default(),
-            worktree_markdown_preview_block_scrolls: Default::default(),
-            worktree_markdown_preview_blocks: Default::default(),
-            worktree_markdown_preview_image_waits: FxHashSet::default(),
-            worktree_markdown_preview_seq: 0,
-            worktree_markdown_preview_inflight: None,
             worktree_preview_segments_cache_path: None,
             worktree_preview_syntax_language: None,
             worktree_preview_style_cache_epoch: 0,
             worktree_preview_cache_write_blocked_until_rev: None,
             worktree_preview_segments_cache: FxHashMap::default(),
             diff_preview_is_new_file: false,
+            worktree_preview_disk: DiskIdentity::default(),
+            worktree_preview_restore_scroll_offset: None,
             file_editor_input,
             _file_editor_input_subscription: file_editor_subscription,
             file_editor_key: None,
+            filesystem_pauses: std::collections::BTreeSet::new(),
+            file_editor_disk_versions: FxHashMap::default(),
+            file_editor_saves: std::collections::BTreeMap::new(),
             file_editor_language: None,
             file_editor_loading: false,
-            file_editor_loaded_status_rev: 0,
+            file_editor_reread_seq: 0,
+            file_editor_disk: DiskIdentity::default(),
             file_editor_error: None,
+            file_editor_text_format: None,
+            file_editor_source_text_format: None,
+            file_editor_decode_key: None,
+            file_editor_waiting_for_attributes: false,
             file_editor_dirty: false,
             file_editor_first_dirty_line: None,
+            file_editor_save_error: None,
             unsaved_file_edits_rev: 0,
             file_editor_saved_fingerprint: None,
+            file_disk_notice: None,
+            file_disk_check_seq: 0,
+            file_disk_check_in_flight: None,
+            file_disk_seen: None,
             file_editor_stash: FxHashMap::default(),
             file_editor_autosave: None,
             file_editor_live_syntax: None,
@@ -520,6 +585,7 @@ impl MainPaneView {
             file_editor_live_syntax_building: None,
             file_editor_live_syntax_build: None,
             file_editor_live_syntax_reparse: None,
+            file_editor_live_syntax_reparsing: None,
             file_editor_syntax_pair: None,
             file_editor_occurrences: Vec::new(),
             file_editor_occurrences_version: None,
@@ -533,19 +599,13 @@ impl MainPaneView {
             file_editor_provider_theme_epoch: 1,
             file_editor_scroll,
             file_editor_gutter_scroll: UniformListScrollHandle::new(),
-            file_editor_gutter_row_height: ui_scale::design_px_from_percent(
-                RESOLVED_OUTPUT_ROW_HEIGHT_PX,
-                ui_scale::current(cx).percent,
-            ),
-            conflict_resolved_gutter_row_height: ui_scale::design_px_from_percent(
-                RESOLVED_OUTPUT_ROW_HEIGHT_PX,
-                ui_scale::current(cx).percent,
-            ),
+            file_editor_gutter_row_height: theme.editor_row_height(ui_scale::current(cx).percent),
+            conflict_resolved_gutter_row_height: theme
+                .editor_row_height(ui_scale::current(cx).percent),
             file_editor_blame: None,
             file_editor_blame_width: px(0.0),
             file_editor_wrap_row_starts: Vec::new(),
             auto_save_file_edits,
-            markdown_preview_load_remote_images,
             conflict_resolver_input,
             _conflict_resolver_input_subscription: conflict_resolver_subscription,
             conflict_resolver: ConflictResolverUiState::default(),
@@ -582,6 +642,7 @@ impl MainPaneView {
             conflict_resolved_preview_line_starts: Arc::default(),
             conflict_resolved_output_live_syntax: None,
             conflict_resolved_output_live_syntax_reparse: None,
+            conflict_resolved_output_live_syntax_reparsing: None,
             conflict_resolved_output_live_syntax_source: None,
             conflict_resolved_output_provider_theme_epoch: 1,
             conflict_resolved_output_highlighted_conflict: None,

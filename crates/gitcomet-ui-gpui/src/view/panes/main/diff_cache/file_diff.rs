@@ -203,7 +203,7 @@ fn file_diff_index_line_capacity_hint(source_len_hint: usize) -> usize {
 enum IndexedFileDiffContent {
     Empty,
     Shared(Arc<str>),
-    File(Arc<std::path::PathBuf>),
+    File(Arc<std::path::PathBuf>, Arc<RecentFileLines>),
 }
 
 #[derive(Clone, Debug)]
@@ -213,6 +213,19 @@ struct IndexedFileDiffSource {
     line_starts: Arc<[usize]>,
     line_flags: Arc<[u8]>,
 }
+
+/// Lines of a file-backed source handed out recently. A line's text loads
+/// lazily from disk (open, seek, read) the first time it is shown; returning
+/// the same shared text for the same line keeps that read for the frames
+/// after it instead of repeating it in every frame that paints the row.
+/// Direct-mapped by line index, so a full pass (search) only cycles slots.
+#[derive(Debug, Default)]
+struct RecentFileLines {
+    slots: std::sync::Mutex<Vec<Option<(usize, gitcomet_core::file_diff::FileDiffLineText)>>>,
+}
+
+const RECENT_FILE_LINES: usize = 1024;
+const RECENT_FILE_LINE_MAX_BYTES: usize = 16 * 1024;
 
 impl IndexedFileDiffSource {
     fn empty() -> Self {
@@ -245,10 +258,10 @@ impl IndexedFileDiffSource {
         }
     }
 
-    fn from_file(path: &std::path::Path) -> Result<Self, String> {
+    fn from_file(path: &std::path::Path) -> Result<Self, IndexedSourceError> {
         let metadata = std::fs::metadata(path).map_err(|e| e.to_string())?;
         if metadata.is_dir() {
-            return Err("file diff source is a directory".to_string());
+            return Err("file diff source is a directory".to_string().into());
         }
 
         let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
@@ -308,7 +321,7 @@ impl IndexedFileDiffSource {
         }
 
         if !utf8_tail.is_empty() {
-            return Err("file diff source is not valid UTF-8".to_string());
+            return Err(IndexedSourceError::NotUtf8);
         }
         if source_len > 0 && !ended_with_newline {
             line_flags.push(preview_line_flags_from_bools(
@@ -318,7 +331,7 @@ impl IndexedFileDiffSource {
         }
 
         Ok(Self {
-            content: IndexedFileDiffContent::File(Arc::new(path.to_path_buf())),
+            content: IndexedFileDiffContent::File(Arc::new(path.to_path_buf()), Arc::default()),
             source_len,
             line_starts: Arc::from(line_starts),
             line_flags: Arc::from(line_flags),
@@ -358,13 +371,34 @@ impl IndexedFileDiffSource {
             IndexedFileDiffContent::Shared(text) => Some(
                 gitcomet_core::file_diff::FileDiffLineText::shared_slice(Arc::clone(text), range),
             ),
-            IndexedFileDiffContent::File(path) => {
-                Some(gitcomet_core::file_diff::FileDiffLineText::file_slice(
-                    Arc::clone(path),
-                    range,
-                    preview_line_is_ascii_without_loading(flags),
-                    preview_line_has_tabs_without_loading(flags),
-                ))
+            IndexedFileDiffContent::File(path, recent_lines) => {
+                let fresh = || {
+                    gitcomet_core::file_diff::FileDiffLineText::file_slice(
+                        Arc::clone(path),
+                        range.clone(),
+                        preview_line_is_ascii_without_loading(flags),
+                        preview_line_has_tabs_without_loading(flags),
+                    )
+                };
+                // Long lines (minified files) are not retained.
+                if range.len() > RECENT_FILE_LINE_MAX_BYTES {
+                    return Some(fresh());
+                }
+                let Ok(mut slots) = recent_lines.slots.lock() else {
+                    return Some(fresh());
+                };
+                if slots.is_empty() {
+                    slots.resize(RECENT_FILE_LINES, None);
+                }
+                let slot = &mut slots[line_ix % RECENT_FILE_LINES];
+                if let Some((cached_ix, text)) = slot.as_ref()
+                    && *cached_ix == line_ix
+                {
+                    return Some(text.clone());
+                }
+                let text = fresh();
+                *slot = Some((line_ix, text.clone()));
+                Some(text)
             }
         }
     }
@@ -379,11 +413,52 @@ fn file_diff_line_count_from_starts(source_len: usize, line_starts: &[usize]) ->
         .saturating_sub(usize::from(line_starts.last().copied() == Some(source_len)))
 }
 
+/// Why a source file could not be indexed. `NotUtf8` is the binary case the
+/// diff pane shows as a placeholder; everything else is a real failure.
+#[derive(Debug)]
+enum IndexedSourceError {
+    NotUtf8,
+    Other(String),
+}
+
+impl From<String> for IndexedSourceError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
+/// Why a file diff could not be built. A binary side is a normal outcome with
+/// its own placeholder rather than an error dump naming a temp file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) enum FileDiffCacheError {
+    /// A side is binary or not UTF-8; sizes are of the sides that exist.
+    NotText {
+        old_bytes: Option<u64>,
+        new_bytes: Option<u64>,
+    },
+    Message(String),
+}
+
+impl From<String> for FileDiffCacheError {
+    fn from(message: String) -> Self {
+        Self::Message(message)
+    }
+}
+
+impl std::fmt::Display for FileDiffCacheError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotText { .. } => f.write_str("file diff source is not valid UTF-8"),
+            Self::Message(message) => f.write_str(message),
+        }
+    }
+}
+
 fn validate_file_diff_utf8_chunk_streaming(
     utf8_tail: &mut Vec<u8>,
     validation_buffer: &mut Vec<u8>,
     chunk: &[u8],
-) -> Result<(), String> {
+) -> Result<(), IndexedSourceError> {
     validation_buffer.clear();
     if !utf8_tail.is_empty() {
         validation_buffer.extend_from_slice(utf8_tail.as_slice());
@@ -397,7 +472,7 @@ fn validate_file_diff_utf8_chunk_streaming(
         }
         Err(error) => {
             if error.error_len().is_some() {
-                return Err("file diff source is not valid UTF-8".to_string());
+                return Err(IndexedSourceError::NotUtf8);
             }
             let valid_up_to = error.valid_up_to();
             utf8_tail.clear();
@@ -1075,42 +1150,27 @@ impl StreamedFileDiffSource {
         ))
     }
 
-    fn change_visible_indices_for_runs(&self, inline: bool) -> Vec<usize> {
-        let len = if inline {
-            self.plan.inline_row_count
-        } else {
-            self.plan.row_count
-        };
-        let mut out = Vec::new();
-
-        for row_ix in 0..len {
-            let is_change = if inline {
-                self.inline_visual_kind(row_ix).is_some_and(|kind| {
-                    matches!(
-                        kind,
-                        gitcomet_core::domain::DiffLineKind::Add
-                            | gitcomet_core::domain::DiffLineKind::Remove
-                    )
-                })
-            } else {
-                self.split_visual_kind(row_ix).is_some_and(|kind| {
-                    !matches!(kind, gitcomet_core::file_diff::FileDiffRowKind::Context)
-                })
-            };
-            if is_change {
-                out.push(row_ix);
-            }
-        }
-
-        out
+    // Grouped by visual kind, not by plan run: ignore-whitespace turns whole
+    // runs back into context.
+    fn split_change_blocks(&self) -> Vec<Range<usize>> {
+        let kinds = &self.split_visual_kinds;
+        crate::view::diff_navigation::change_block_ranges(kinds.len(), |row_ix| {
+            !matches!(
+                kinds[row_ix],
+                gitcomet_core::file_diff::FileDiffRowKind::Context
+            )
+        })
     }
 
-    fn split_change_visible_indices(&self) -> Vec<usize> {
-        self.change_visible_indices_for_runs(false)
-    }
-
-    fn inline_change_visible_indices(&self) -> Vec<usize> {
-        self.change_visible_indices_for_runs(true)
+    fn inline_change_blocks(&self) -> Vec<Range<usize>> {
+        let kinds = &self.inline_visual_kinds;
+        crate::view::diff_navigation::change_block_ranges(kinds.len(), |inline_ix| {
+            matches!(
+                kinds[inline_ix],
+                gitcomet_core::domain::DiffLineKind::Add
+                    | gitcomet_core::domain::DiffLineKind::Remove
+            )
+        })
     }
 
     fn split_scrollbar_markers(&self) -> Vec<components::ScrollbarMarker> {
@@ -1380,8 +1440,8 @@ impl PagedFileDiffRows {
         page.get(page_row_ix).cloned()
     }
 
-    pub(in crate::view) fn change_visible_indices(&self) -> Vec<usize> {
-        self.source.split_change_visible_indices()
+    pub(in crate::view) fn change_blocks(&self) -> Vec<Range<usize>> {
+        self.source.split_change_blocks()
     }
 
     pub(in crate::view) fn scrollbar_markers(&self) -> Vec<components::ScrollbarMarker> {
@@ -1504,8 +1564,8 @@ impl PagedFileDiffInlineRows {
         page.get(page_row_ix).cloned()
     }
 
-    pub(in crate::view) fn change_visible_indices(&self) -> Vec<usize> {
-        self.source.inline_change_visible_indices()
+    pub(in crate::view) fn change_blocks(&self) -> Vec<Range<usize>> {
+        self.source.inline_change_blocks()
     }
 
     pub(in crate::view) fn scrollbar_markers(&self) -> Vec<components::ScrollbarMarker> {
@@ -1572,7 +1632,7 @@ impl gitcomet_core::domain::DiffRowProvider for PagedFileDiffInlineRows {
 fn file_diff_source_text(source: &IndexedFileDiffSource) -> SharedString {
     match &source.content {
         IndexedFileDiffContent::Shared(text) => SharedString::from(Arc::clone(text)),
-        IndexedFileDiffContent::Empty | IndexedFileDiffContent::File(_) => SharedString::default(),
+        IndexedFileDiffContent::Empty | IndexedFileDiffContent::File(..) => SharedString::default(),
     }
 }
 
@@ -1584,7 +1644,7 @@ fn file_diff_source_text(source: &IndexedFileDiffSource) -> SharedString {
 /// it back from here on demand instead of forcing every diff to hold it.
 fn file_diff_source_path(source: &IndexedFileDiffSource) -> Option<Arc<std::path::PathBuf>> {
     match &source.content {
-        IndexedFileDiffContent::File(path) => Some(Arc::clone(path)),
+        IndexedFileDiffContent::File(path, _) => Some(Arc::clone(path)),
         IndexedFileDiffContent::Shared(_) | IndexedFileDiffContent::Empty => None,
     }
 }
@@ -1607,7 +1667,7 @@ fn file_diff_source_plan_text(source: &IndexedFileDiffSource) -> Result<SharedSt
     match &source.content {
         IndexedFileDiffContent::Shared(text) => Ok(SharedString::from(Arc::clone(text))),
         IndexedFileDiffContent::Empty => Ok(SharedString::default()),
-        IndexedFileDiffContent::File(path) => std::fs::read_to_string(path.as_ref())
+        IndexedFileDiffContent::File(path, _) => std::fs::read_to_string(path.as_ref())
             .map(SharedString::from)
             .map_err(|error| {
                 format!(
@@ -1633,18 +1693,32 @@ fn build_file_diff_plan_from_indexed_sources(
 }
 
 fn index_file_diff_side(
+    file: &gitcomet_core::domain::FileDiffText,
     source: Option<&gitcomet_core::domain::FileDiffTextSource>,
     legacy_text: Option<&Arc<str>>,
-) -> Result<IndexedFileDiffSource, String> {
+) -> Result<IndexedFileDiffSource, FileDiffCacheError> {
     if let Some(source) = source {
-        return IndexedFileDiffSource::from_file(&source.path).map_err(|error| {
-            format!(
+        return IndexedFileDiffSource::from_file(&source.path).map_err(|error| match error {
+            IndexedSourceError::NotUtf8 => not_text_error(file),
+            IndexedSourceError::Other(error) => FileDiffCacheError::Message(format!(
                 "Unable to load file diff source `{}`: {error}",
                 source.path.display()
-            )
+            )),
         });
     }
     Ok(IndexedFileDiffSource::from_shared(legacy_text))
+}
+
+fn not_text_error(file: &gitcomet_core::domain::FileDiffText) -> FileDiffCacheError {
+    let bytes = |source: Option<&gitcomet_core::domain::FileDiffTextSource>| {
+        source
+            .and_then(|source| std::fs::metadata(&source.path).ok())
+            .map(|metadata| metadata.len())
+    };
+    FileDiffCacheError::NotText {
+        old_bytes: bytes(file.old_source.as_ref()),
+        new_bytes: bytes(file.new_source.as_ref()),
+    }
 }
 
 fn file_diff_plan_from_runs(
@@ -1883,7 +1957,7 @@ fn build_file_diff_plan_from_patch(
     file_diff_plan_from_runs(runs)
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(in crate::view) struct FileDiffCacheRebuild {
     pub(in crate::view) file_path: Option<std::path::PathBuf>,
     pub(in crate::view) language: Option<rows::DiffSyntaxLanguage>,
@@ -1914,7 +1988,7 @@ pub(in crate::view) struct FileDiffCacheRebuild {
 pub(in crate::view) fn build_file_diff_cache_rebuild(
     file: &gitcomet_core::domain::FileDiffText,
     workdir: &std::path::Path,
-) -> Result<FileDiffCacheRebuild, String> {
+) -> Result<FileDiffCacheRebuild, FileDiffCacheError> {
     build_file_diff_cache_rebuild_with_patch(file, workdir, None, DiffWhitespaceMode::Show)
 }
 
@@ -1923,9 +1997,9 @@ pub(in crate::view) fn build_file_diff_cache_rebuild_with_patch(
     workdir: &std::path::Path,
     patch_diff: Option<&gitcomet_core::domain::Diff>,
     whitespace_mode: DiffWhitespaceMode,
-) -> Result<FileDiffCacheRebuild, String> {
-    let old_source = index_file_diff_side(file.old_source.as_ref(), file.old.as_ref())?;
-    let new_source = index_file_diff_side(file.new_source.as_ref(), file.new.as_ref())?;
+) -> Result<FileDiffCacheRebuild, FileDiffCacheError> {
+    let old_source = index_file_diff_side(file, file.old_source.as_ref(), file.old.as_ref())?;
+    let new_source = index_file_diff_side(file, file.new_source.as_ref(), file.new.as_ref())?;
     let old_text = file_diff_source_text(&old_source);
     let new_text = file_diff_source_text(&new_source);
     let old_source_path = file_diff_source_path(&old_source);
@@ -1938,6 +2012,18 @@ pub(in crate::view) fn build_file_diff_cache_rebuild_with_patch(
     let new_line_starts = Arc::clone(&new_source.line_starts);
     let old_line_count = old_source.line_count();
     let new_line_count = new_source.line_count();
+    // Git's hunks align the rows. A patch without any (git printed "Binary
+    // files differ" for UTF-16 text it cannot read) says nothing about them,
+    // so the decoded sides are diffed directly. Neither does a patch of a
+    // stored pointer: these sources contain the resolved payload.
+    let patch_diff = patch_diff.filter(|patch| {
+        file.old_large.is_none()
+            && file.new_large.is_none()
+            && patch
+                .lines
+                .iter()
+                .any(|line| line.kind == gitcomet_core::domain::DiffLineKind::Hunk)
+    });
     let plan = Arc::new(if let Some(patch_diff) = patch_diff {
         build_file_diff_plan_from_patch(patch_diff, old_line_count, new_line_count)
     } else {
@@ -2013,6 +2099,23 @@ pub(in crate::view) fn build_file_diff_cache_rebuild_with_patch(
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn file_backed_lines_are_read_once_across_frames() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("source.txt");
+        std::fs::write(&path, "zero\none\ntwo\n").expect("write source");
+        let source = IndexedFileDiffSource::from_file(&path).expect("index source");
+        let _ = gitcomet_core::file_diff::take_file_slice_opens_for_tests();
+        // Each frame asks a clone of the source for the row's text again.
+        for source in [source.clone(), source] {
+            assert_eq!(source.line_text(1).expect("line").as_str(), "one");
+        }
+        assert_eq!(
+            gitcomet_core::file_diff::take_file_slice_opens_for_tests(),
+            1
+        );
+    }
 
     fn streamed_file_diff_source_for_test_with_mode(
         old: &str,
@@ -2158,8 +2261,8 @@ mod tests {
                 gitcomet_core::domain::DiffLineKind::Context
             ]
         );
-        assert!(split.change_visible_indices().is_empty());
-        assert!(inline.change_visible_indices().is_empty());
+        assert!(split.change_blocks().is_empty());
+        assert!(inline.change_blocks().is_empty());
         assert!(split.scrollbar_markers().is_empty());
         assert!(inline.scrollbar_markers().is_empty());
     }
@@ -2193,21 +2296,50 @@ mod tests {
                 .iter()
                 .all(|kind| *kind == gitcomet_core::domain::DiffLineKind::Context)
         );
-        assert!(split.change_visible_indices().is_empty());
-        assert!(inline.change_visible_indices().is_empty());
+        assert!(split.change_blocks().is_empty());
+        assert!(inline.change_blocks().is_empty());
     }
 
     #[test]
-    fn file_diff_change_visible_indices_include_every_changed_row() {
+    fn file_diff_change_blocks_span_each_contiguous_run() {
         let source = streamed_file_diff_source_for_test(
-            "alpha\nold one\nold two\nold three\nomega\n",
-            "alpha\nnew one\nnew two\nnew three\nomega\n",
+            "alpha\nold one\nold two\nmiddle\nold three\nomega\n",
+            "alpha\nnew one\nnew two\nmiddle\nnew three\nomega\n",
         );
         let split = PagedFileDiffRows::new(Arc::clone(&source), 1);
         let inline = PagedFileDiffInlineRows::new(Arc::clone(&source), 1);
 
-        assert_eq!(split.change_visible_indices(), vec![1, 2, 3]);
-        assert_eq!(inline.change_visible_indices(), vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(split.change_blocks(), vec![1..3, 4..5]);
+        // Inline interleaves each modified pair as `-`/`+`.
+        assert_eq!(inline.change_blocks(), vec![1..5, 6..8]);
+    }
+
+    #[test]
+    fn file_diff_change_blocks_drop_whitespace_only_blocks_when_ignored() {
+        let old_text = "alpha\nold one\nmiddle\n  keep\nomega\n";
+        let new_text = "alpha\nnew one\nmiddle\nkeep\nomega\n";
+
+        let shown = streamed_file_diff_source_for_test(old_text, new_text);
+        let shown_starts = PagedFileDiffRows::new(Arc::clone(&shown), 1)
+            .change_blocks()
+            .into_iter()
+            .map(|block| block.start)
+            .collect::<Vec<_>>();
+        assert_eq!(shown_starts, vec![1, 3]);
+
+        let ignored = streamed_file_diff_source_for_test_with_mode(
+            old_text,
+            new_text,
+            DiffWhitespaceMode::Ignore,
+        );
+        assert_eq!(
+            PagedFileDiffRows::new(Arc::clone(&ignored), 1).change_blocks(),
+            vec![1..2]
+        );
+        assert_eq!(
+            PagedFileDiffInlineRows::new(Arc::clone(&ignored), 1).change_blocks(),
+            vec![1..3]
+        );
     }
 
     #[test]
@@ -2353,6 +2485,37 @@ mod tests {
     }
 
     #[test]
+    fn a_patch_without_hunks_diffs_the_decoded_sides_itself() {
+        // What git prints for UTF-16 text without working-tree-encoding.
+        let binary_patch = gitcomet_core::domain::Diff::from_unified(
+            gitcomet_core::domain::DiffTarget::working_tree(
+                PathBuf::from("notes.txt"),
+                gitcomet_core::domain::DiffArea::Unstaged,
+            ),
+            "diff --git a/notes.txt b/notes.txt\nBinary files a/notes.txt and b/notes.txt differ\n",
+        );
+        let file = gitcomet_core::domain::FileDiffText::new(
+            PathBuf::from("notes.txt"),
+            Some("hello\nsame\n".to_string()),
+            Some("hello\nchanged\n".to_string()),
+        );
+        let rebuild = build_file_diff_cache_rebuild_with_patch(
+            &file,
+            Path::new("/tmp/repo"),
+            Some(&binary_patch),
+            DiffWhitespaceMode::Show,
+        )
+        .expect("rebuild");
+        assert!(
+            rebuild
+                .rows
+                .iter()
+                .any(|row| row.kind != gitcomet_core::file_diff::FileDiffRowKind::Context),
+            "the changed line must not be shown as unchanged"
+        );
+    }
+
+    #[test]
     fn build_file_diff_cache_rebuild_reports_invalid_source_file() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let source_path = tmp.path().join("binary.dat");
@@ -2369,8 +2532,72 @@ mod tests {
         let error = build_file_diff_cache_rebuild(&file, tmp.path())
             .expect_err("invalid UTF-8 source should be reported");
 
-        assert!(error.contains(source_path.to_string_lossy().as_ref()));
-        assert!(error.contains("not valid UTF-8"));
+        assert_eq!(
+            error,
+            FileDiffCacheError::NotText {
+                old_bytes: None,
+                new_bytes: Some(3),
+            },
+            "binary content is a placeholder outcome, not an error dump"
+        );
+    }
+
+    #[test]
+    fn build_file_diff_cache_rebuild_reports_unreadable_source_as_message() {
+        let file = gitcomet_core::domain::FileDiffText::new_sources(
+            PathBuf::from("missing.txt"),
+            None,
+            Some(gitcomet_core::domain::FileDiffTextSource::with_identity(
+                PathBuf::from("/nonexistent/gitcomet-missing-source"),
+                "missing-source",
+            )),
+        );
+        match build_file_diff_cache_rebuild(&file, Path::new("/tmp/repo")) {
+            Err(FileDiffCacheError::Message(message)) => {
+                assert!(message.contains("gitcomet-missing-source"), "{message}");
+            }
+            other => panic!("expected a message error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolved_lfs_diff_uses_content_changes_instead_of_pointer_hunks() {
+        use gitcomet_core::domain::{Diff, DiffArea, DiffTarget, FileDiffText};
+        use gitcomet_core::large_files::{LargeFileContent, LargeFilePointer, LargeFileSide};
+        let old = (1..=10)
+            .map(|i| format!("line {i:02}\n"))
+            .collect::<String>();
+        let new = old.replace("line 08", "edit 08");
+        let side = |byte| LargeFileSide {
+            pointer: LargeFilePointer::Lfs(gitcomet_core::lfs::LfsPointer {
+                oid: gitcomet_core::lfs::LfsOid([byte; 32]),
+                size: 80,
+            }),
+            content: LargeFileContent::Available,
+        };
+        let target = DiffTarget::working_tree("data.bin".into(), DiffArea::Unstaged);
+        let patch = Diff::from_unified(
+            target,
+            &format!(
+                "diff --git a/data.bin b/data.bin\n--- a/data.bin\n+++ b/data.bin\n@@ -1,3 +1,3 @@\n version https://git-lfs.github.com/spec/v1\n-oid sha256:{}\n+oid sha256:{}\n size 80\n",
+                "01".repeat(32),
+                "02".repeat(32)
+            ),
+        );
+        let file = FileDiffText::new("data.bin".into(), Some(old), Some(new))
+            .with_large_sides(Some(side(1)), Some(side(2)));
+        let rebuilt = build_file_diff_cache_rebuild_with_patch(
+            &file,
+            Path::new("/tmp"),
+            Some(&patch),
+            DiffWhitespaceMode::Show,
+        )
+        .unwrap();
+        assert_eq!(
+            rebuilt.row_provider.change_blocks(),
+            vec![7..8],
+            "only payload line 8 changed"
+        );
     }
 
     #[test]

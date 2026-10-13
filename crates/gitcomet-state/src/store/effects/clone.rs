@@ -7,6 +7,7 @@ use gitcomet_core::auth::askpass::{
 };
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::process::{bytes_to_text_preserving_utf8, git_command};
+use gitcomet_core::remote_url::{RemoteUrlPolicy, validate_remote_url_with_policy};
 use gitcomet_core::services::CommandOutput;
 use gitcomet_core::text_utils::redact_url_userinfo;
 use rustc_hash::FxHashMap;
@@ -14,7 +15,7 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -28,8 +29,6 @@ use gitcomet_core::auth::{
 };
 
 const GIT_COMMAND_WAIT_POLL: Duration = Duration::from_millis(100);
-const ALLOWED_CLONE_URL_SCHEMES: [&str; 4] = ["https", "ssh", "git", "file"];
-
 struct ActiveCloneHandle {
     cancel_requested: AtomicBool,
     child: Mutex<Option<Child>>,
@@ -121,74 +120,6 @@ fn active_clones() -> &'static Mutex<FxHashMap<PathBuf, Arc<ActiveCloneHandle>>>
     static ACTIVE_CLONES: OnceLock<Mutex<FxHashMap<PathBuf, Arc<ActiveCloneHandle>>>> =
         OnceLock::new();
     ACTIVE_CLONES.get_or_init(|| Mutex::new(FxHashMap::default()))
-}
-
-fn is_windows_drive_path(url: &str) -> bool {
-    let bytes = url.as_bytes();
-    bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && (bytes[2] == b'\\' || bytes[2] == b'/')
-}
-
-fn explicit_url_scheme_end(url: &str) -> Option<usize> {
-    if is_windows_drive_path(url) {
-        return None;
-    }
-
-    let mut chars = url.char_indices();
-    let (_, first) = chars.next()?;
-    if !first.is_ascii_alphabetic() {
-        return None;
-    }
-
-    for (idx, ch) in chars {
-        if ch == ':' {
-            return Some(idx);
-        }
-        if !(ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '.')) {
-            return None;
-        }
-    }
-
-    None
-}
-
-fn validate_clone_url(url: &str) -> Result<(), Error> {
-    let url = url.trim();
-    if url.is_empty() {
-        return Err(Error::new(ErrorKind::Backend(
-            "clone URL cannot be empty".to_string(),
-        )));
-    }
-
-    // Schemeless inputs (`/tmp/repo.git`, `git@host:org/repo.git`, `C:\\repo`)
-    // are handed to git as-is, so this is the only place an option-looking
-    // value would be caught before `git clone` parses it as one.
-    if url.starts_with('-') {
-        return Err(Error::new(ErrorKind::Backend(format!(
-            "clone URL cannot start with '-': {url:?}"
-        ))));
-    }
-
-    let Some(scheme_end) = explicit_url_scheme_end(url) else {
-        return Ok(());
-    };
-
-    let scheme = url[..scheme_end].to_ascii_lowercase();
-    if !ALLOWED_CLONE_URL_SCHEMES.contains(&scheme.as_str()) {
-        return Err(Error::new(ErrorKind::Backend(format!(
-            "unsupported clone URL scheme `{scheme}` (allowed: https, ssh, git, file)"
-        ))));
-    }
-
-    if !url[scheme_end..].starts_with("://") {
-        return Err(Error::new(ErrorKind::Backend(format!(
-            "invalid clone URL format for `{scheme}`; expected `{scheme}://...`"
-        ))));
-    }
-
-    Ok(())
 }
 
 /// The label shown in the command log and in failure messages; the URL is
@@ -307,6 +238,7 @@ pub(super) fn schedule_clone_repo(
     msg_tx: StoreWorkerSender,
     url: String,
     dest: PathBuf,
+    remote_url_policy: RemoteUrlPolicy,
     auth: Option<StagedGitAuth>,
 ) {
     let active_clone = Arc::new(ActiveCloneHandle::new());
@@ -316,7 +248,7 @@ pub(super) fn schedule_clone_repo(
     executor.spawn(move || {
         let _registration = registration;
 
-        if let Err(err) = validate_clone_url(&url) {
+        if let Err(err) = validate_remote_url_with_policy(&url, remote_url_policy) {
             send_or_log(
                 &msg_tx,
                 Msg::Internal(crate::msg::InternalMsg::CloneRepoFinished {
@@ -329,6 +261,16 @@ pub(super) fn schedule_clone_repo(
         }
 
         let mut cmd = build_clone_command(&url, &dest);
+        // git-lfs is silent on a non-terminal stderr; its progress file is the
+        // only sign of life while a large checkout downloads.
+        let lfs_progress = tempfile::Builder::new()
+            .prefix("gitcomet-clone-lfs-progress-")
+            .tempfile()
+            .ok()
+            .map(|file| file.into_temp_path());
+        if let Some(path) = lfs_progress.as_ref() {
+            cmd.env("GIT_LFS_PROGRESS", path.as_os_str());
+        }
         cmd.stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null())
@@ -374,6 +316,10 @@ pub(super) fn schedule_clone_repo(
         active_clone.set_child(child);
 
         let (stdout, stderr) = active_clone.take_stdio();
+        // Millis since `start` of the last stderr chunk: the deadline measures
+        // silence, so a clone that keeps reporting progress is never killed.
+        let start = Instant::now();
+        let last_activity = Arc::new(AtomicU64::new(0));
         let stdout_handle = std::thread::spawn(move || {
             let mut buf = Vec::new();
             if let Some(mut stdout) = stdout {
@@ -384,6 +330,7 @@ pub(super) fn schedule_clone_repo(
 
         let progress_dest = Arc::new(dest.clone());
         let progress_tx = msg_tx.clone();
+        let stderr_activity = Arc::clone(&last_activity);
         let stderr_handle = std::thread::spawn(move || {
             let mut stderr_bytes = Vec::new();
             let mut pending = Vec::new();
@@ -393,6 +340,9 @@ pub(super) fn schedule_clone_repo(
                     match stderr.read(&mut buf) {
                         Ok(0) => break,
                         Ok(n) => {
+                            let millis =
+                                u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                            stderr_activity.fetch_max(millis, Ordering::Relaxed);
                             let chunk = &buf[..n];
                             stderr_bytes.extend_from_slice(chunk);
                             pending.extend_from_slice(chunk);
@@ -423,13 +373,26 @@ pub(super) fn schedule_clone_repo(
         });
 
         let timeout = git_command_timeout();
-        let start = Instant::now();
         let mut timed_out = false;
+        let mut lfs_progress_len = 0u64;
         let status = loop {
             match active_clone.try_wait() {
                 Ok(Some(status)) => break Ok(status),
                 Ok(None) => {
-                    if start.elapsed() >= timeout {
+                    if let Some(len) = lfs_progress
+                        .as_ref()
+                        .and_then(|path| fs::metadata(path).ok())
+                        .map(|metadata| metadata.len())
+                        .filter(|len| *len != lfs_progress_len)
+                    {
+                        lfs_progress_len = len;
+                        let millis = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                        last_activity.fetch_max(millis, Ordering::Relaxed);
+                    }
+                    let idle = start.elapsed().saturating_sub(Duration::from_millis(
+                        last_activity.load(Ordering::Relaxed),
+                    ));
+                    if idle >= timeout {
                         timed_out = true;
                         active_clone.request_cancel();
                         break active_clone.wait();
@@ -448,7 +411,7 @@ pub(super) fn schedule_clone_repo(
             Ok(status) => {
                 if timed_out {
                     Err(Error::new(ErrorKind::Backend(format!(
-                        "{command_str} timed out after {} seconds (set {GIT_COMMAND_TIMEOUT_ENV} to override)",
+                        "{command_str} timed out after {} seconds without output (set {GIT_COMMAND_TIMEOUT_ENV} to override)",
                         timeout.as_secs()
                     ))))
                 } else if active_clone.cancel_requested() && !status.success() {
@@ -517,6 +480,8 @@ pub(super) fn schedule_abort_clone_repo(_msg_tx: StoreWorkerSender, dest: PathBu
 
 #[cfg(test)]
 mod tests {
+    use gitcomet_core::remote_url::validate_remote_url;
+
     use super::*;
     use std::process::Command;
 
@@ -539,32 +504,7 @@ mod tests {
             .any(|(k, v)| k == OsStr::new(key) && v.is_none())
     }
 
-    #[test]
-    fn validate_clone_url_accepts_allowlisted_schemes() {
-        assert!(validate_clone_url("https://example.com/org/repo.git").is_ok());
-        assert!(validate_clone_url("ssh://git@example.com/org/repo.git").is_ok());
-        assert!(validate_clone_url("git://example.com/org/repo.git").is_ok());
-        assert!(validate_clone_url("file:///tmp/repo.git").is_ok());
-    }
-
-    #[test]
-    fn validate_clone_url_rejects_unallowlisted_schemes() {
-        assert!(validate_clone_url("ext::sh -c touch /tmp/pwned").is_err());
-        assert!(validate_clone_url("http://example.com/org/repo.git").is_err());
-    }
-
-    #[test]
-    fn validate_clone_url_keeps_schemeless_inputs_working() {
-        assert!(validate_clone_url("/tmp/repo.git").is_ok());
-        assert!(validate_clone_url("git@github.com:org/repo.git").is_ok());
-        assert!(validate_clone_url("C:\\repos\\repo.git").is_ok());
-    }
-
-    #[test]
-    fn validate_clone_url_rejects_malformed_allowlisted_schemes() {
-        assert!(validate_clone_url("ssh:git@example.com/org/repo.git").is_err());
-    }
-
+    /// Scheme coverage lives with the validator; this pins the clone-only shape.
     #[test]
     fn validate_clone_url_rejects_option_like_inputs() {
         for url in [
@@ -573,7 +513,7 @@ mod tests {
             "--upload-pack=touch /tmp/pwned",
             "  --template=/tmp/x",
         ] {
-            let err = validate_clone_url(url).expect_err(url);
+            let err = validate_remote_url(url).expect_err(url);
             assert!(
                 err.to_string().contains("cannot start with '-'"),
                 "{url}: {err}"
@@ -604,6 +544,10 @@ mod tests {
         assert_eq!(
             args,
             [
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("protocol.ext.allow=never"),
+                std::ffi::OsStr::new("-c"),
+                std::ffi::OsStr::new("maintenance.auto=false"),
                 std::ffi::OsStr::new("-c"),
                 std::ffi::OsStr::new("color.ui=false"),
                 std::ffi::OsStr::new("clone"),

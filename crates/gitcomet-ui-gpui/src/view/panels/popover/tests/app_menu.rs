@@ -3,7 +3,7 @@ use super::*;
 fn open_app_menu(
     cx: &mut gpui::TestAppContext,
 ) -> (Entity<GitCometView>, &mut gpui::VisualTestContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
 
@@ -56,6 +56,61 @@ fn app_menu_places_quit_after_close_window(cx: &mut gpui::TestAppContext) {
     assert!(
         quit.top() >= close_window.bottom(),
         "Quit should be the final row after Close Window"
+    );
+}
+
+#[gpui::test]
+fn app_menu_quit_waits_until_the_popover_update_finishes(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = open_app_menu(cx);
+    let quit = cx
+        .debug_bounds("app_menu_quit")
+        .expect("app menu should offer Quit");
+
+    cx.simulate_mouse_move(quit.center(), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        quit.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        quit.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    cx.update(|_window, app| {
+        assert!(
+            !view.read(app).popover_host.read(app).is_open(),
+            "Quit should close the app menu without re-entering its PopoverHost update"
+        );
+    });
+}
+
+#[gpui::test]
+fn app_menu_close_window_waits_until_the_popover_update_finishes(cx: &mut gpui::TestAppContext) {
+    let (_view, cx) = open_app_menu(cx);
+    let close_window = cx
+        .debug_bounds("app_menu_close_window")
+        .expect("app menu should offer Close Window");
+
+    cx.simulate_mouse_move(close_window.center(), None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(
+        close_window.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        close_window.center(),
+        gpui::MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.cx.update(|app| app.windows().len()),
+        0,
+        "Close Window should remove the window after releasing the PopoverHost update"
     );
 }
 
@@ -161,4 +216,249 @@ fn app_menu_offers_the_reflog_panel(cx: &mut gpui::TestAppContext) {
         reflog.bottom() <= apply_patch.top(),
         "Reflog should sit above Apply patch"
     );
+}
+
+#[gpui::test]
+fn app_menu_offers_open_remote_beside_the_file_explorer(cx: &mut gpui::TestAppContext) {
+    let (_view, cx) = open_app_menu(cx);
+    let locate = cx
+        .debug_bounds("app_menu_locate_file")
+        .expect("app menu should offer Open in file explorer");
+    let open_remote = cx
+        .debug_bounds("app_menu_open_remote_in_browser")
+        .expect("app menu should offer Open remote in web browser");
+    let reflog = cx
+        .debug_bounds("app_menu_show_reflog")
+        .expect("app menu should offer Reflog");
+
+    assert!(open_remote.top() >= locate.bottom());
+    assert!(open_remote.bottom() <= reflog.top());
+}
+
+/// A view whose active repository has these remotes, with the app shortcuts
+/// installed so a dispatched `OpenRemoteInBrowser` has somewhere to land.
+fn app_menu_view_with_remotes(
+    cx: &mut gpui::TestAppContext,
+    remotes: Vec<gitcomet_core::domain::Remote>,
+) -> (Entity<GitCometView>, &mut gpui::VisualTestContext) {
+    app_menu_view_with(cx, Loadable::Ready(Arc::new(remotes)))
+}
+
+fn app_menu_view_with(
+    cx: &mut gpui::TestAppContext,
+    remotes: Loadable<Arc<Vec<gitcomet_core::domain::Remote>>>,
+) -> (Entity<GitCometView>, &mut gpui::VisualTestContext) {
+    let backend: Arc<dyn GitBackend> = Arc::new(TestBackend);
+    let (store, events) = AppStore::new_test(Arc::clone(&backend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo_id = RepoId(23);
+    cx.update(|window, app| {
+        crate::app::install_app_shortcuts_for_test(app, backend);
+        view.update(app, |this, cx| {
+            let mut repo = RepoState::new_opening(
+                repo_id,
+                gitcomet_core::domain::RepoSpec {
+                    workdir: std::env::temp_dir().join("gitcomet_ui_test_app_menu_remote"),
+                },
+            );
+            repo.open = Loadable::Ready(());
+            repo.remotes = remotes;
+            let state = Arc::new(AppState {
+                repos: vec![repo],
+                active_repo: Some(repo_id),
+                ..AppState::test_default()
+            });
+            this.state = Arc::clone(&state);
+            this.ui_model
+                .update(cx, |model, cx| model.set_state(state, cx));
+        });
+        let _ = window.draw(app);
+    });
+    (view, cx)
+}
+
+fn open_remote_entry_disabled(
+    cx: &mut gpui::VisualTestContext,
+    view: &Entity<GitCometView>,
+) -> Option<bool> {
+    cx.update(|_window, app| {
+        let host = view.read(app).popover_host.read(app);
+        super::super::app_menu::model(host)
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ContextMenuItem::Entry {
+                    label, disabled, ..
+                } if label.as_ref() == crate::menu_labels::OPEN_REMOTE_IN_BROWSER => {
+                    Some(*disabled)
+                }
+                _ => None,
+            })
+    })
+}
+
+fn web_remote(name: &str, url: &str) -> gitcomet_core::domain::Remote {
+    gitcomet_core::domain::Remote {
+        name: name.to_string(),
+        url: Some(url.to_string()),
+    }
+}
+
+#[gpui::test]
+fn app_menu_disables_open_remote_without_a_repository(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = open_app_menu(cx);
+    assert_eq!(open_remote_entry_disabled(cx, &view), Some(true));
+}
+
+#[gpui::test]
+fn app_menu_disables_open_remote_while_remotes_load(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = app_menu_view_with(cx, Loadable::Loading);
+    assert_eq!(open_remote_entry_disabled(cx, &view), Some(true));
+}
+
+#[gpui::test]
+fn app_menu_disables_open_remote_without_remotes(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = app_menu_view_with_remotes(cx, Vec::new());
+    assert_eq!(open_remote_entry_disabled(cx, &view), Some(true));
+}
+
+#[gpui::test]
+fn app_menu_open_remote_shows_the_chord(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = open_app_menu(cx);
+    let shortcut = cx.update(|_window, app| {
+        let host = view.read(app).popover_host.read(app);
+        super::super::app_menu::model(host)
+            .items
+            .iter()
+            .find_map(|item| match item {
+                ContextMenuItem::Entry {
+                    label, shortcut, ..
+                } if label.as_ref() == crate::menu_labels::OPEN_REMOTE_IN_BROWSER => {
+                    shortcut.clone()
+                }
+                _ => None,
+            })
+    });
+    let expected = if cfg!(target_os = "macos") {
+        "Cmd+K"
+    } else {
+        "Ctrl+K"
+    };
+    assert_eq!(shortcut.as_deref(), Some(expected));
+}
+
+#[gpui::test]
+fn app_menu_disables_open_remote_without_a_web_page(cx: &mut gpui::TestAppContext) {
+    let (view, cx) =
+        app_menu_view_with_remotes(cx, vec![web_remote("origin", "/srv/git/repo.git")]);
+    assert_eq!(open_remote_entry_disabled(cx, &view), Some(true));
+}
+
+#[gpui::test]
+fn app_menu_enables_open_remote_with_a_web_page(cx: &mut gpui::TestAppContext) {
+    let (view, cx) = app_menu_view_with_remotes(
+        cx,
+        vec![web_remote("origin", "git@github.com:org/repo.git")],
+    );
+    assert_eq!(open_remote_entry_disabled(cx, &view), Some(false));
+}
+
+#[gpui::test]
+fn app_menu_open_remote_hands_off_to_the_remote_picker(cx: &mut gpui::TestAppContext) {
+    // Two web remotes, so the click can only open the picker, never a browser.
+    let (view, cx) = app_menu_view_with_remotes(
+        cx,
+        vec![
+            web_remote("origin", "git@github.com:org/repo.git"),
+            web_remote("upstream", "https://gitlab.com/upstream/repo.git"),
+        ],
+    );
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.popover_host.update(cx, |host, cx| {
+                host.open_popover_at(
+                    PopoverKind::AppMenu,
+                    gpui::point(gpui::px(120.0), gpui::px(72.0)),
+                    window,
+                    cx,
+                );
+            });
+        });
+        let _ = window.draw(app);
+    });
+
+    let center = cx
+        .debug_bounds("app_menu_open_remote_in_browser")
+        .expect("expected the Open remote row")
+        .center();
+    cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
+    cx.simulate_mouse_down(center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.simulate_mouse_up(center, gpui::MouseButton::Left, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let picker = PopoverKind::remote(RepoId(23), RemotePopoverKind::OpenInBrowserMenu);
+    cx.update(|_window, app| {
+        assert!(
+            view.read(app).popover_host.read(app).is_kind_open(&picker),
+            "the app menu row should open the remote picker in its place"
+        );
+    });
+}
+
+/// This fork does not track upstream releases, so there is nothing to check
+/// for, and the request would only disclose that the app was launched.
+#[gpui::test]
+fn app_menu_offers_no_update_check(cx: &mut gpui::TestAppContext) {
+    let (_view, cx) = open_app_menu(cx);
+    assert!(
+        cx.debug_bounds("app_menu_apply_patch").is_some(),
+        "precondition: the app menu should be open"
+    );
+    assert!(
+        cx.debug_bounds("app_menu_check_for_updates").is_none(),
+        "the app menu must not offer an update check"
+    );
+}
+
+#[gpui::test]
+fn app_menu_zoom_in_zooms_only_this_window(cx: &mut gpui::TestAppContext) {
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (_view, cx) = open_app_menu(cx);
+    cx.update(|window, app| {
+        crate::app::install_app_shortcuts_for_test(app, Arc::new(TestBackend));
+        let _ = window.draw(app);
+    });
+    for selector in [
+        "app_menu_zoom_in",
+        "app_menu_zoom_out",
+        "app_menu_reset_zoom",
+    ] {
+        assert!(cx.debug_bounds(selector).is_some(), "expected {selector}");
+    }
+    let before = cx.update(|_window, app| crate::ui_scale::current(app).percent);
+
+    let center = cx
+        .debug_bounds("app_menu_zoom_in")
+        .expect("zoom in")
+        .center();
+    cx.simulate_click(center, gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let (after, own_zoom, default) = cx.update(|window, app| {
+        (
+            crate::ui_scale::current(app).percent,
+            crate::ui_scale::window_override(app, window.window_handle().window_id()),
+            crate::ui_scale::default_percent(app),
+        )
+    });
+    assert!(
+        after > before,
+        "Zoom In should raise the scale ({before}% -> {after}%)"
+    );
+    assert_eq!(own_zoom, Some(after), "the zoom belongs to this window");
+    assert_eq!(default, before, "the default UI scale is untouched");
+    cx.update(|window, app| {
+        crate::ui_scale::set_window_percent(app, window.window_handle().window_id(), None);
+    });
 }

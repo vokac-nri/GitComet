@@ -43,12 +43,14 @@ pub(super) fn panel(
         )
         .render(
             theme,
-            dialog_cancel_button(
+            cancel_button(
                 "stage_conflict_markers_cancel",
                 "stage_conflict_markers_cancel_hint",
                 theme,
-                cx,
-            ),
+            )
+            .on_click(theme, cx, |this, _event, window, cx| {
+                this.close_popover_and_restore_focus(window, cx);
+            }),
             components::Button::new("stage_conflict_markers_go", "Stage anyway")
                 .style(components::ButtonStyle::Danger)
                 .on_click(theme, cx, move |this, _e, _w, cx| {
@@ -58,11 +60,12 @@ pub(super) fn panel(
                     if clear_selection {
                         this.clear_status_multi_selection(repo_id, cx);
                     }
-                    this.store.dispatch(Msg::ClearDiffSelection { repo_id });
-                    this.store.dispatch(Msg::StagePaths {
+                    crate::view::status_actions::stage_or_unstage_paths(
+                        &this.store,
                         repo_id,
-                        paths: paths.clone().into(),
-                    });
+                        DiffArea::Unstaged,
+                        paths.clone(),
+                    );
                     this.close_popover(cx);
                 }),
             cx,

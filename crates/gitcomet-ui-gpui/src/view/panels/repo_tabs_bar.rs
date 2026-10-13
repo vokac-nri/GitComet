@@ -1,5 +1,7 @@
 use super::super::path_display;
 use super::*;
+use crate::kit::click::PointerClickExt as _;
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use rustc_hash::FxHasher;
 use std::cell::Cell;
 use std::hash::{Hash, Hasher};
@@ -21,6 +23,8 @@ pub(in super::super) struct RepoTabsBarView {
     active_context_menu_invoker: Option<SharedString>,
     repo_tab_spinner_delay: Option<RepoTabSpinnerDelayState>,
     repo_tab_spinner_delay_seq: u64,
+    /// Show the busy spinner only once a load outlasts the delay.
+    uses_spinner_delay: bool,
     notify_fingerprint: u64,
     repo_tab_drag_visual: Option<RepoTabDragVisual>,
     tab_scroll: components::TabBarScroll,
@@ -97,7 +101,9 @@ const REPO_TAB_DRAG_SCROLL_PX_PER_SEC: f32 = 700.0;
 /// launch the strip across several tabs at once.
 const REPO_TAB_DRAG_SCROLL_MAX_STEP: Duration = Duration::from_millis(50);
 /// Shared label-row geometry. Keeping an explicit line box lets the text,
-/// status glyph, and close button all center on the same title-bar axis.
+/// status glyph, and close button all center on the same title-bar axis. Every
+/// size here is fixed: the strip lives in the title bar, which stays outside
+/// the appearance system (see `chrome::chrome_scale`).
 const REPO_TAB_FONT_SIZE_PX: f32 = 15.0;
 const REPO_TAB_CONTENT_HEIGHT_PX: f32 = 18.0;
 const REPO_TAB_STATUS_SIZE_PX: f32 = components::REPOSITORY_BADGE_SIZE_PX;
@@ -107,6 +113,13 @@ pub(in crate::view) const REPO_TAB_SIDE_PADDING_PX: f32 = 14.0;
 const REPO_TAB_HOVER_BOX_X_OVERHANG_PX: f32 = 4.0;
 const REPO_TAB_HOVER_BOX_Y_OVERHANG_PX: f32 = 3.0;
 const REPO_TAB_HOVER_BOX_RADIUS_PX: f32 = 4.0;
+/// The label plate, overhang included, has to fit the tab it sits in, and it
+/// has to cover the close button it shares a hover surface with. Both sides are
+/// fixed, so the check belongs in the build rather than in a test run.
+const REPO_TAB_HOVER_BOX_HEIGHT_PX: f32 =
+    REPO_TAB_CONTENT_HEIGHT_PX + REPO_TAB_HOVER_BOX_Y_OVERHANG_PX * 2.0;
+const _: () = assert!(REPO_TAB_HOVER_BOX_HEIGHT_PX >= components::REMOVE_BUTTON_SIZE_PX);
+const _: () = assert!(REPO_TAB_HOVER_BOX_HEIGHT_PX < components::Tab::CONTENT_HEIGHT_PX);
 
 /// Returns the drag direction and its new high/low-water mark. A direction is
 /// established immediately, but reversing it requires deliberate travel away
@@ -138,7 +151,7 @@ fn repo_tab_text_width(label: SharedString, font_size: Pixels, window: &mut Wind
     let run = style.to_run(label.len());
     window
         .text_system()
-        .shape_line(label, font_size, &[run], None)
+        .shape_line(label, font_size, &[run])
         .width
 }
 
@@ -146,22 +159,21 @@ fn repo_tab_text_width(label: SharedString, font_size: Pixels, window: &mut Wind
 /// picker rows' remove button wears (`components::REMOVE_BUTTON_*`), except it
 /// is composited into an opaque fill: this button overlays repository text, so
 /// a translucent plate would let the label show through.
+#[cfg(test)]
 fn repo_tab_close_button_fill(
     theme: AppTheme,
     background: gpui::Rgba,
     pressed: bool,
 ) -> gpui::Rgba {
-    let amount = if pressed {
-        components::REMOVE_BUTTON_PRESSED_ALPHA
-    } else {
-        components::REMOVE_BUTTON_HOVER_ALPHA
-    };
-    let mut fill = crate::theme::composite_over(
+    controls::InteractionStyle::destructive(theme).resolved_background(
         background,
-        with_alpha(theme.colors.status.danger.foreground, amount),
-    );
-    fill.alpha = 1.0;
-    fill
+        controls::InteractionState::default(),
+        if pressed {
+            controls::InteractionFeedback::Pressed
+        } else {
+            controls::InteractionFeedback::Hovered
+        },
+    )
 }
 
 struct RepoTabSlide {
@@ -318,17 +330,30 @@ impl RepoTabsBarView {
                     err.hash(&mut hasher);
                 }
             }
-            repo.loads_in_flight.any_in_flight().hash(&mut hasher);
-            repo.local_actions_in_flight.hash(&mut hasher);
-            repo.pull_in_flight.hash(&mut hasher);
-            repo.push_in_flight.hash(&mut hasher);
         }
+        // Busy is left out: it flips on every background refresh, and only
+        // the delayed spinner shows it (see `shows_spinner`).
         hasher.finish()
+    }
+
+    fn shows_spinner(&self, repo: &RepoState) -> bool {
+        Some(repo.id) == self.active_repo_id()
+            && Self::is_repo_busy(repo)
+            && self
+                .repo_tab_spinner_delay
+                .as_ref()
+                .is_some_and(|s| s.repo_id == repo.id && s.show_spinner)
+    }
+
+    fn active_tab_shows_spinner(&self) -> bool {
+        self.state.repos.iter().any(|repo| self.shows_spinner(repo))
     }
 
     fn is_repo_busy(repo: &RepoState) -> bool {
         matches!(repo.open, Loadable::Loading)
-            || repo.loads_in_flight.any_in_flight()
+            || repo
+                .loads_in_flight
+                .is_in_flight(!gitcomet_state::model::RepoLoadsInFlight::WORKTREE_DIRTY)
             || repo.local_actions_in_flight > 0
             || repo.pull_in_flight > 0
             || repo.push_in_flight > 0
@@ -357,12 +382,9 @@ impl RepoTabsBarView {
     fn close_repo_tab(&mut self, repo_id: RepoId, cx: &mut gpui::Context<Self>) {
         self.hovered_repo_tab = None;
         self.pressed_repo_tab = None;
-        if let Ok(true) = self.root_view.update(cx, |root, cx| {
-            root.request_terminal_shutdown_action(TerminalShutdownAction::CloseRepo { repo_id }, cx)
-        }) {
-            return;
-        }
-        self.store.dispatch(Msg::CloseRepo { repo_id });
+        let _ = self.root_view.update(cx, |root, cx| {
+            root.request_close_repos(vec![repo_id], None, cx);
+        });
         cx.notify();
     }
 
@@ -378,6 +400,7 @@ impl RepoTabsBarView {
         let subscription = cx.observe(&ui_model, |this, model, cx| {
             let next = Arc::clone(&model.read(cx).state);
             let next_fingerprint = Self::notify_fingerprint(&next);
+            let showed_spinner = this.active_tab_shows_spinner();
 
             this.state = next;
             this.update_repo_tab_spinner_delay(cx);
@@ -395,7 +418,9 @@ impl RepoTabsBarView {
                 this.pressed_repo_tab = None;
             }
 
-            if next_fingerprint != this.notify_fingerprint {
+            if next_fingerprint != this.notify_fingerprint
+                || showed_spinner != this.active_tab_shows_spinner()
+            {
                 this.notify_fingerprint = next_fingerprint;
                 cx.notify();
             }
@@ -415,6 +440,7 @@ impl RepoTabsBarView {
             active_context_menu_invoker: None,
             repo_tab_spinner_delay: None,
             repo_tab_spinner_delay_seq: 0,
+            uses_spinner_delay: crate::ui_runtime::current().uses_repo_tab_spinner_delay(),
             notify_fingerprint,
             repo_tab_drag_visual: None,
             tab_scroll: components::TabBarScroll::new(),
@@ -508,14 +534,14 @@ impl RepoTabsBarView {
     /// The pointer can sit still for as long as it likes, so this runs off the
     /// render loop rather than drag-move events, re-picking the drop target on
     /// every step as tabs slide past underneath.
-    fn drive_repo_tab_drag_scroll(&mut self, ui_scale_percent: u32, window: &mut Window) {
+    fn drive_repo_tab_drag_scroll(&mut self, window: &mut Window) {
         let Some(dragged) = self.repo_tab_drag_visual.map(|drag| drag.repo_id) else {
             self.drag_scroll_tick = None;
             return;
         };
 
         let viewport = self.tab_scroll.viewport();
-        let edge = ui_scale::design_px_from_percent(REPO_TAB_DRAG_EDGE_PX, ui_scale_percent);
+        let edge = px(REPO_TAB_DRAG_EDGE_PX);
         let cursor_x = window.mouse_position().x;
         let direction = if cursor_x <= viewport.left() + edge {
             -1.0
@@ -617,6 +643,13 @@ impl RepoTabsBarView {
         });
     }
 
+    /// The live runtime's spinner delay, for this view only: forcing the
+    /// whole runtime live would also start its background work.
+    #[cfg(test)]
+    pub(in crate::view) fn use_spinner_delay_for_tests(&mut self) {
+        self.uses_spinner_delay = true;
+    }
+
     #[cfg(test)]
     pub(in crate::view) fn tab_scroll_for_tests(&self) -> (Pixels, Pixels) {
         (self.tab_scroll.scrolled(), self.tab_scroll.max_scroll())
@@ -677,7 +710,7 @@ impl RepoTabsBarView {
 
         self.repo_tab_spinner_delay_seq = self.repo_tab_spinner_delay_seq.wrapping_add(1);
         let seq = self.repo_tab_spinner_delay_seq;
-        let uses_spinner_delay = crate::ui_runtime::current().uses_repo_tab_spinner_delay();
+        let uses_spinner_delay = self.uses_spinner_delay;
         self.repo_tab_spinner_delay = Some(RepoTabSpinnerDelayState {
             repo_id,
             show_spinner: !uses_spinner_delay,
@@ -688,9 +721,11 @@ impl RepoTabsBarView {
             return;
         }
 
+        // The app executor's timer, not smol's: it runs on the test clock.
+        let delay = cx.background_executor().timer(Duration::from_millis(100));
         cx.spawn(
             async move |view: WeakEntity<RepoTabsBarView>, cx: &mut gpui::AsyncApp| {
-                smol::Timer::after(Duration::from_millis(100)).await;
+                delay.await;
                 let _ = view.update(cx, |this, cx| {
                     if this.repo_tab_spinner_delay_seq != seq {
                         return;
@@ -728,19 +763,25 @@ impl Render for RepoTabsBarView {
         }
 
         let theme = self.theme;
-        let ui_scale_percent = ui_scale::current(cx).percent;
-        let scaled_px = |value| ui_scale::design_px_from_percent(value, ui_scale_percent);
-        let drag_direction_reversal = scaled_px(REPO_TAB_DIRECTION_REVERSAL_PX);
+        let drag_direction_reversal = px(REPO_TAB_DIRECTION_REVERSAL_PX);
         let active = self.active_repo_id();
         let spinner = |id: (&'static str, u64), color: gpui::Rgba| {
-            svg_spinner(id, color, scaled_px(REPO_TAB_STATUS_SIZE_PX))
+            svg_spinner(id, color, px(REPO_TAB_STATUS_SIZE_PX))
         };
         // Tabs are transparent, so a label fading out has to land on whatever
         // is actually behind it: the bar for an idle tab, the content strip
         // for the active one.
-        let strip_bg = crate::view::chrome::title_bar_background(theme, window.is_window_active());
-        let hovered_tab_bg =
-            crate::theme::composite_over(strip_bg, components::Tab::hover_overlay(theme));
+        let workspace_color = crate::workspaces::with_workspace_for_window(
+            cx,
+            window.window_handle().window_id(),
+            |workspace| workspace.color,
+        )
+        .flatten();
+        let strip_bg = crate::view::chrome::title_bar_background(
+            theme,
+            window.is_window_active(),
+            workspace_color,
+        );
 
         // Reveal the active tab when the repository changes, then leave the
         // offset alone so manual scrolling sticks.
@@ -749,9 +790,9 @@ impl Render for RepoTabsBarView {
             self.pending_reveal = active.map(|repo_id| (repo_id, 0));
         }
         self.reveal_pending_repo_tab(window);
-        self.drive_repo_tab_drag_scroll(ui_scale_percent, window);
+        self.drive_repo_tab_drag_scroll(window);
 
-        let tab_horizontal_padding = scaled_px(REPO_TAB_SIDE_PADDING_PX);
+        let tab_horizontal_padding = px(REPO_TAB_SIDE_PADDING_PX);
         let repo_tab_labels = self
             .state
             .repos
@@ -765,20 +806,16 @@ impl Render for RepoTabsBarView {
             .zip(&repo_tab_labels)
             .map(|(repo, label)| {
                 let text_width =
-                    repo_tab_text_width(label.clone(), scaled_px(REPO_TAB_FONT_SIZE_PX), window);
+                    repo_tab_text_width(label.clone(), px(REPO_TAB_FONT_SIZE_PX), window);
                 let terminal_width = if self.open_terminal_repo_ids.contains(&repo.id) {
-                    scaled_px(REPO_TAB_LABEL_GAP_PX + REPO_TAB_STATUS_SIZE_PX)
+                    px(REPO_TAB_LABEL_GAP_PX + REPO_TAB_STATUS_SIZE_PX)
                 } else {
                     px(0.0)
                 };
-                let content_width = scaled_px(REPO_TAB_STATUS_SIZE_PX + REPO_TAB_LABEL_GAP_PX)
+                let content_width = px(REPO_TAB_STATUS_SIZE_PX + REPO_TAB_LABEL_GAP_PX)
                     + text_width
                     + terminal_width;
-                components::Tab::natural_width(
-                    content_width,
-                    tab_horizontal_padding,
-                    ui_scale_percent,
-                )
+                components::Tab::natural_width(content_width, tab_horizontal_padding)
             })
             .collect::<Vec<_>>();
         let mut bar = components::TabBar::new("repo_tab_bar").scroll(self.tab_scroll.clone());
@@ -786,13 +823,7 @@ impl Render for RepoTabsBarView {
             let repo_id = repo.id;
             let next_repo_id = self.state.repos.get(ix + 1).map(|r| r.id);
             let is_active = Some(repo_id) == active;
-            let is_busy = Self::is_repo_busy(repo);
-            let show_spinner = is_active
-                && is_busy
-                && self
-                    .repo_tab_spinner_delay
-                    .as_ref()
-                    .is_some_and(|s| s.repo_id == repo_id && s.show_spinner);
+            let show_spinner = self.shows_spinner(repo);
             let context_menu_invoker: SharedString = format!("repo_tab_{}", repo_id.0).into();
             let context_menu_active =
                 self.active_context_menu_invoker.as_ref() == Some(&context_menu_invoker);
@@ -813,15 +844,20 @@ impl Render for RepoTabsBarView {
             let is_pressed = self.pressed_repo_tab == Some(repo_id);
             let label = repo_tab_labels[ix].clone();
             let initials: SharedString = components::repository_initials(label.as_ref()).into();
-            let label_bg = if is_active || context_menu_active {
-                theme.colors.surface.chrome
-            } else if is_pressed {
-                theme.colors.interaction.pressed_background
-            } else if is_hovered {
-                hovered_tab_bg
-            } else {
-                strip_bg
-            };
+            let label_bg = controls::InteractionStyle::new(theme).resolved_background(
+                strip_bg,
+                controls::InteractionState::default().selected(
+                    is_active || context_menu_active,
+                    theme.colors.surface.chrome,
+                ),
+                if is_pressed {
+                    controls::InteractionFeedback::Pressed
+                } else if is_hovered {
+                    controls::InteractionFeedback::Hovered
+                } else {
+                    controls::InteractionFeedback::Resting
+                },
+            );
             let drag_left = self
                 .repo_tab_drag_visual
                 .filter(|drag| drag.repo_id == repo_id)
@@ -829,8 +865,6 @@ impl Render for RepoTabsBarView {
 
             let tooltip = Self::repo_tab_tooltip(repo);
             let close_tooltip: SharedString = "Close repository".into();
-            let close_hover_bg = repo_tab_close_button_fill(theme, label_bg, false);
-            let close_pressed_bg = repo_tab_close_button_fill(theme, label_bg, true);
 
             let close_button = div()
                 .id(("repo_tab_close", repo_id.0))
@@ -838,30 +872,35 @@ impl Render for RepoTabsBarView {
                 .flex()
                 .items_center()
                 .justify_center()
-                .size(scaled_px(REPO_TAB_STATUS_SIZE_PX))
+                .size(px(components::REMOVE_BUTTON_SIZE_PX))
                 .rounded(px(theme.radii.row))
                 // Fully cover any label ink beneath the button; the sibling
                 // ramp transitions into this exact background.
                 .bg(label_bg)
                 .cursor_pointer()
-                .hover(move |s| s.bg(close_hover_bg))
-                .active(move |s| s.bg(close_pressed_bg))
+                .control_interaction(
+                    controls::InteractionStyle::destructive(theme).on_surface(label_bg),
+                    controls::InteractionState::default(),
+                )
                 .child(svg_icon(
                     components::REMOVE_BUTTON_ICON,
                     theme.colors.status.danger.foreground,
-                    scaled_px(components::REMOVE_BUTTON_ICON_SIZE_PX),
+                    px(components::REMOVE_BUTTON_ICON_SIZE_PX),
                 ))
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _w, cx| {
-                    cx.stop_propagation();
-                    this.close_repo_tab(repo_id, cx);
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Nested,
+                    cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                        this.close_repo_tab(repo_id, cx);
+                    }),
+                )
                 .gitcomet_tooltip(theme, close_tooltip.clone());
             let close_overlay = div()
                 .flex()
                 .items_center()
-                .h(scaled_px(REPO_TAB_STATUS_SIZE_PX))
+                .h(px(components::REMOVE_BUTTON_SIZE_PX))
                 .child(
-                    components::trailing_fade(label_bg, scaled_px(REPO_TAB_CLOSE_FADE_WIDTH_PX))
+                    components::trailing_fade(label_bg, px(REPO_TAB_CLOSE_FADE_WIDTH_PX))
                         .debug_selector(move || format!("repo_tab_close_fade_{}", repo_id.0)),
                 )
                 .child(close_button);
@@ -890,8 +929,8 @@ impl Render for RepoTabsBarView {
                 .flex()
                 .flex_1()
                 .items_center()
-                .h(scaled_px(REPO_TAB_CONTENT_HEIGHT_PX))
-                .gap(scaled_px(REPO_TAB_LABEL_GAP_PX))
+                .h(px(REPO_TAB_CONTENT_HEIGHT_PX))
+                .gap(px(REPO_TAB_LABEL_GAP_PX))
                 .min_w(px(0.0))
                 // Idle tabs highlight only their compact content box. The
                 // plate overhang adds breathing room around the initials and
@@ -900,16 +939,16 @@ impl Render for RepoTabsBarView {
                     div()
                         .debug_selector(move || format!("repo_tab_hover_box_{}", repo_id.0))
                         .absolute()
-                        .top(scaled_px(-REPO_TAB_HOVER_BOX_Y_OVERHANG_PX))
-                        .bottom(scaled_px(-REPO_TAB_HOVER_BOX_Y_OVERHANG_PX))
-                        .left(scaled_px(-REPO_TAB_HOVER_BOX_X_OVERHANG_PX))
-                        .right(scaled_px(-REPO_TAB_HOVER_BOX_X_OVERHANG_PX))
-                        .rounded(scaled_px(REPO_TAB_HOVER_BOX_RADIUS_PX))
+                        .top(px(-REPO_TAB_HOVER_BOX_Y_OVERHANG_PX))
+                        .bottom(px(-REPO_TAB_HOVER_BOX_Y_OVERHANG_PX))
+                        .left(px(-REPO_TAB_HOVER_BOX_X_OVERHANG_PX))
+                        .right(px(-REPO_TAB_HOVER_BOX_X_OVERHANG_PX))
+                        .rounded(px(REPO_TAB_HOVER_BOX_RADIUS_PX))
                         .bg(label_bg),
                 )
                 .child(
                     div()
-                        .size(scaled_px(REPO_TAB_STATUS_SIZE_PX))
+                        .size(px(REPO_TAB_STATUS_SIZE_PX))
                         .flex()
                         .items_center()
                         .justify_center()
@@ -924,14 +963,14 @@ impl Render for RepoTabsBarView {
                             d.child(svg_icon(
                                 "icons/warning.svg",
                                 theme.colors.status.warning.foreground,
-                                scaled_px(12.0),
+                                px(12.0),
                             ))
                         })
                         .when(show_initials, |d| {
                             d.child(
                                 components::repository_initials_box(
                                     theme,
-                                    ui_scale_percent,
+                                    crate::view::chrome::chrome_scale(),
                                     initials.clone(),
                                     is_active,
                                 )
@@ -945,12 +984,12 @@ impl Render for RepoTabsBarView {
                     components::FadingText::new(
                         div()
                             .debug_selector(move || format!("repo_tab_label_text_{}", repo_id.0))
-                            .text_size(scaled_px(REPO_TAB_FONT_SIZE_PX))
-                            .line_height(scaled_px(REPO_TAB_CONTENT_HEIGHT_PX))
+                            .text_size(px(REPO_TAB_FONT_SIZE_PX))
+                            .line_height(px(REPO_TAB_CONTENT_HEIGHT_PX))
                             .child(label),
                         label_bg,
                     )
-                    .render(ui_scale_percent)
+                    .render(crate::view::chrome::chrome_scale())
                     .debug_selector(move || format!("repo_tab_label_{}", repo_id.0))
                     .flex_1(),
                 )
@@ -961,14 +1000,14 @@ impl Render for RepoTabsBarView {
                             .child(svg_icon(
                                 "icons/terminal.svg",
                                 theme.colors.accent.foreground,
-                                scaled_px(REPO_TAB_STATUS_SIZE_PX),
+                                px(REPO_TAB_STATUS_SIZE_PX),
                             )),
                     )
                 });
 
             let tab = tab
                 .child(tab_label)
-                .render(theme, ui_scale_percent)
+                .render(theme)
                 .relative()
                 .when(show_inactive_separator, |tab| {
                     tab.child(
@@ -980,10 +1019,10 @@ impl Render for RepoTabsBarView {
                             // Paint in the margin the two neighbouring tabs
                             // share, so the divider sits in their gap rather
                             // than on either tab shape.
-                            .right(scaled_px(-components::Tab::HORIZONTAL_MARGIN_PX))
-                            .top(scaled_px(7.0))
+                            .right(px(-components::Tab::HORIZONTAL_MARGIN_PX))
+                            .top(px(7.0))
                             .w(px(1.0))
-                            .h(scaled_px(16.0))
+                            .h(px(16.0))
                             .bg(with_alpha(
                                 components::Tab::outline_color(theme),
                                 if theme.is_dark { 0.55 } else { 0.50 },
@@ -1068,7 +1107,7 @@ impl Render for RepoTabsBarView {
                         cx.notify();
                     }),
                 )
-                .on_mouse_down(
+                .on_pointer_click(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                         cx.stop_propagation();
@@ -1076,9 +1115,8 @@ impl Render for RepoTabsBarView {
                         let invoker = context_menu_invoker_for_right_click.clone();
                         let anchor = e.position;
                         let _ = this.root_view.update(cx, move |root, cx| {
-                            root.set_active_context_menu_invoker(Some(invoker), cx);
                             root.open_popover_at(
-                                PopoverKind::RepoTabMenu { repo_id },
+                                (PopoverKind::RepoTabMenu { repo_id }).invoked_by(invoker),
                                 anchor,
                                 window,
                                 cx,
@@ -1088,12 +1126,20 @@ impl Render for RepoTabsBarView {
                     }),
                 )
                 .gitcomet_tooltip(theme, tooltip.clone())
-                .on_click(cx.listener(move |this, _e: &ClickEvent, _w, _cx| {
-                    if let Some(msg) = Self::repo_tab_click_message(this.active_repo_id(), repo_id)
-                    {
-                        this.store.dispatch(msg);
-                    }
-                }))
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener(move |this, _e: &ClickEvent, _w, cx| {
+                        let _ = this
+                            .root_view
+                            .update(cx, |root, cx| root.show_repository_canvas(cx));
+                        if let Some(msg) =
+                            Self::repo_tab_click_message(this.active_repo_id(), repo_id)
+                        {
+                            this.store.dispatch(msg);
+                        }
+                    }),
+                )
                 .on_aux_click(cx.listener(move |this, e: &ClickEvent, _w, cx| {
                     if !e.is_middle_click() {
                         return;
@@ -1105,7 +1151,7 @@ impl Render for RepoTabsBarView {
 
             let sliding_tab = RepoTabSlide::new(("repo_tab_slide", repo_id.0), tab, drag_left);
             if drag_left.is_some() {
-                bar = bar.tab(gpui::deferred(sliding_tab).with_priority(1));
+                bar = bar.tab(gpui::deferred(sliding_tab).priority(1));
             } else {
                 bar = bar.tab(sliding_tab);
             }
@@ -1123,20 +1169,21 @@ impl Render for RepoTabsBarView {
             // Only the visible control row should intercept title-bar input.
             // A full-height child here blocks window dragging in the blank
             // chrome above the button when the tab row overflows.
-            .h(scaled_px(components::CONTROL_HEIGHT_PX))
+            .h(px(components::CONTROL_HEIGHT_PX))
             .self_center()
             .flex()
             .items_center()
-            .pl(scaled_px(2.0))
-            .pr(scaled_px(8.0))
+            .pl(px(2.0))
+            .pr(px(8.0))
             .child(
                 components::Button::new("add_repo_menu", "")
                     .start_slot(svg_icon(
                         "icons/plus.svg",
                         theme.colors.foreground.secondary,
-                        scaled_px(14.0),
+                        px(14.0),
                     ))
                     .style(components::ButtonStyle::Transparent)
+                    .unscaled()
                     .on_click_with_bounds(theme, cx, move |_this, _e, bounds, window, cx| {
                         cx.stop_propagation();
                         let _ = root_view.update(cx, |root, cx| {
@@ -1207,7 +1254,7 @@ impl Render for RepoTabsBarView {
             },
         );
 
-        let bar = bar.tab_end(add_repo).render(theme, ui_scale_percent);
+        let bar = bar.tab_end(add_repo).render();
         let external_drop_target = div()
             .id("repo_external_folder_drop_target")
             .debug_selector(|| "repo_external_folder_drop_target".to_string())
@@ -1254,10 +1301,15 @@ impl Render for RepoTabsBarView {
             .can_drop(|dragged, _window, _cx| {
                 dragged
                     .downcast_ref::<gpui::ExternalPaths>()
-                    .is_some_and(|paths| matches!(paths.paths(), [_]))
+                    .is_some_and(|paths| !paths.paths().is_empty())
             })
             .on_drop(
-                cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                    if let Some(transfer) = window.take_file_drop() {
+                        transfer
+                            .completion
+                            .complete(Some(gpui::FileTransferOperation::Copy));
+                    }
                     this.set_external_folder_drag_active(false, cx);
                     let paths = paths.clone();
                     let _ = this.root_view.update(cx, |root, cx| {

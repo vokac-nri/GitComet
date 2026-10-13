@@ -135,6 +135,23 @@ module.exports = grammar({
 
   word: ($) => $.identifier,
 
+  // Keyword extraction alone is not enough: when a keyword is not valid in the
+  // current parse state, tree-sitter falls back to the word token, so `let type
+  // = 2` binds a value named "type" and `open System` inside a function body
+  // parses as the application `open System`. Listing the keywords here stops
+  // that fallback, so those positions become ERROR as FSC reports them.
+  // Two keywords are deliberately absent:
+  //
+  //  * `member`, because the grammar relies on it lexing as an identifier to
+  //    recover from over-indented member declarations (`inherit Base()` followed
+  //    by a more-indented `static member ...`), which FSC accepts.
+  //  * `val`, because the `basic long namespace` test in source_file.txt asserts
+  //    a tree for `namespace test.val`, which FSC rejects ("Unexpected start of
+  //    structured construct"). Reserving it would change that expected tree.
+  reserved: {
+    global: (_) => ["as", "namespace", "open", "type"],
+  },
+
   inline: ($) => [
     $._expression_or_range,
     $._object_expression_inner,
@@ -407,13 +424,27 @@ module.exports = grammar({
     value_declaration_left: ($) =>
       prec.left(
         2,
-        seq(
-          optional("mutable"),
-          optional($.access_modifier),
-          $._pattern,
-          optional($.type_arguments),
+        choice(
+          seq(
+            optional("mutable"),
+            optional($.access_modifier),
+            $._pattern,
+            optional($.type_arguments),
+          ),
+          // `let inline add3 = add 3` — an inline value has no parameters, so it
+          // is not a function_declaration_left. Only a name (no pattern, no
+          // arguments) may follow the keyword, so `let inline f x` stays a
+          // function and `let inline (a, b) = …` is not accepted.
+          seq("inline", optional($.access_modifier), alias($._inline_value_name, $.identifier_pattern), optional($.type_arguments)),
         ),
       ),
+
+    // The name of an inline value. The same shape identifier_pattern wraps
+    // (an identifier, an operator name or a dotted path): the alias keeps the
+    // tree identical to a plain `let x = …`, so queries need no special case.
+    // A dotted name is not valid F# here, but identifier_pattern accepts it
+    // everywhere else too and the type checker reports it.
+    _inline_value_name: ($) => $.long_identifier_or_op,
 
     access_modifier: (_) =>
       prec(100, token(prec(1000, choice("private", "internal", "public")))),
@@ -421,7 +452,9 @@ module.exports = grammar({
     // Top-level rules (END)
     //
 
-    class_as_reference: ($) => seq("as", $.identifier),
+    // Outranks as_pattern (prec 0), which would otherwise absorb the `as this`
+    // of `type T(args) as this` / `new (args) as this` into the argument pattern.
+    class_as_reference: ($) => prec(1, seq("as", $.identifier)),
 
     primary_constr_args: ($) =>
       seq(
@@ -638,8 +671,12 @@ module.exports = grammar({
       prec(
         PREC.PAREN_EXPR,
         choice(
-          seq("<@", $._expression, $._quoted_close),
-          seq("<@@", $._expression, $._untyped_quoted_close),
+          // A paren-kind scope, like `( … )`: the body may span lines that are
+          // not aligned with any open layout level, and `@>` closes it.
+          // The closers are scanner tokens; aliasing them to their spelling
+          // makes them addressable from queries ("@>" @punctuation.special).
+          seq("<@", $._paren_expression_block, alias($._quoted_close, "@>")),
+          seq("<@@", $._paren_expression_block, alias($._untyped_quoted_close, "@@>")),
         ),
       ),
 
@@ -742,8 +779,10 @@ module.exports = grammar({
         seq(
           "new",
           $._expression,
-          optional(seq("as", $.identifier)),
-          $._object_expression_inner,
+          // No `as` binding: `{ new Base() as b with ... }` is rejected by FSC
+          // ("'inherit' declarations cannot have 'as' bindings"); `base` is a
+          // keyword instead.
+          optional($._object_expression_inner),   // `{ new A<int>() }` — no overrides
         ),
       ),
 
@@ -1437,7 +1476,8 @@ module.exports = grammar({
             // abbreviation ambiguous with a measure.
             $.postfix_type,
           ),
-          repeat1(seq("/", choice($._measure_operand, $.measure_product))),
+          // `m / s s`: the same postfix-type reading of `s s` applies on the right.
+          repeat1(seq("/", choice($._measure_operand, $.measure_product, $.postfix_type))),
         ),
       ),
 
@@ -1563,7 +1603,9 @@ module.exports = grammar({
             "(",
             choice(
               $.trait_member_constraint,
-              seq("new", ":", "unit", arrow(), $._type),
+              // `new : string -> 'a` — the constructor may take arguments (FS0698
+              // is a type-checker error, not a parse error).
+              seq("new", ":", choice("unit", $._type), arrow(), $._type),
             ),
             ")",
           ),
@@ -1745,7 +1787,9 @@ module.exports = grammar({
     delegate_type_defn: ($) =>
       seq($.type_name, "=", scoped($.delegate_signature, $._indent, $._dedent)),
 
-    delegate_signature: ($) => seq("delegate", "of", $._type),
+    // `delegate of arg1:int * arg2:int -> int` — parameters may be named, which
+    // is the member-signature shape rather than a plain function type.
+    delegate_signature: ($) => seq("delegate", "of", choice($._type, $.curried_spec)),
 
     type_abbrev_defn: ($) =>
       seq(
@@ -1805,7 +1849,6 @@ module.exports = grammar({
       seq(
         optional($.attributes),
         optional("mutable"),
-        optional($.access_modifier),
         $.identifier,
         ":",
         $._type,
@@ -1871,7 +1914,7 @@ module.exports = grammar({
       seq($.union_type_field, repeat(seq("*", $.union_type_field))),
 
     union_type_field: ($) =>
-      prec.left(choice($._type, seq($.identifier, ":", $._type))),
+      prec.left(choice($._argument_type, seq($.identifier, ":", $._argument_type))),
 
     interface_type_defn: ($) =>
       prec.left(
@@ -1969,18 +2012,28 @@ module.exports = grammar({
             seq(
               // `static abstract` declares an interface member that
               // implementing types must provide statically (F# 7 IWSAMs).
-              // The accessibility modifier is accepted on either side of
-              // `abstract` (FSC parses both and rejects it later, FS0561),
-              // and `inline` likewise parses here (rejected as FS3151).
+              // An accessibility modifier *before* `abstract` parses and is
+              // rejected later (FS0561); after it, FSC fails in the parser
+              // ("Unexpected keyword 'public' in member definition"), so it is
+              // not accepted here. `inline` parses here (rejected as FS3151).
               optional($.access_modifier),
               optional("static"),
               "abstract",
               optional("member"),
               optional("inline"),
-              optional($.access_modifier),
               $.member_signature,
             ),
-            seq("member", "val", optional($.access_modifier), $.property_or_ident, $._val_property_defn),
+            // `static member val` declares a static auto-property. Without the
+            // `static` here it fell through to the generic member branch with
+            // `val` as the method name, which mis-nested whatever followed.
+            seq(
+              optional("static"),
+              "member",
+              "val",
+              optional($.access_modifier),
+              $.property_or_ident,
+              $._val_property_defn,
+            ),
             seq("override", optional($.access_modifier), $.method_or_prop_defn),
             seq("default", optional($.access_modifier), $.method_or_prop_defn),
             seq(
@@ -2003,7 +2056,7 @@ module.exports = grammar({
         seq(
           field("instance", $.identifier),
           ".",
-          field("method", $.identifier),
+          field("method", choice($.identifier, $.op_identifier)),   // `member _.(+) a b`
         ),
         $._identifier_or_op,
       ),
@@ -2040,6 +2093,7 @@ module.exports = grammar({
       prec.left(
         PREC.APP_EXPR + 100001,
         seq(
+          optional($.type_arguments),   // `member this.TypeFunc<'a> = typeof<'a>.Name`
           optional(seq(":", $._type)),
           choice(
             seq("=", $._expression_block),
@@ -2100,6 +2154,9 @@ module.exports = grammar({
         optional($.access_modifier),
         "new",
         $._pattern,
+        // `new (args) as this = ...` binds the object being constructed, the
+        // same way a primary constructor does.
+        optional($.class_as_reference),
         "=",
         $._expression_block,
         optional(seq("then", $._expression_block)),
@@ -2138,11 +2195,18 @@ module.exports = grammar({
       ),
 
     extern_param: ($) =>
-      seq(
+      // prec: with the name optional, `_type identifier` could also be a postfix
+      // type (`int option`) — prefer reading the identifier as the name.
+      prec(1, seq(
         optional($.attributes),
         field("type", $._type),
-        field("name", $.identifier),
-      ),
+        // `bool & bFailIfExists` — a byref written with a space (the glued
+        // `bool&` is a byref_type).
+        optional("&"),
+        // `extern bool F(ExplicitRect&, ExplicitPoint)` — P/Invoke parameters
+        // need no names.
+        optional(field("name", $.identifier)),
+      )),
 
     class_inherits_decl: ($) =>
       prec.left(

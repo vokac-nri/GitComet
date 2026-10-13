@@ -1,30 +1,45 @@
 use super::*;
+use crate::view::components::ControlInteractionExt;
 use gitcomet_core::services::InteractiveRebaseAction;
+use std::rc::Rc;
 
 mod add_repo_menu;
 mod add_to_gitignore_prompt;
+mod annex_prompt;
 mod app_menu;
+mod apply_file_change_confirm;
 mod author_filter;
+mod branch_exists_prompt;
 mod branch_picker;
 mod checkout_remote_branch_prompt;
 mod cherry_pick_commit_confirm;
 mod clone_repo;
+mod close_guard_confirm;
+mod commit_mainline;
 mod commit_prompt;
 pub(in super::super) mod context_menu;
 mod create_branch_from_ref_prompt;
 mod create_tag_prompt;
 mod delete_branches_confirm;
+mod delete_permanently_confirm;
 mod delete_remote_branch_confirm;
 mod discard_changes_confirm;
+mod discard_folder_changes_confirm;
+mod error_details;
+mod extension_dialog;
 mod file_history;
+mod filesystem_conflict_prompt;
+mod filesystem_unsaved_edits_confirm;
 mod fingerprint;
 mod force_delete_branch_confirm;
 mod force_push_confirm;
 mod force_remove_worktree_confirm;
 mod hook_activity;
+mod interactive_cherry_pick_confirm;
+mod menu_layer;
 mod merge_abort_confirm;
 mod merge_commit_confirm;
-mod picker_nav;
+pub(in crate::view) mod picker_nav;
 mod picker_row_menu;
 mod pull_reconcile_prompt;
 mod push_set_upstream_prompt;
@@ -35,6 +50,7 @@ mod remote_remove_confirm;
 mod rename_branch_prompt;
 mod repo_picker;
 mod reset_prompt;
+mod revert_commit_confirm;
 mod rows_cache;
 mod search_inputs;
 mod squash_prompt;
@@ -47,10 +63,12 @@ mod submodule_change_pointer_prompt;
 mod submodule_picker;
 mod submodule_remove_confirm;
 mod submodule_trust_confirm;
+mod tag_push;
 mod terminal_shutdown_confirm;
 mod unsaved_file_edits_confirm;
-mod workspace_picker;
+mod upstream_picker;
 mod worktree_add_prompt;
+mod worktree_badge_picker;
 mod worktree_picker;
 mod worktree_remove_confirm;
 
@@ -100,6 +118,11 @@ impl PopoverWidthSpec {
 
 const DEFAULT_CONTEXT_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(260.0, 180.0, 380.0);
 const NARROW_CONTEXT_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(220.0, 160.0, 220.0);
+const TEXT_FORMAT_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(300.0, 220.0, 360.0);
+/// The sort menu's labels name both what is ordered and which way ("File type:
+/// Descending"), which is wider than `NARROW` leaves room for -- at 220px the
+/// icon column and padding leave ~150px of ink and the longest label ellipsises.
+const SORT_CONTEXT_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(260.0, 220.0, 300.0);
 const REBASE_ACTION_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::fixed(110.0);
 const REBASE_AUTOSQUASH_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::fixed(190.0);
 const CHANGE_TRACKING_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(220.0, 220.0, 320.0);
@@ -116,6 +139,8 @@ const STASH_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(220.0, 180.0,
 /// default.
 const HISTORY_AUTHOR_FILTER_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(320.0, 240.0, 420.0);
 const REPO_TAB_MENU_WIDTH: PopoverWidthSpec = PopoverWidthSpec::fixed(360.0);
+/// Rows read "origin — github.com/owner/repo", so wider than a plain menu.
+const REMOTE_WEB_PICKER_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(360.0, 260.0, 520.0);
 const PICKER_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(420.0, 420.0, 820.0);
 const LARGE_PICKER_WIDTH: PopoverWidthSpec = PopoverWidthSpec::range(520.0, 520.0, 820.0);
 const DIALOG_320_WIDTH: PopoverWidthSpec = PopoverWidthSpec::fixed(320.0);
@@ -147,13 +172,17 @@ impl DialogFocus {
 }
 
 pub(in super::super) struct PopoverHost {
-    store: Arc<AppStore>,
+    store: crate::view::pane_store::PaneStore,
+    history_store: crate::view::pane_store::PaneStore,
+    history_pane: Entity<MainPaneView>,
+    extension_dialog: Option<extension_dialog::ExtensionDialog>,
     state: Arc<AppState>,
     theme: AppTheme,
     theme_mode: ThemeMode,
     date_time_format: DateTimeFormat,
     timezone: Timezone,
     show_timezone: bool,
+    history_relative_dates: bool,
     change_tracking_view: ChangeTrackingView,
     commit_amend_enabled: bool,
     commit_push_after_enabled: bool,
@@ -165,8 +194,9 @@ pub(in super::super) struct PopoverHost {
     _ui_model_subscription: gpui::Subscription,
     _repo_picker_search_input_subscription: Option<gpui::Subscription>,
     _branch_picker_search_input_subscription: Option<gpui::Subscription>,
+    _upstream_picker_search_input_subscription: Option<gpui::Subscription>,
     _worktree_picker_search_input_subscription: Option<gpui::Subscription>,
-    _workspace_picker_search_input_subscription: Option<gpui::Subscription>,
+    _worktree_badge_picker_search_input_subscription: Option<gpui::Subscription>,
     _submodule_picker_search_input_subscription: Option<gpui::Subscription>,
     _file_history_search_input_subscription: Option<gpui::Subscription>,
     _history_author_filter_search_input_subscription: Option<gpui::Subscription>,
@@ -179,6 +209,7 @@ pub(in super::super) struct PopoverHost {
     /// Held here because menu models are built while the root view's update
     /// borrow is active, so its entity can't be read at that point.
     root_view_mode: GitCometViewMode,
+    pub(in crate::view) extension_editor_available: bool,
     tooltip_host: WeakEntity<TooltipHost>,
     main_pane: Entity<MainPaneView>,
     details_pane: Entity<DetailsPaneView>,
@@ -197,21 +228,31 @@ pub(in super::super) struct PopoverHost {
         std::collections::BTreeMap<std::path::PathBuf, std::collections::BTreeSet<String>>,
     /// Mirror of the sidebar's branch filter, for the same reason.
     branch_filter_query: String,
+    branch_search: crate::view::sidebar_search::SidebarSearch,
 
+    tag_push_preview_key: Option<u64>,
+    tag_push_cancellations: Vec<gitcomet_core::services::CancellationToken>,
+    push_upstream_tag_mode: Option<gitcomet_core::tag_push::TagPushMode>,
     popover: Option<PopoverKind>,
     popover_anchor: Option<PopoverAnchor>,
     hook_activity_selected: Option<GitOperationId>,
+    hook_activity_text: hook_activity::TextState,
     hook_activity_history_scroll: ScrollHandle,
     hook_activity_hooks_scroll: ScrollHandle,
     hook_activity_output_scroll: ScrollHandle,
-    /// Explicit 1-based mainline selected for the currently open single
-    /// merge-commit cherry-pick confirmation. Reset every time that dialog
-    /// opens; drafts are intentionally session-local.
-    cherry_pick_mainline: Option<usize>,
+    /// The error shown in the error details dialog, by its toast id.
+    error_details_selected: Option<u64>,
+    error_details_text: error_details::TextState,
+    error_details_scroll: ScrollHandle,
+    error_details_rail_scroll: ScrollHandle,
+    /// Explicit 1-based mainline selected in the open merge-commit
+    /// cherry-pick or revert confirmation. Reset every time either opens.
+    commit_mainline: Option<usize>,
     context_menu_focus_handle: FocusHandle,
-    /// Focus held by the App/Add Repository menu invoker, restored when that
-    /// menu is dismissed without replacing it with another prompt.
+    /// Focus held by the menu or confirmation's invoker, restored on dismissal.
     menu_invoker_focus: Option<FocusHandle>,
+    focus_return: Option<FocusHandle>,
+    active_invoker: Option<SharedString>,
     /// Whether the open popover was invoked from inside the diff panel.
     ///
     /// Some menus — the web link menu above all — can be raised from either the
@@ -221,6 +262,18 @@ pub(in super::super) struct PopoverHost {
     prompt_tab_group_focus_handle: FocusHandle,
     prompt_tab_wrap_end_focus_handle: FocusHandle,
     context_menu_selected_ix: Option<usize>,
+    context_menu_scroll: ScrollHandle,
+    /// Where the open context menu sits, measured and resolved each frame by
+    /// the kit's `menu_placement` element.
+    context_menu_placement: Rc<std::cell::RefCell<crate::kit::menu_placement::MenuPlacementState>>,
+    context_menu_arrows: menu_layer::MenuArrows,
+    pin_menu_entries: Option<(RepoId, bool, PinMenuEntries)>,
+    pin_menu_scroll: UniformListScrollHandle,
+    /// Content-space `(top, height)` of each context menu row from the last
+    /// prepaint, indexed like the model's items: what keyboard navigation
+    /// scrolls into view.
+    context_menu_row_extents: context_menu::RowExtents,
+    expanded_history_ref: Option<HistoryMenuRef>,
     repo_picker_selected_index: Option<usize>,
     /// Last trimmed query handled by the repository picker. Kept separately
     /// from the input so text edits can reset keyboard selection without
@@ -232,6 +285,14 @@ pub(in super::super) struct PopoverHost {
     /// Session pins snapshotted alongside `cached_recent_repos`. Held apart from
     /// the recents so a pin outlives the recents cap.
     cached_pinned_repos: Vec<std::path::PathBuf>,
+    /// Durable workspaces snapshotted with the repository picker so its
+    /// rows remain stable for the duration of one keyboard interaction.
+    cached_workspaces: Vec<session::Workspace>,
+    cached_workspace_id: Option<session::WorkspaceId>,
+    /// Extension commands in the app menu, fixed at construction.
+    extension_app_menu: Rc<[crate::view::extension_host::ExtensionMenuEntry]>,
+    /// Extension commands in a repository tab's menu, fixed at construction.
+    extension_repo_tab_menu: Rc<[crate::view::extension_host::ExtensionMenuEntry]>,
     /// Storage keys of the repository picker sections the user folded away.
     cached_collapsed_picker_sections: std::collections::BTreeSet<String>,
     repo_picker_sort: repo_picker::RepoPickerSort,
@@ -239,9 +300,18 @@ pub(in super::super) struct PopoverHost {
     /// Repository row whose context menu floats over the picker, and the window
     /// position it was invoked at. The picker stays open underneath it.
     picker_row_menu: Option<picker_row_menu::PickerRowMenu>,
+    /// The open row menu's scroll area, placement, arrows, row extents (by
+    /// keyboard index) and the selection last scrolled into view.
+    picker_row_menu_scroll: ScrollHandle,
+    picker_row_menu_placement:
+        Rc<std::cell::RefCell<crate::kit::menu_placement::MenuPlacementState>>,
+    picker_row_menu_arrows: menu_layer::MenuArrows,
+    picker_row_menu_rows: context_menu::RowExtents,
+    picker_row_menu_revealed: std::cell::Cell<Option<usize>>,
     branch_picker_selected_index: Option<usize>,
+    upstream_picker_selected_index: Option<usize>,
     worktree_picker_selected_index: Option<usize>,
-    workspace_picker_selected_index: Option<usize>,
+    worktree_badge_picker_selected_index: Option<usize>,
     /// Path/reference the workspace badge's create row hands to the Add-worktree
     /// dialog. Consumed (and cleared) when that dialog opens, so a later
     /// open from elsewhere still starts blank.
@@ -249,18 +319,16 @@ pub(in super::super) struct PopoverHost {
     submodule_picker_selected_index: Option<usize>,
     file_history_selected_index: Option<usize>,
     history_author_filter_selected_index: Option<usize>,
-    /// Author suggestions for the history author filter, keyed by repository and
-    /// the log revision they were collected from. Collecting them walks the
-    /// whole accumulated log, and the popover re-renders on every mouse move
-    /// over it, so the result has to outlive the frame. See
-    /// [`author_filter::suggestions`].
-    history_author_suggestions: Option<(RepoId, u64, std::sync::Arc<[SharedString]>)>,
+    /// Collected author names survive frames and active author filters.
+    history_author_suggestions: Option<author_filter::SuggestionCache>,
     /// Row models for the pickers that build one row per repository, ref or
     /// worktree, rebuilt only when the data behind them changes rather than on
     /// every frame. See [`rows_cache`] — a hover moving between rows re-renders
     /// this whole view.
     branch_picker_rows_cache: rows_cache::RowsCache<branch_picker::BranchPickerNavTarget>,
-    workspace_picker_rows_cache: rows_cache::RowsCache<workspace_picker::WorkspaceRow>,
+    upstream_picker_rows_cache: rows_cache::RowsCache<upstream_picker::UpstreamTarget>,
+    worktree_badge_picker_rows_cache:
+        rows_cache::RowsCache<worktree_badge_picker::WorktreeBadgeRow>,
     repo_picker_rows_cache: rows_cache::RowsCache<repo_picker::RepoPickerEntry>,
     stash_picker_rows_cache: rows_cache::RowsCache<stash_picker_prompt::StashRow>,
     file_history_rows_cache: rows_cache::RowsCache<CommitId>,
@@ -274,7 +342,7 @@ pub(in super::super) struct PopoverHost {
     file_history_search_input: Option<Entity<components::TextInput>>,
     history_author_filter_search_input: Option<Entity<components::TextInput>>,
     worktree_picker_search_input: Option<Entity<components::TextInput>>,
-    workspace_picker_search_input: Option<Entity<components::TextInput>>,
+    worktree_badge_picker_search_input: Option<Entity<components::TextInput>>,
     submodule_picker_search_input: Option<Entity<components::TextInput>>,
     picker_prompt_scroll: ScrollHandle,
 
@@ -296,6 +364,7 @@ pub(in super::super) struct PopoverHost {
     /// mid-edit cannot change the offered scopes under the user.
     gitignore_suggestions: Option<gitcomet_core::gitignore::GitignoreSuggestions>,
     /// The paths the dialog is about, for the "Ignore <file>" body text.
+    gitignore_explorer: bool,
     gitignore_paths: Vec<std::path::PathBuf>,
     squash_message_input: Entity<components::TextInput>,
     squash_description_input: Entity<components::TextInput>,
@@ -324,6 +393,9 @@ pub(in super::super) struct PopoverHost {
     create_branch_from_ref_focus: DialogFocus,
     create_tag_annotated: bool,
     create_tag_annotated_focus_handle: FocusHandle,
+    /// "Apply to all remaining" in the open file-collision dialog.
+    filesystem_conflict_apply_to_all: bool,
+    filesystem_conflict_apply_to_all_focus_handle: FocusHandle,
     checkout_remote_branch_focus: DialogFocus,
     stash_message_input: Entity<components::TextInput>,
     stash_focus: DialogFocus,
@@ -343,6 +415,9 @@ pub(in super::super) struct PopoverHost {
     remote_add_focus: DialogFocus,
     remote_edit_focus: DialogFocus,
     push_upstream_focus: DialogFocus,
+    push_upstream_remote_focus_handle: FocusHandle,
+    push_upstream_remote_menu_open: bool,
+    push_upstream_remote_selected_index: Option<usize>,
     worktree_browse_focus_handle: FocusHandle,
     worktree_focus: DialogFocus,
     submodule_advanced_focus_handle: FocusHandle,
@@ -362,6 +437,8 @@ pub(in super::super) struct PopoverHost {
     rebase_reword_description_input: Entity<components::TextInput>,
     rebase_reword_description_scroll: ScrollHandle,
 }
+
+type PinMenuEntries = std::rc::Rc<[(SharedString, SharedString)]>;
 
 pub(in crate::view) struct PopoverHostInit {
     pub(in crate::view) theme: AppTheme,
@@ -397,7 +474,7 @@ pub(in crate::view) fn benchmark_workspace_rows(
     repo: &RepoState,
     query: &str,
 ) -> Vec<components::PickerPromptItem> {
-    workspace_picker::rows(repo, query).items
+    worktree_badge_picker::rows(repo, query).items
 }
 
 pub(in super::super) fn popover_ui_scale(cx: &mut gpui::Context<PopoverHost>) -> ui_scale::UiScale {
@@ -408,28 +485,13 @@ pub(in super::super) fn popover_ui_scale_percent(cx: &mut gpui::Context<PopoverH
     popover_ui_scale(cx).percent()
 }
 
-pub(in super::super) fn popover_scaled_px(
-    value: f32,
-    ui_scale: impl Into<ui_scale::UiScale>,
-) -> Pixels {
-    ui_scale.into().px(value)
-}
-
-pub(in super::super) fn popover_scaled_px_from_percent(
-    value: f32,
-    ui_scale_percent: u32,
-) -> Pixels {
-    popover_scaled_px(value, ui_scale_percent)
-}
-
 /// One-line replacement for the per-panel `ui_scale_percent` + closure
 /// preamble: returns a copyable `f32 -> Pixels` scaler for the current
 /// UI scale.
 pub(super) fn popover_scaled_px_fn(
     cx: &mut gpui::Context<PopoverHost>,
 ) -> impl Fn(f32) -> Pixels + Copy + use<> {
-    let ui_scale = popover_ui_scale(cx);
-    move |value: f32| ui_scale.px(value)
+    ui_scale::scaler(popover_ui_scale(cx))
 }
 
 pub(in super::super) fn focusable_toggle_row<V: 'static>(
@@ -440,8 +502,6 @@ pub(in super::super) fn focusable_toggle_row<V: 'static>(
     cx: &mut gpui::Context<V>,
 ) -> gpui::Stateful<gpui::Div> {
     let focus_handle = focus_handle.clone().tab_index(0).tab_stop(true);
-    let hover_bg = theme.hover_overlay();
-    let active_bg = theme.active_overlay();
     div()
         .id(id)
         .debug_selector(move || debug_selector.to_string())
@@ -456,12 +516,10 @@ pub(in super::super) fn focusable_toggle_row<V: 'static>(
         .border_color(gpui::transparent_black())
         .track_focus(&focus_handle)
         .cursor(CursorStyle::PointingHand)
-        .hover(move |s| s.bg(hover_bg))
-        .active(move |s| s.bg(active_bg))
-        .focus(move |s| {
-            s.bg(theme.colors.interaction.focus_background)
-                .border_color(theme.colors.interaction.focus_ring)
-        })
+        .control_interaction(
+            components::InteractionStyle::new(theme),
+            components::InteractionState::default(),
+        )
         .on_mouse_down(
             MouseButton::Left,
             cx.listener(move |_this, _e: &MouseDownEvent, window, cx| {
@@ -470,10 +528,61 @@ pub(in super::super) fn focusable_toggle_row<V: 'static>(
         )
 }
 
+/// A check box with its label. The caller toggles it from `on_activate`.
+pub(super) fn checkbox_row(
+    id: &'static str,
+    debug_selector: &'static str,
+    label: impl Into<SharedString>,
+    checked: bool,
+    focus_handle: &FocusHandle,
+    theme: AppTheme,
+    cx: &mut gpui::Context<PopoverHost>,
+) -> gpui::Stateful<gpui::Div> {
+    let scaled_px = popover_scaled_px_fn(cx);
+    let border = if checked {
+        theme.colors.status.success.foreground
+    } else {
+        theme.colors.stroke.default
+    };
+    let background = if checked {
+        with_alpha(
+            theme.colors.status.success.foreground,
+            if theme.is_dark { 0.18 } else { 0.12 },
+        )
+    } else {
+        gpui::rgba(0x00000000)
+    };
+
+    focusable_toggle_row(id, debug_selector, theme, focus_handle, cx)
+        .flex()
+        .gap_2()
+        .justify_start()
+        .child(
+            div()
+                .size(scaled_px(16.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .border_1()
+                .border_color(border)
+                .rounded(scaled_px(theme.radii.control * 0.5))
+                .bg(background)
+                .when(checked, |this| {
+                    this.child(crate::view::icons::svg_icon(
+                        "icons/check.svg",
+                        theme.colors.status.success.foreground,
+                        scaled_px(10.0),
+                    ))
+                }),
+        )
+        .child(div().text_size(theme.ui_text(14.0)).child(label.into()))
+}
+
 fn popover_is_context_menu(kind: &PopoverKind) -> bool {
     matches!(
         kind,
-        PopoverKind::AppMenu
+        PopoverKind::Hosted { menu: true, .. }
+            | PopoverKind::AppMenu
             | PopoverKind::AddRepoMenu
             | PopoverKind::PullPicker
             | PopoverKind::PushPicker
@@ -481,6 +590,7 @@ fn popover_is_context_menu(kind: &PopoverKind) -> bool {
             | PopoverKind::PreviousCommitMessagesMenu { .. }
             | PopoverKind::RepoTabMenu { .. }
             | PopoverKind::WebLinkMenu { .. }
+            | PopoverKind::LocalFileLinkMenu { .. }
             | PopoverKind::CommitShaLinkMenu { .. }
             | PopoverKind::DiffActionMenu
             | PopoverKind::InteractiveRebaseActionMenu { .. }
@@ -488,7 +598,9 @@ fn popover_is_context_menu(kind: &PopoverKind) -> bool {
             | PopoverKind::MergetoolSettingsMenu
             | PopoverKind::HistoryBranchFilter { .. }
             | PopoverKind::DiffContentModeSettings
-            | PopoverKind::CommitFileSortMenu
+            | PopoverKind::TextFormatMenu { .. }
+            | PopoverKind::CommitFileSortMenu { .. }
+            | PopoverKind::FileListLayoutMenu { .. }
             | PopoverKind::ChangeTrackingSettings
             | PopoverKind::UiScalePicker
             | PopoverKind::TerminalMenu { .. }
@@ -500,14 +612,15 @@ fn popover_is_context_menu(kind: &PopoverKind) -> bool {
             | PopoverKind::CommitMenu { .. }
             | PopoverKind::ReflogEntryMenu { .. }
             | PopoverKind::TagMenu { .. }
-            | PopoverKind::TagRefMenu { .. }
             | PopoverKind::StatusFileMenu { .. }
+            | PopoverKind::StatusConflictMenu { .. }
             | PopoverKind::BranchMenu { .. }
-            | PopoverKind::BranchRefsMenu { .. }
             | PopoverKind::BranchSectionMenu { .. }
             | PopoverKind::SubmoduleInnerDiffMenu { .. }
             | PopoverKind::Repo {
-                kind: RepoPopoverKind::Remote(RemotePopoverKind::Menu { .. }),
+                kind: RepoPopoverKind::Remote(
+                    RemotePopoverKind::Menu { .. } | RemotePopoverKind::OpenInBrowserMenu,
+                ),
                 ..
             }
             | PopoverKind::StashMenu { .. }
@@ -523,11 +636,22 @@ fn popover_is_context_menu(kind: &PopoverKind) -> bool {
                 ),
                 ..
             }
+            | PopoverKind::Repo {
+                kind: RepoPopoverKind::Annex(
+                    AnnexPopoverKind::SectionMenu | AnnexPopoverKind::RepositoryMenu { .. },
+                ),
+                ..
+            }
             | PopoverKind::CommitFileMenu { .. }
+            | PopoverKind::WorktreeFileMenu { .. }
+            | PopoverKind::CommitRangeFileMenu { .. }
             | PopoverKind::FileBrowserFileMenu { .. }
             | PopoverKind::FileBrowserFolderMenu { .. }
+            | PopoverKind::ExplorerSettingsMenu { .. }
+            | PopoverKind::FileListFolderMenu { .. }
             | PopoverKind::BranchGroupMenu { .. }
-            | PopoverKind::PinnedSectionMenu { .. }
+            | PopoverKind::SidebarPinnedOverflow { .. }
+            | PopoverKind::SidebarAncestorMenu { .. }
             | PopoverKind::BrowseHistoryMenu { .. }
     )
 }
@@ -536,22 +660,32 @@ fn popover_is_confirm_dialog(kind: &PopoverKind) -> bool {
     matches!(
         kind,
         PopoverKind::StashDropConfirm { .. }
+            | PopoverKind::ErrorDetails { .. }
             | PopoverKind::ForcePushConfirm { .. }
             | PopoverKind::CherryPickCommitConfirm { .. }
+            | PopoverKind::InteractiveCherryPickConfirm { .. }
+            | PopoverKind::RevertCommitConfirm { .. }
+            | PopoverKind::ApplyFileChangeConfirm { .. }
             | PopoverKind::MergeCommitConfirm { .. }
             | PopoverKind::MergeAbortConfirm { .. }
             | PopoverKind::RebaseOntoConfirm { .. }
             | PopoverKind::RebaseReword { .. }
+            | PopoverKind::BranchExistsPrompt { .. }
             | PopoverKind::ForceDeleteBranchConfirm { .. }
             | PopoverKind::DeleteBranchesConfirm { .. }
             | PopoverKind::ForceRemoveWorktreeConfirm { .. }
             | PopoverKind::DiscardChangesConfirm { .. }
+            | PopoverKind::DiscardFolderChangesConfirm { .. }
             | PopoverKind::AddToGitignorePrompt { .. }
             | PopoverKind::StageConflictMarkersConfirm { .. }
             | PopoverKind::ResetPrompt { .. }
             | PopoverKind::PullReconcilePrompt { .. }
             | PopoverKind::TerminalShutdownConfirm(_)
             | PopoverKind::UnsavedFileEditsConfirm(_)
+            | PopoverKind::FilesystemConflict(_)
+            | PopoverKind::DeletePermanentlyConfirm(_)
+            | PopoverKind::FilesystemUnsavedEditsConfirm(_)
+            | PopoverKind::CloseGuardConfirm(_)
             | PopoverKind::Repo {
                 kind: RepoPopoverKind::Remote(RemotePopoverKind::RemoveConfirm { .. }),
                 ..
@@ -571,6 +705,16 @@ fn popover_is_confirm_dialog(kind: &PopoverKind) -> bool {
     )
 }
 
+/// The root-side key of a file-operation dialog.
+fn filesystem_prompt_id(kind: &PopoverKind) -> Option<u64> {
+    match kind {
+        PopoverKind::FilesystemConflict(prompt) => Some(prompt.prompt_id),
+        PopoverKind::DeletePermanentlyConfirm(prompt) => Some(prompt.prompt_id),
+        PopoverKind::FilesystemUnsavedEditsConfirm(prompt) => Some(prompt.prompt_id),
+        _ => None,
+    }
+}
+
 pub(super) fn hotkey_hint(
     theme: AppTheme,
     debug_selector: &'static str,
@@ -579,7 +723,7 @@ pub(super) fn hotkey_hint(
     div()
         .debug_selector(move || debug_selector.to_string())
         .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
-        .text_xs()
+        .text_size(theme.ui_text(12.0))
         .text_color(theme.colors.foreground.secondary)
         .child(label.into())
 }
@@ -613,13 +757,9 @@ pub(super) fn dialog_cancel_button(
     theme: AppTheme,
     cx: &mut gpui::Context<PopoverHost>,
 ) -> gpui::Stateful<gpui::Div> {
-    cancel_button(id, hint_debug_selector, theme).on_click(theme, cx, |this, _e, _w, cx| {
-        this.close_popover(cx);
+    cancel_button(id, hint_debug_selector, theme).on_click(theme, cx, |this, _e, window, cx| {
+        this.close_popover_and_restore_focus(window, cx);
     })
-}
-
-pub(super) fn dialog_divider(theme: AppTheme) -> gpui::Div {
-    div().border_t_1().border_color(theme.colors.stroke.default)
 }
 
 /// Shared scaffolding for confirm-style dialogs: title, divider, body
@@ -647,7 +787,7 @@ impl ConfirmDialog {
             div()
                 .px_2()
                 .py_1()
-                .text_sm()
+                .text_size(theme.ui_text(14.0))
                 .text_color(theme.colors.foreground.secondary)
                 .child(text.into())
                 .into_any_element(),
@@ -661,7 +801,7 @@ impl ConfirmDialog {
             div()
                 .px_2()
                 .pb_1()
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .text_color(theme.colors.foreground.secondary)
                 .child(text.into())
                 .into_any_element(),
@@ -675,7 +815,7 @@ impl ConfirmDialog {
             div()
                 .px_2()
                 .py_1()
-                .text_sm()
+                .text_size(theme.ui_text(14.0))
                 .child(
                     div()
                         .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
@@ -693,7 +833,7 @@ impl ConfirmDialog {
             div()
                 .px_2()
                 .pb_1()
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
                 .text_color(theme.colors.foreground.secondary)
                 .child(text.into())
@@ -703,7 +843,36 @@ impl ConfirmDialog {
     }
 
     pub(super) fn divider(mut self, theme: AppTheme) -> Self {
-        self.sections.push(dialog_divider(theme).into_any_element());
+        self.sections.push(popover_rule(theme).into_any_element());
+        self
+    }
+
+    /// Monospace list of the affected files.
+    pub(super) fn file_list(mut self, theme: AppTheme, files: &[SharedString]) -> Self {
+        self.sections.push(
+            div()
+                .px_2()
+                .pb_1()
+                .text_size(theme.ui_text(14.0))
+                .text_color(theme.colors.foreground.secondary)
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        // Capped: a long list would push the buttons out of the
+                        // dialog, and the count above already says how many.
+                        .children(files.iter().take(8).map(|label| {
+                            div()
+                                .font_family(crate::font_preferences::EDITOR_MONOSPACE_FONT_FAMILY)
+                                .ml_2()
+                                .child(label.clone())
+                        }))
+                        .when(files.len() > 8, |d| {
+                            d.child(div().ml_2().child(format!("…and {} more", files.len() - 8)))
+                        }),
+                )
+                .into_any_element(),
+        );
         self
     }
 
@@ -725,20 +894,11 @@ impl ConfirmDialog {
             .flex()
             .flex_col()
             .min_w(self.width.preferred_px(ui_scale))
-            .child(popover_title(self.title))
-            .child(dialog_divider(theme))
+            .child(popover_title(theme, self.title))
+            .child(popover_rule(theme))
             .children(self.sections)
-            .child(dialog_divider(theme))
-            .child(
-                div()
-                    .px_2()
-                    .py_1()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(cancel)
-                    .child(actions),
-            )
+            .child(popover_rule(theme))
+            .child(prompt_footer_row().child(cancel).child(actions))
     }
 }
 
@@ -754,21 +914,43 @@ pub(super) fn is_submittable_branch_name(name: &str) -> bool {
     !name.is_empty() && !name.ends_with('/')
 }
 
-pub(super) fn popover_title(title: impl Into<SharedString>) -> gpui::Div {
+pub(super) fn popover_title(theme: AppTheme, title: impl Into<SharedString>) -> gpui::Div {
     let title: SharedString = title.into();
     div()
         .px_2()
         .py_1()
-        .text_sm()
+        .text_size(theme.ui_text(14.0))
         .font_weight(FontWeight::BOLD)
         .child(title)
+}
+
+/// A prompt's action row: cancel on the left, the action button(s) on the
+/// right. The caller adds those two as children.
+pub(super) fn prompt_footer_row() -> gpui::Div {
+    div().px_2().py_1().flex().items_center().justify_between()
+}
+
+/// The rule between a prompt's sections.
+pub(super) fn popover_rule(theme: AppTheme) -> gpui::Div {
+    div().border_t_1().border_color(theme.colors.stroke.default)
+}
+
+/// The line under a prompt's title naming what it acts on. Bigger than an
+/// [`input_label`], which names a field rather than the subject.
+pub(super) fn popover_detail(theme: AppTheme, text: impl Into<SharedString>) -> gpui::Div {
+    div()
+        .px_2()
+        .py_1()
+        .text_size(theme.ui_text(14.0))
+        .text_color(theme.colors.foreground.secondary)
+        .child(text.into())
 }
 
 pub(super) fn input_label(theme: AppTheme, label: &'static str) -> gpui::Div {
     div()
         .px_2()
         .py_1()
-        .text_xs()
+        .text_size(theme.ui_text(12.0))
         .text_color(theme.colors.foreground.secondary)
         .child(label)
 }
@@ -783,6 +965,7 @@ fn popover_anchor_corner(kind: &PopoverKind) -> Anchor {
     match kind {
         PopoverKind::PullPicker
         | PopoverKind::HookActivity { .. }
+        | PopoverKind::ErrorDetails { .. }
         | PopoverKind::PushPicker
         | PopoverKind::CreateBranchFromRefPrompt { .. }
         | PopoverKind::RenameBranchPrompt { .. }
@@ -825,8 +1008,15 @@ fn popover_anchor_corner(kind: &PopoverKind) -> Anchor {
         | PopoverKind::PushSetUpstreamPrompt { .. }
         | PopoverKind::ForcePushConfirm { .. }
         | PopoverKind::CherryPickCommitConfirm { .. }
+        | PopoverKind::InteractiveCherryPickConfirm { .. }
+        | PopoverKind::RevertCommitConfirm { .. }
+        | PopoverKind::ApplyFileChangeConfirm { .. }
         | PopoverKind::MergeCommitConfirm { .. }
         | PopoverKind::MergeAbortConfirm { .. }
+        | PopoverKind::BranchExistsPrompt { .. }
+        | PopoverKind::FilesystemConflict(_)
+        | PopoverKind::DeletePermanentlyConfirm(_)
+        | PopoverKind::FilesystemUnsavedEditsConfirm(_)
         | PopoverKind::ForceDeleteBranchConfirm { .. }
         | PopoverKind::ForceRemoveWorktreeConfirm { .. }
         | PopoverKind::PullReconcilePrompt { .. }
@@ -836,34 +1026,40 @@ fn popover_anchor_corner(kind: &PopoverKind) -> Anchor {
         | PopoverKind::PreviousCommitMessagesMenu { .. }
         | PopoverKind::RepoTabMenu { .. }
         | PopoverKind::DiffActionMenu
+        | PopoverKind::ExplorerSettingsMenu { .. }
         | PopoverKind::MergetoolSettingsMenu
         | PopoverKind::HistoryBranchFilter { .. }
         | PopoverKind::HistoryAuthorFilter { .. }
         | PopoverKind::DiffContentModeSettings
-        | PopoverKind::CommitFileSortMenu
+        | PopoverKind::CommitFileSortMenu { .. }
+        | PopoverKind::FileListLayoutMenu { .. }
         | PopoverKind::ChangeTrackingSettings
-        | PopoverKind::TerminalMenu { .. }
-        | PopoverKind::UiScalePicker => Anchor::TopRight,
+        | PopoverKind::TerminalMenu { .. } => Anchor::TopRight,
+        // The strip and the bottom bar sit at the bottom edge; open upwards.
+        PopoverKind::TextFormatMenu { .. } | PopoverKind::UiScalePicker => Anchor::BottomRight,
         _ => Anchor::TopLeft,
     }
 }
 
 pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<PopoverWidthSpec> {
     match kind {
-        PopoverKind::RepoPicker
+        PopoverKind::RepoPicker { .. }
         | PopoverKind::BranchPicker {
             purpose: BranchPickerPurpose::Delete | BranchPickerPurpose::RebaseOnto,
         } => Some(PICKER_WIDTH),
         PopoverKind::BranchPicker {
             purpose: BranchPickerPurpose::Checkout,
-        } => Some(LARGE_PICKER_WIDTH),
+        }
+        | PopoverKind::UpstreamPicker { .. } => Some(LARGE_PICKER_WIDTH),
         PopoverKind::StashPrompt
         | PopoverKind::CommitPrompt { .. }
         | PopoverKind::StashPickerPrompt { .. }
         | PopoverKind::CloneRepo
         | PopoverKind::CreateTagPrompt { .. }
         | PopoverKind::SquashPrompt { .. } => Some(DIALOG_420_WIDTH),
-        PopoverKind::HookActivity { .. } => Some(DIALOG_900_WIDTH),
+        PopoverKind::HookActivity { .. } | PopoverKind::ErrorDetails { .. } => {
+            Some(DIALOG_900_WIDTH)
+        }
         PopoverKind::CreateBranchFromRefPrompt { .. }
         | PopoverKind::RenameBranchPrompt { .. }
         | PopoverKind::CheckoutRemoteBranchPrompt { .. } => Some(DIALOG_540_WIDTH),
@@ -888,12 +1084,19 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::ForceDeleteBranchConfirm { .. }
         | PopoverKind::DeleteBranchesConfirm { .. }
         | PopoverKind::DiscardChangesConfirm { .. }
+        | PopoverKind::DiscardFolderChangesConfirm { .. }
         | PopoverKind::StageConflictMarkersConfirm { .. } => Some(DIALOG_420_WIDTH),
         PopoverKind::PushSetUpstreamPrompt { .. } => Some(DIALOG_320_WIDTH),
         PopoverKind::ResetPrompt { .. }
         | PopoverKind::RebaseOntoConfirm { .. }
         | PopoverKind::CherryPickCommitConfirm { .. }
+        | PopoverKind::InteractiveCherryPickConfirm { .. }
+        | PopoverKind::RevertCommitConfirm { .. }
+        | PopoverKind::ApplyFileChangeConfirm { .. }
         | PopoverKind::MergeCommitConfirm { .. } => Some(DIALOG_380_WIDTH),
+        PopoverKind::BranchExistsPrompt { .. } | PopoverKind::FilesystemConflict(_) => {
+            Some(DIALOG_540_WIDTH)
+        }
         PopoverKind::MergeAbortConfirm { .. } => Some(DIALOG_360_WIDTH),
         PopoverKind::ForceRemoveWorktreeConfirm { .. } => Some(DIALOG_460_WIDTH),
         PopoverKind::PullReconcilePrompt { .. } | PopoverKind::AddToGitignorePrompt { .. } => {
@@ -923,6 +1126,10 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
             ..
         } => Some(DIALOG_420_WIDTH),
         PopoverKind::Repo {
+            kind: RepoPopoverKind::Annex(AnnexPopoverKind::Prompt(_)),
+            ..
+        } => Some(DIALOG_460_WIDTH),
+        PopoverKind::Repo {
             kind:
                 RepoPopoverKind::Worktree(
                     WorktreePopoverKind::OpenPicker
@@ -941,18 +1148,20 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::FileHistory { .. } => Some(LARGE_PICKER_WIDTH),
         PopoverKind::AppMenu => Some(APP_MENU_WIDTH),
         PopoverKind::AddRepoMenu => Some(DEFAULT_CONTEXT_MENU_WIDTH),
-        PopoverKind::TerminalShutdownConfirm(_) | PopoverKind::UnsavedFileEditsConfirm(_) => {
-            Some(DIALOG_440_WIDTH)
-        }
+        PopoverKind::TerminalShutdownConfirm(_)
+        | PopoverKind::UnsavedFileEditsConfirm(_)
+        | PopoverKind::CloseGuardConfirm(_)
+        | PopoverKind::DeletePermanentlyConfirm(_)
+        | PopoverKind::FilesystemUnsavedEditsConfirm(_) => Some(DIALOG_440_WIDTH),
         PopoverKind::TerminalMenu { .. } => Some(DEFAULT_CONTEXT_MENU_WIDTH),
-        PopoverKind::WebLinkMenu { .. } | PopoverKind::DiffActionMenu => {
-            Some(DIFF_ACTION_MENU_WIDTH)
-        }
-        // Shares "Browse repository at this point" with the commit menu, and so
-        // needs the same extra room.
+        PopoverKind::WebLinkMenu { .. }
+        | PopoverKind::LocalFileLinkMenu { .. }
+        | PopoverKind::DiffActionMenu
+        | PopoverKind::ExplorerSettingsMenu { .. } => Some(DIFF_ACTION_MENU_WIDTH),
+        // SHA-link and commit menus share their width to keep navigation
+        // and file-browsing actions consistent.
         PopoverKind::CommitShaLinkMenu { .. } => Some(PopoverWidthSpec::range(300.0, 220.0, 400.0)),
-        // "Browse repository at this point" needs more room than the default
-        // context-menu width.
+        // Keep room for the longer commit actions.
         PopoverKind::CommitMenu { .. } => Some(PopoverWidthSpec::range(300.0, 220.0, 400.0)),
         // Resolver settings have substantially longer labels than diff actions.
         // A dedicated preferred width also feeds the shared anchor-side chooser,
@@ -963,10 +1172,9 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         | PopoverKind::CommitOptionsMenu { .. }
         | PopoverKind::PreviousCommitMessagesMenu { .. }
         | PopoverKind::TagMenu { .. }
-        | PopoverKind::TagRefMenu { .. }
         | PopoverKind::StatusFileMenu { .. }
+        | PopoverKind::StatusConflictMenu { .. }
         | PopoverKind::BranchMenu { .. }
-        | PopoverKind::BranchRefsMenu { .. }
         | PopoverKind::BranchSectionMenu { .. }
         | PopoverKind::SubmoduleInnerDiffMenu { .. }
         | PopoverKind::Repo {
@@ -987,19 +1195,36 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
                 ),
             ..
         }
+        | PopoverKind::Repo {
+            kind:
+                RepoPopoverKind::Annex(
+                    AnnexPopoverKind::SectionMenu | AnnexPopoverKind::RepositoryMenu { .. },
+                ),
+            ..
+        }
         | PopoverKind::CommitFileMenu { .. }
+        | PopoverKind::WorktreeFileMenu { .. }
+        | PopoverKind::CommitRangeFileMenu { .. }
         | PopoverKind::FileBrowserFileMenu { .. }
         | PopoverKind::FileBrowserFolderMenu { .. }
         | PopoverKind::BranchGroupMenu { .. }
-        | PopoverKind::PinnedSectionMenu { .. }
+        | PopoverKind::SidebarPinnedOverflow { .. }
+        | PopoverKind::SidebarAncestorMenu { .. }
         | PopoverKind::ReflogEntryMenu { .. }
+        | PopoverKind::FileListFolderMenu { .. }
         | PopoverKind::BrowseHistoryMenu { .. } => Some(DEFAULT_CONTEXT_MENU_WIDTH),
         PopoverKind::RepoTabMenu { .. } => Some(REPO_TAB_MENU_WIDTH),
+        PopoverKind::Repo {
+            kind: RepoPopoverKind::Remote(RemotePopoverKind::OpenInBrowserMenu),
+            ..
+        } => Some(REMOTE_WEB_PICKER_WIDTH),
+        PopoverKind::CommitFileSortMenu { .. } => Some(SORT_CONTEXT_MENU_WIDTH),
+        PopoverKind::FileListLayoutMenu { .. } => Some(NARROW_CONTEXT_MENU_WIDTH),
         PopoverKind::HistoryBranchFilter { .. }
         | PopoverKind::DiffContentModeSettings
-        | PopoverKind::CommitFileSortMenu
         | PopoverKind::UiScalePicker
         | PopoverKind::DiffHunkMenu { .. } => Some(NARROW_CONTEXT_MENU_WIDTH),
+        PopoverKind::TextFormatMenu { .. } => Some(TEXT_FORMAT_MENU_WIDTH),
         PopoverKind::HistoryAuthorFilter { .. } => Some(HISTORY_AUTHOR_FILTER_WIDTH),
         PopoverKind::ChangeTrackingSettings => Some(CHANGE_TRACKING_MENU_WIDTH),
         PopoverKind::DiffEditorMenu { .. } => Some(DIFF_EDITOR_MENU_WIDTH),
@@ -1007,7 +1232,9 @@ pub(in super::super) fn popover_width_spec(kind: &PopoverKind) -> Option<Popover
         PopoverKind::ConflictResolverChunkMenu { .. } => Some(CONFLICT_CHUNK_MENU_WIDTH),
         PopoverKind::ConflictResolverOutputMenu { .. } => Some(CONFLICT_OUTPUT_MENU_WIDTH),
         PopoverKind::StashMenu { .. } => Some(STASH_MENU_WIDTH),
-        PopoverKind::RebaseReword { .. } => Some(DIALOG_440_WIDTH),
+        // A hosted menu is a context menu; a hosted dialog frames its content.
+        PopoverKind::Hosted { menu: true, .. } => Some(DEFAULT_CONTEXT_MENU_WIDTH),
+        PopoverKind::RebaseReword { .. } | PopoverKind::Hosted { .. } => Some(DIALOG_440_WIDTH),
         PopoverKind::InteractiveRebaseActionMenu { .. } => Some(REBASE_ACTION_MENU_WIDTH),
         PopoverKind::InteractiveRebaseAutosquashMenu => Some(REBASE_AUTOSQUASH_MENU_WIDTH),
     }
@@ -1100,3 +1327,11 @@ mod prompt_actions;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(feature = "benchmarks")]
+pub(in crate::view) fn benchmark_file_history_rows(
+    page: &gitcomet_core::domain::LogPage,
+    now: std::time::SystemTime,
+) -> Vec<components::PickerPromptItem> {
+    file_history::benchmark_rows(page, now)
+}

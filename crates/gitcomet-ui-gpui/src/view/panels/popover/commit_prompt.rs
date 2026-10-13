@@ -13,26 +13,21 @@ pub(super) fn panel(
         .flex()
         .flex_col()
         .w(scaled_px(420.0))
-        .child(popover_title("Commit Changes"))
-        .child(div().border_t_1().border_color(theme.colors.stroke.default))
+        .child(popover_title(theme, "Commit Changes"))
+        .child(super::popover_rule(theme))
         .child(
             div().px_2().py_1().w_full().min_w(px(0.0)).child(
                 components::ScrollContainer::vertical(
                     "commit_prompt_message_scroll_surface",
                     "commit_prompt_message_scrollbar",
                     this.commit_prompt_message_scroll.clone(),
-                    px(200.0),
+                    scaled_px(200.0),
                 )
                 .render(theme, this.commit_prompt_message_input.clone()),
             ),
         )
         .child(
-            div()
-                .px_2()
-                .py_1()
-                .flex()
-                .items_center()
-                .justify_between()
+            super::prompt_footer_row()
                 .child(
                     cancel_button("commit_prompt_cancel", "commit_prompt_cancel_hint", theme)
                         .focus_handle(this.commit_prompt_focus.cancel.clone())

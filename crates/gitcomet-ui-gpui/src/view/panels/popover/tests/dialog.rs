@@ -31,8 +31,8 @@ fn assert_popover_open(view: &gpui::Entity<GitCometView>, app: &gpui::App, expec
 
 #[gpui::test]
 fn force_push_confirm_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -42,7 +42,7 @@ fn force_push_confirm_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
     open_popover_and_draw(
         &view,
         PopoverKind::ForcePushConfirm { repo_id: RepoId(1) },
-        &mut cx,
+        cx,
     );
     cx.debug_bounds("force_push_cancel_hint")
         .expect("expected force push Cancel shortcut hint");
@@ -50,23 +50,23 @@ fn force_push_confirm_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn stash_prompt_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
         let _ = window.draw(app);
     });
 
-    open_popover_and_draw(&view, PopoverKind::StashPrompt, &mut cx);
+    open_popover_and_draw(&view, PopoverKind::StashPrompt, cx);
     cx.debug_bounds("stash_cancel_hint")
         .expect("expected stash Cancel shortcut hint");
 }
 
 #[gpui::test]
 fn reset_prompt_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -80,7 +80,7 @@ fn reset_prompt_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
             target: "HEAD".to_string(),
             mode: ResetMode::Mixed,
         },
-        &mut cx,
+        cx,
     );
     cx.debug_bounds("reset_cancel_hint")
         .expect("expected reset Cancel shortcut hint");
@@ -90,8 +90,8 @@ fn reset_prompt_renders_cancel_hint(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn force_push_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -101,7 +101,7 @@ fn force_push_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
     open_popover_and_draw(
         &view,
         PopoverKind::ForcePushConfirm { repo_id: RepoId(1) },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -114,15 +114,15 @@ fn force_push_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn stash_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
         let _ = window.draw(app);
     });
 
-    open_popover_and_draw(&view, PopoverKind::StashPrompt, &mut cx);
+    open_popover_and_draw(&view, PopoverKind::StashPrompt, cx);
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
     cx.run_until_parked();
@@ -134,8 +134,8 @@ fn stash_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn reset_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -149,7 +149,7 @@ fn reset_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
             target: "HEAD".to_string(),
             mode: ResetMode::Mixed,
         },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -162,8 +162,8 @@ fn reset_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn pull_reconcile_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -173,7 +173,7 @@ fn pull_reconcile_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
     open_popover_and_draw(
         &view,
         PopoverKind::PullReconcilePrompt { repo_id: RepoId(1) },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -186,8 +186,8 @@ fn pull_reconcile_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn terminal_shutdown_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -200,7 +200,7 @@ fn terminal_shutdown_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
             action: TerminalShutdownAction::CloseWindow,
             summary: TerminalShutdownSummary::default(),
         }),
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -213,8 +213,8 @@ fn terminal_shutdown_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn discard_changes_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -228,7 +228,7 @@ fn discard_changes_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
             area: DiffArea::Unstaged,
             path: None,
         },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -241,8 +241,8 @@ fn discard_changes_confirm_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn submodule_change_pointer_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -257,7 +257,7 @@ fn submodule_change_pointer_escape_closes(cx: &mut gpui::TestAppContext) {
                 path: std::path::PathBuf::from("."),
             }),
         },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -289,19 +289,19 @@ fn seed_untracked(
             );
             repo.status = Loadable::Ready(
                 gitcomet_core::domain::RepoStatus {
-                    staged: vec![],
-                    unstaged: vec![gitcomet_core::domain::FileStatus {
+                    staged: std::sync::Arc::new(vec![]),
+                    unstaged: std::sync::Arc::new(vec![gitcomet_core::domain::FileStatus {
                         path,
                         kind: gitcomet_core::domain::FileStatusKind::Untracked,
                         conflict: None,
-                    }],
+                    }]),
                 }
                 .into(),
             );
             let state = Arc::new(AppState {
                 repos: vec![repo],
                 active_repo: Some(repo_id),
-                ..Default::default()
+                ..AppState::test_default()
             });
             this.state = Arc::clone(&state);
             this.popover_host.update(cx, |host, _cx| {
@@ -325,8 +325,8 @@ fn gitignore_pattern_text(view: &gpui::Entity<GitCometView>, app: &gpui::App) ->
 
 #[gpui::test]
 fn add_to_gitignore_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -340,7 +340,7 @@ fn add_to_gitignore_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
             area: DiffArea::Unstaged,
             path: std::path::PathBuf::from("build/out.log"),
         },
-        &mut cx,
+        cx,
     );
     cx.update(|_window, app| assert_popover_open(&view, app, true));
     cx.simulate_keystrokes("escape");
@@ -353,15 +353,15 @@ fn add_to_gitignore_prompt_escape_closes(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn add_to_gitignore_prompt_prefills_the_anchored_file_pattern(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
         let _ = window.draw(app);
     });
 
-    seed_untracked(&view, &mut cx, RepoId(1), "build/out.log");
+    seed_untracked(&view, cx, RepoId(1), "build/out.log");
     open_popover_and_draw(
         &view,
         PopoverKind::AddToGitignorePrompt {
@@ -369,7 +369,7 @@ fn add_to_gitignore_prompt_prefills_the_anchored_file_pattern(cx: &mut gpui::Tes
             area: DiffArea::Unstaged,
             path: std::path::PathBuf::from("build/out.log"),
         },
-        &mut cx,
+        cx,
     );
 
     cx.update(|_window, app| {
@@ -383,15 +383,15 @@ fn add_to_gitignore_prompt_prefills_the_anchored_file_pattern(cx: &mut gpui::Tes
 
 #[gpui::test]
 fn add_to_gitignore_prompt_scope_switch_rewrites_the_pattern(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
         let _ = window.draw(app);
     });
 
-    seed_untracked(&view, &mut cx, RepoId(1), "build/out.log");
+    seed_untracked(&view, cx, RepoId(1), "build/out.log");
     open_popover_and_draw(
         &view,
         PopoverKind::AddToGitignorePrompt {
@@ -399,7 +399,7 @@ fn add_to_gitignore_prompt_scope_switch_rewrites_the_pattern(cx: &mut gpui::Test
             area: DiffArea::Unstaged,
             path: std::path::PathBuf::from("build/out.log"),
         },
-        &mut cx,
+        cx,
     );
 
     for (scope, expected) in [
@@ -425,8 +425,8 @@ fn add_to_gitignore_prompt_scope_switch_rewrites_the_pattern(cx: &mut gpui::Test
 
 #[gpui::test]
 fn add_to_gitignore_prompt_submits_the_hand_edited_pattern(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, mut cx) =
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
         cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
     cx.update(|window, app| {
         crate::app::bind_text_input_keys_for_test(app);
@@ -441,7 +441,7 @@ fn add_to_gitignore_prompt_submits_the_hand_edited_pattern(cx: &mut gpui::TestAp
             area: DiffArea::Unstaged,
             path: path.clone(),
         },
-        &mut cx,
+        cx,
     );
 
     // The user trims the suggestion down to the whole directory, and leaves a
@@ -482,4 +482,45 @@ fn add_to_gitignore_prompt_submits_the_hand_edited_pattern(cx: &mut gpui::TestAp
         let _ = window.draw(app);
         assert_popover_open(&view, app, false);
     });
+}
+
+/// Prompts share one rule, one detail line and one action row. Hand-rolling any
+/// of them is how the detail line ended up at two different sizes.
+#[test]
+fn prompts_use_the_shared_shell_pieces() {
+    let mut offenders = Vec::new();
+    let dir = std::path::Path::new("src/view/panels/popover");
+    for entry in std::fs::read_dir(dir).expect("read popover dir") {
+        let path = entry.expect("dir entry").path();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        if !name.ends_with(".rs") || name == "mod.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("read source");
+        let compact: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+        for (pattern, helper) in [
+            (
+                "div() .border_t_1() .border_color(theme.colors.stroke.default)",
+                "popover_rule",
+            ),
+            (
+                "div() .px_2() .py_1() .flex() .items_center() .justify_between()",
+                "prompt_footer_row",
+            ),
+            (
+                ".px_2() .py_1() .text_size(theme.ui_text(14.0)) .text_color(theme.colors.foreground.secondary)",
+                "popover_detail",
+            ),
+        ] {
+            if compact.contains(pattern) {
+                offenders.push(format!("{name}: use `{helper}`"));
+            }
+        }
+    }
+
+    assert!(offenders.is_empty(), "{offenders:#?}");
 }

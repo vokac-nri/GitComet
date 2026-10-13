@@ -1,18 +1,8 @@
 use super::*;
 
-fn push_raw_patch_diff_state(
-    cx: &mut gpui::VisualTestContext,
-    view: &gpui::Entity<super::super::GitCometView>,
-    repo_id: gitcomet_state::model::RepoId,
-    fixture_name: &str,
-    unified: String,
-) -> gitcomet_core::domain::DiffTarget {
-    push_raw_patch_diff_state_with_rev(cx, view, repo_id, fixture_name, unified, 1, true)
-}
-
 #[gpui::test]
 fn split_file_diff_multiline_search_preserves_blank_side_rows(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -94,7 +84,7 @@ index 1111111..2222222 100644
 #[gpui::test]
 fn short_split_diff_has_region_confined_below_eof_surfaces(cx: &mut gpui::TestAppContext) {
     let _visual_guard = lock_visual_test();
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -185,7 +175,7 @@ index 1111111..2222222 100644
 fn diff_search_f3_continues_from_previous_location_after_patch_refresh(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -197,10 +187,10 @@ fn diff_search_f3_continues_from_previous_location_after_patch_refresh(
     ));
     let _ = std::fs::create_dir_all(&workdir);
     let path = std::path::PathBuf::from("src/search_refresh.rs");
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: path.clone(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(
+        path.clone(),
+        gitcomet_core::domain::DiffArea::Unstaged,
+    );
 
     let push_patch = |cx: &mut gpui::VisualTestContext, diff_rev: u64, unified: &str| {
         let diff = gitcomet_core::domain::Diff::from_unified(target.clone(), unified);
@@ -362,61 +352,76 @@ index 1111111..2222222 100644
         unified
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
     let repo_id = gitcomet_state::model::RepoId(9139);
 
     cx.simulate_resize(gpui::size(px(900.0), px(420.0)));
-    push_raw_patch_diff_state_with_rev(
+    push_file_patch_diff_state_with_rev(
         cx,
         &view,
         repo_id,
         "search_refresh_zero_previous_match",
         unified_with_replacement("fresh focus line"),
         1,
-        true,
     );
     wait_for_main_pane_condition(
         cx,
         &view,
-        "initial no-match patch diff for search refresh regression",
-        |pane| pane.diff_cache_rev == 1 && pane.patch_diff_row_len() > 0,
-        |pane| (pane.diff_cache_rev, pane.patch_diff_row_len()),
+        "initial no-match file diff for search refresh regression",
+        |pane| pane.file_diff_cache_rev == 1 && pane.diff_visible_len() > 0,
+        |pane| (pane.file_diff_cache_rev, pane.diff_visible_len()),
     );
 
     cx.update(|_window, app| {
         let main_pane = view.read(app).main_pane.clone();
-        main_pane.update(app, |pane, _cx| {
+        main_pane.update(app, |pane, cx| {
             pane.diff_view = DiffViewMode::Inline;
             pane.diff_search_active = true;
-            pane.diff_search_query = "needle".into();
-            pane.diff_search_recompute_matches();
-            assert!(
-                pane.diff_search_matches.is_empty(),
-                "initial fixture should have no matches for the active query"
-            );
-            assert_eq!(pane.diff_search_match_ix, None);
+            pane.diff_search_input.update(cx, |input, cx| {
+                input.set_text("needle", cx);
+            });
         });
     });
+    wait_for_main_pane_condition(
+        cx,
+        &view,
+        "the initial search finishes without matches",
+        |pane| {
+            pane.diff_search_query.as_ref() == "needle"
+                && pane.diff_search_document.is_some()
+                && !pane.diff_search_result_pending()
+        },
+        |pane| {
+            (
+                pane.diff_search_query.clone(),
+                pane.diff_search_result_pending(),
+            )
+        },
+    );
+    cx.update(|_window, app| {
+        let pane = view.read(app).main_pane.read(app);
+        assert!(pane.diff_search_matches.is_empty());
+        assert_eq!(pane.diff_search_match_ix, None);
+    });
 
-    push_raw_patch_diff_state_with_rev(
+    push_file_patch_diff_state_with_rev(
         cx,
         &view,
         repo_id,
         "search_refresh_zero_previous_match",
         unified_with_replacement("needle focus line"),
         2,
-        true,
     );
     wait_for_main_pane_condition(
         cx,
         &view,
-        "refreshed patch diff scrolls to first new search match",
+        "refreshed file diff scrolls to first new search match",
         |pane| {
             let first_match = pane.diff_search_matches.first().copied();
-            pane.diff_cache_rev == 2
+            pane.file_diff_cache_rev == 2
                 && pane.diff_search_matches.len() == 1
                 && pane.diff_search_match_ix == Some(0)
                 && pane.diff_selection_anchor == first_match
@@ -426,8 +431,11 @@ index 1111111..2222222 100644
         },
         |pane| {
             (
-                pane.diff_cache_rev,
+                pane.file_diff_cache_rev,
                 pane.diff_visible_len(),
+                pane.diff_search_active,
+                pane.diff_search_query.clone(),
+                pane.diff_view,
                 pane.diff_search_matches.clone(),
                 pane.diff_search_match_ix,
                 pane.diff_selection_anchor,
@@ -439,41 +447,76 @@ index 1111111..2222222 100644
     );
 }
 
-pub(super) fn push_raw_patch_diff_state_with_rev(
+pub(super) fn push_file_patch_diff_state_with_rev(
     cx: &mut gpui::VisualTestContext,
     view: &gpui::Entity<super::super::GitCometView>,
     repo_id: gitcomet_state::model::RepoId,
     fixture_name: &str,
     unified: String,
     diff_rev: u64,
-    ready: bool,
 ) -> gitcomet_core::domain::DiffTarget {
-    let workdir = std::env::temp_dir().join(format!(
-        "gitcomet_ui_test_{}_{}_raw_patch_root",
-        std::process::id(),
-        fixture_name
-    ));
-    let _ = std::fs::create_dir_all(&workdir);
-    let target = gitcomet_core::domain::DiffTarget::Commit {
-        commit_id: gitcomet_core::domain::CommitId("feedface".into()),
-        path: None,
-    };
-    let diff = gitcomet_core::domain::Diff::from_unified(target.clone(), &unified);
-
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
-            let mut repo = opening_repo_state(repo_id, &workdir);
-            repo.diff_state.diff_target = Some(target.clone());
-            repo.diff_state.diff_state_rev = diff_rev;
-            repo.diff_state.diff_rev = diff_rev;
-            repo.diff_state.diff = if ready {
-                gitcomet_state::model::Loadable::Ready(Arc::new(diff))
-            } else {
-                gitcomet_state::model::Loadable::Loading
-            };
-            push_test_state(this, app_state_with_repo(repo, repo_id), cx);
+            this.set_diff_view_mode(DiffViewMode::Inline, cx);
+            this.set_diff_word_wrap(false, cx);
         });
     });
+    let path = PathBuf::from(
+        unified
+            .lines()
+            .find_map(|line| line.strip_prefix("+++ b/"))
+            .expect("the fixture must contain a single file patch"),
+    );
+    let target = gitcomet_core::domain::DiffTarget::commit(
+        gitcomet_core::domain::CommitId("deadbeef".into()),
+        path.clone(),
+    );
+    let diff = gitcomet_core::domain::Diff::from_unified(target, &unified);
+    let mut old_text = String::new();
+    let mut new_text = String::new();
+    // These fixtures include the complete file, so the patch also provides
+    // the file contents needed by the full per-file diff view.
+    for line in &diff.lines {
+        use gitcomet_core::domain::DiffLineKind;
+        match line.kind {
+            DiffLineKind::Context | DiffLineKind::Remove => {
+                old_text.push_str(&line.text[1..]);
+                old_text.push('\n');
+            }
+            _ => {}
+        }
+        match line.kind {
+            DiffLineKind::Context | DiffLineKind::Add => {
+                new_text.push_str(&line.text[1..]);
+                new_text.push('\n');
+            }
+            _ => {}
+        }
+    }
+
+    let target = push_regular_diff_content_mode_state_with_rev(
+        cx,
+        view,
+        repo_id,
+        fixture_name,
+        path,
+        diff_rev,
+        unified,
+        old_text,
+        new_text,
+    );
+    set_diff_content_mode_for_test(cx, view, DiffContentMode::Full);
+    wait_for_main_pane_condition(
+        cx,
+        view,
+        "file diff fixture ready",
+        |pane| {
+            pane.is_file_diff_view_active()
+                && pane.file_diff_cache_rev == diff_rev
+                && pane.file_diff_cache_inflight.is_none()
+        },
+        |pane| (pane.is_file_diff_view_active(), pane.file_diff_cache_rev),
+    );
 
     target
 }
@@ -553,6 +596,7 @@ fn activate_full_file_diff_horizontal_scroll_fixture(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_working_tree_full_file_horizontal_scroll_fixture_state(
     cx: &mut gpui::VisualTestContext,
     view: &gpui::Entity<super::super::GitCometView>,
@@ -577,10 +621,7 @@ fn push_working_tree_full_file_horizontal_scroll_fixture_state(
     ));
     let _ = std::fs::create_dir_all(&workdir);
     let path = PathBuf::from("src/lib.rs");
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: path.clone(),
-        area,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(path.clone(), area);
     let diff = gitcomet_core::domain::Diff::from_unified(target.clone(), &unified);
     let file_diff =
         gitcomet_core::domain::FileDiffText::new(path.clone(), Some(old_text), Some(new_text));
@@ -613,69 +654,6 @@ fn push_working_tree_full_file_horizontal_scroll_fixture_state(
     });
 
     target
-}
-
-fn activate_raw_patch_horizontal_scroll_fixture(
-    cx: &mut gpui::VisualTestContext,
-    view: &gpui::Entity<super::super::GitCometView>,
-    repo_id: gitcomet_state::model::RepoId,
-    fixture_name: &str,
-    diff_view: DiffViewMode,
-) {
-    let (unified, _, _) = build_collapsed_diff_horizontal_scroll_fixture_texts();
-    let target = push_raw_patch_diff_state(cx, view, repo_id, fixture_name, unified);
-
-    cx.update(|_window, app| {
-        let main_pane = view.read(app).main_pane.clone();
-        main_pane.update(app, |pane, cx| {
-            pane.diff_view = diff_view;
-            cx.notify();
-        });
-    });
-    draw_and_drain_test_window(cx);
-
-    wait_for_main_pane_condition(
-        cx,
-        view,
-        "raw patch diff horizontal overflow becomes available",
-        |pane| {
-            pane.rendered_diff_target() == Some(&target)
-                && !pane.is_file_diff_view_active()
-                && pane.patch_diff_row_len() > 0
-                && match diff_view {
-                    DiffViewMode::Inline => {
-                        pane.diff_scroll.0.borrow().base_handle.max_offset().x > px(0.0)
-                    }
-                    DiffViewMode::Split => {
-                        pane.diff_scroll.0.borrow().base_handle.max_offset().x > px(0.0)
-                            && pane
-                                .diff_split_right_scroll
-                                .0
-                                .borrow()
-                                .base_handle
-                                .max_offset()
-                                .x
-                                > px(0.0)
-                    }
-                }
-        },
-        |pane| {
-            format!(
-                "target={:?} file_diff_active={} patch_rows={} left_offset={:?} left_max={:?} right_offset={:?} right_max={:?}",
-                pane.rendered_diff_target(),
-                pane.is_file_diff_view_active(),
-                pane.patch_diff_row_len(),
-                pane.diff_scroll.0.borrow().base_handle.offset(),
-                pane.diff_scroll.0.borrow().base_handle.max_offset(),
-                pane.diff_split_right_scroll.0.borrow().base_handle.offset(),
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .max_offset(),
-            )
-        },
-    );
 }
 
 fn assert_diff_unmeasured_render_does_not_force_horizontal_scroll_restore(
@@ -1434,7 +1412,7 @@ fn assert_diff_horizontal_scrollbar_drag_keeps_range_stable(
 
 #[gpui::test]
 fn diff_vertical_scrollbar_gutter_stays_reserved_when_unmeasured(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1691,7 +1669,7 @@ fn assert_working_tree_full_file_diff_horizontal_scroll_stable_across_same_targe
 fn full_file_diff_inline_unstaged_same_target_loading_preserves_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1711,7 +1689,7 @@ fn full_file_diff_inline_unstaged_same_target_loading_preserves_horizontal_scrol
 fn full_file_diff_split_unstaged_same_target_loading_preserves_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1731,7 +1709,7 @@ fn full_file_diff_split_unstaged_same_target_loading_preserves_horizontal_scroll
 fn full_file_diff_split_staged_same_target_loading_preserves_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1751,7 +1729,7 @@ fn full_file_diff_split_staged_same_target_loading_preserves_horizontal_scroll(
 fn full_file_diff_split_vertical_sync_same_target_loading_preserves_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1767,217 +1745,11 @@ fn full_file_diff_split_vertical_sync_same_target_loading_preserves_horizontal_s
     );
 }
 
-fn assert_raw_patch_diff_horizontal_scroll_stable_across_same_target_loading(
-    cx: &mut gpui::VisualTestContext,
-    view: &gpui::Entity<super::super::GitCometView>,
-    repo_id: gitcomet_state::model::RepoId,
-    fixture_name: &str,
-    diff_view: DiffViewMode,
-    sync_mode: DiffScrollSync,
-) {
-    let (unified, _, _) = build_collapsed_diff_horizontal_scroll_fixture_texts();
-    let target = push_raw_patch_diff_state_with_rev(
-        cx,
-        view,
-        repo_id,
-        fixture_name,
-        unified.clone(),
-        1,
-        true,
-    );
-    if diff_view == DiffViewMode::Split {
-        set_diff_scroll_sync_for_test(cx, view, sync_mode);
-    }
-    cx.update(|_window, app| {
-        let main_pane = view.read(app).main_pane.clone();
-        main_pane.update(app, |pane, cx| {
-            pane.diff_view = diff_view;
-            cx.notify();
-        });
-    });
-    draw_and_drain_test_window(cx);
-
-    wait_for_main_pane_condition(
-        cx,
-        view,
-        "raw patch horizontal overflow becomes available before same-target loading",
-        |pane| {
-            pane.rendered_diff_target() == Some(&target)
-                && !pane.is_file_diff_view_active()
-                && pane.diff_cache_rev == 1
-                && pane.patch_diff_row_len() > 0
-                && match diff_view {
-                    DiffViewMode::Inline => {
-                        pane.diff_scroll.0.borrow().base_handle.max_offset().x > px(0.0)
-                    }
-                    DiffViewMode::Split => {
-                        pane.diff_scroll.0.borrow().base_handle.max_offset().x > px(0.0)
-                            && pane
-                                .diff_split_right_scroll
-                                .0
-                                .borrow()
-                                .base_handle
-                                .max_offset()
-                                .x
-                                > px(0.0)
-                    }
-                }
-        },
-        |pane| {
-            format!(
-                "target={:?} cache_rev={} rows={} left_offset={:?} left_max={:?} right_offset={:?} right_max={:?}",
-                pane.rendered_diff_target(),
-                pane.diff_cache_rev,
-                pane.patch_diff_row_len(),
-                pane.diff_scroll.0.borrow().base_handle.offset(),
-                pane.diff_scroll.0.borrow().base_handle.max_offset(),
-                pane.diff_split_right_scroll.0.borrow().base_handle.offset(),
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .max_offset(),
-            )
-        },
-    );
-
-    cx.update(|_window, app| {
-        let main_pane = view.read(app).main_pane.clone();
-        main_pane.update(app, |pane, _cx| {
-            let left_handle = pane.diff_scroll.0.borrow().base_handle.clone();
-            let left_offset = left_handle.offset();
-            let left_max = left_handle.max_offset();
-            left_handle.set_offset(point(-left_max.x.min(px(360.0)), left_offset.y));
-
-            if diff_view == DiffViewMode::Split {
-                let right_handle = pane.diff_split_right_scroll.0.borrow().base_handle.clone();
-                let right_offset = right_handle.offset();
-                let right_max = right_handle.max_offset();
-                right_handle.set_offset(point(-right_max.x.min(px(540.0)), right_offset.y));
-            }
-        });
-    });
-    draw_and_drain_test_window(cx);
-
-    let (left_before_x, right_before_x, left_before_max, right_before_max) =
-        cx.update(|_window, app| {
-            let pane = view.read(app).main_pane.read(app);
-            (
-                pane.diff_scroll.0.borrow().base_handle.offset().x,
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .offset()
-                    .x,
-                pane.diff_scroll.0.borrow().base_handle.max_offset().x,
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .max_offset()
-                    .x,
-            )
-        });
-    assert!(left_before_x < px(0.0));
-    if diff_view == DiffViewMode::Split {
-        assert!(right_before_x < px(0.0));
-    }
-
-    let assert_stable = |cx: &mut gpui::VisualTestContext, label: &str| {
-        let (left_x, right_x, left_max, right_max, cache_rev, rows) = cx.update(|_window, app| {
-            let pane = view.read(app).main_pane.read(app);
-            (
-                pane.diff_scroll.0.borrow().base_handle.offset().x,
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .offset()
-                    .x,
-                pane.diff_scroll.0.borrow().base_handle.max_offset().x,
-                pane.diff_split_right_scroll
-                    .0
-                    .borrow()
-                    .base_handle
-                    .max_offset()
-                    .x,
-                pane.diff_cache_rev,
-                pane.patch_diff_row_len(),
-            )
-        });
-        assert_eq!(cache_rev, 2, "{label}: raw patch cache rev should advance");
-        assert!(rows > 0, "{label}: raw patch rows should remain cached");
-        assert!(
-            (left_x - left_before_x).abs() < px(0.01),
-            "{label}: left/inline offset should remain stable"
-        );
-        assert!(
-            (left_max - left_before_max).abs() < px(1.0),
-            "{label}: left/inline range should remain stable"
-        );
-        if diff_view == DiffViewMode::Split {
-            assert!(
-                (right_x - right_before_x).abs() < px(0.01),
-                "{label}: split-right offset should remain stable"
-            );
-            assert!(
-                (right_max - right_before_max).abs() < px(1.0),
-                "{label}: split-right range should remain stable"
-            );
-        }
-    };
-
-    push_raw_patch_diff_state_with_rev(cx, view, repo_id, fixture_name, unified.clone(), 2, false);
-    draw_and_drain_test_window(cx);
-    assert_stable(cx, "raw patch same-target loading redraw");
-
-    push_raw_patch_diff_state_with_rev(cx, view, repo_id, fixture_name, unified, 2, true);
-    draw_and_drain_test_window(cx);
-    assert_stable(cx, "raw patch same-target ready redraw");
-}
-
-#[gpui::test]
-fn raw_patch_inline_same_target_loading_preserves_horizontal_scroll(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    assert_raw_patch_diff_horizontal_scroll_stable_across_same_target_loading(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(916),
-        "raw_patch_inline_same_target_loading_hscroll",
-        DiffViewMode::Inline,
-        DiffScrollSync::None,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_vertical_sync_same_target_loading_preserves_horizontal_scroll(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    assert_raw_patch_diff_horizontal_scroll_stable_across_same_target_loading(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(917),
-        "raw_patch_split_vertical_sync_same_target_loading_hscroll",
-        DiffViewMode::Split,
-        DiffScrollSync::Vertical,
-    );
-}
-
 #[gpui::test]
 fn collapsed_diff_split_same_target_loading_preserves_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2161,99 +1933,10 @@ fn collapsed_diff_split_same_target_loading_preserves_horizontal_scroll(
 }
 
 #[gpui::test]
-fn raw_patch_inline_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(902),
-        "raw_patch_inline_hscrollbar_bounds_stable_unmeasured",
-        DiffViewMode::Inline,
-    );
-    assert_diff_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-        cx,
-        &view,
-        DiffViewMode::Inline,
-        DiffScrollSync::None,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(903),
-        "raw_patch_split_hscrollbar_bounds_stable_unmeasured",
-        DiffViewMode::Split,
-    );
-    assert_diff_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-        cx,
-        &view,
-        DiffViewMode::Split,
-        DiffScrollSync::None,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_vertical_sync_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(904),
-        "raw_patch_split_vertical_sync_hscrollbar_bounds_stable_unmeasured",
-        DiffViewMode::Split,
-    );
-    assert_diff_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
-        cx,
-        &view,
-        DiffViewMode::Split,
-        DiffScrollSync::Vertical,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_inline_horizontal_scrollbar_drag_keeps_range_stable(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(909),
-        "raw_patch_inline_hscrollbar_drag_range_stable",
-        DiffViewMode::Inline,
-    );
-    assert_diff_horizontal_scrollbar_drag_keeps_range_stable(cx, &view, DiffViewMode::Inline);
-}
-
-#[gpui::test]
 fn collapsed_diff_split_horizontal_scrollbar_drag_keeps_range_stable(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2276,7 +1959,7 @@ fn collapsed_diff_split_horizontal_scrollbar_drag_keeps_range_stable(
 fn collapsed_diff_inline_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2304,7 +1987,7 @@ fn collapsed_diff_inline_horizontal_scrollbar_bounds_stable_across_unmeasured_re
 fn collapsed_diff_split_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2332,7 +2015,7 @@ fn collapsed_diff_split_horizontal_scrollbar_bounds_stable_across_unmeasured_ren
 fn collapsed_diff_split_vertical_sync_horizontal_scrollbar_bounds_stable_across_unmeasured_render(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2358,7 +2041,7 @@ fn collapsed_diff_split_vertical_sync_horizontal_scrollbar_bounds_stable_across_
 
 #[gpui::test]
 fn collapsed_diff_split_scroll_sync_setting_controls_each_axis(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2494,7 +2177,7 @@ fn collapsed_diff_split_scroll_sync_setting_controls_each_axis(cx: &mut gpui::Te
 fn full_file_diff_inline_unmeasured_render_does_not_force_horizontal_scroll_restore(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2517,7 +2200,7 @@ fn full_file_diff_inline_unmeasured_render_does_not_force_horizontal_scroll_rest
 fn full_file_diff_split_unmeasured_render_does_not_force_horizontal_scroll_restore(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2537,56 +2220,10 @@ fn full_file_diff_split_unmeasured_render_does_not_force_horizontal_scroll_resto
 }
 
 #[gpui::test]
-fn raw_patch_inline_unmeasured_render_does_not_force_horizontal_scroll_restore(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(273),
-        "raw_patch_inline_unmeasured_render_no_forced_hscroll_restore",
-        DiffViewMode::Inline,
-    );
-    assert_diff_unmeasured_render_does_not_force_horizontal_scroll_restore(
-        cx,
-        &view,
-        DiffViewMode::Inline,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_unmeasured_render_does_not_force_horizontal_scroll_restore(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(274),
-        "raw_patch_split_unmeasured_render_no_forced_hscroll_restore",
-        DiffViewMode::Split,
-    );
-    assert_diff_unmeasured_render_does_not_force_horizontal_scroll_restore(
-        cx,
-        &view,
-        DiffViewMode::Split,
-    );
-}
-
-#[gpui::test]
 fn full_file_diff_inline_unmeasured_render_does_not_zero_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2609,7 +2246,7 @@ fn full_file_diff_inline_unmeasured_render_does_not_zero_horizontal_scroll(
 fn full_file_diff_split_unmeasured_render_does_not_zero_horizontal_scroll(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2629,54 +2266,8 @@ fn full_file_diff_split_unmeasured_render_does_not_zero_horizontal_scroll(
 }
 
 #[gpui::test]
-fn raw_patch_inline_unmeasured_render_does_not_zero_horizontal_scroll(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(277),
-        "raw_patch_inline_unmeasured_render_does_not_zero_hscroll",
-        DiffViewMode::Inline,
-    );
-    assert_diff_unmeasured_render_keeps_horizontal_scroll_without_zero_frame(
-        cx,
-        &view,
-        DiffViewMode::Inline,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_unmeasured_render_does_not_zero_horizontal_scroll(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(278),
-        "raw_patch_split_unmeasured_render_does_not_zero_hscroll",
-        DiffViewMode::Split,
-    );
-    assert_diff_unmeasured_render_keeps_horizontal_scroll_without_zero_frame(
-        cx,
-        &view,
-        DiffViewMode::Split,
-    );
-}
-
-#[gpui::test]
 fn full_file_diff_inline_scroll_to_start_persists(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2693,7 +2284,7 @@ fn full_file_diff_inline_scroll_to_start_persists(cx: &mut gpui::TestAppContext)
 
 #[gpui::test]
 fn full_file_diff_split_scroll_to_start_persists(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2709,44 +2300,10 @@ fn full_file_diff_split_scroll_to_start_persists(cx: &mut gpui::TestAppContext) 
 }
 
 #[gpui::test]
-fn raw_patch_inline_scroll_to_start_persists(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(281),
-        "raw_patch_inline_scroll_to_start_persists",
-        DiffViewMode::Inline,
-    );
-    assert_diff_horizontal_scroll_to_start_persists(cx, &view, DiffViewMode::Inline);
-}
-
-#[gpui::test]
-fn raw_patch_split_scroll_to_start_persists(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(282),
-        "raw_patch_split_scroll_to_start_persists",
-        DiffViewMode::Split,
-    );
-    assert_diff_horizontal_scroll_to_start_persists(cx, &view, DiffViewMode::Split);
-}
-
-#[gpui::test]
 fn full_file_diff_inline_horizontal_range_stable_across_unmeasured_render(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2769,7 +2326,7 @@ fn full_file_diff_inline_horizontal_range_stable_across_unmeasured_render(
 fn full_file_diff_split_horizontal_range_stable_across_unmeasured_render(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2779,50 +2336,6 @@ fn full_file_diff_split_horizontal_range_stable_across_unmeasured_render(
         &view,
         gitcomet_state::model::RepoId(284),
         "full_file_split_horizontal_range_stable_unmeasured",
-        DiffViewMode::Split,
-    );
-    assert_diff_horizontal_scroll_range_stable_across_unmeasured_render(
-        cx,
-        &view,
-        DiffViewMode::Split,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_inline_horizontal_range_stable_across_unmeasured_render(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(285),
-        "raw_patch_inline_horizontal_range_stable_unmeasured",
-        DiffViewMode::Inline,
-    );
-    assert_diff_horizontal_scroll_range_stable_across_unmeasured_render(
-        cx,
-        &view,
-        DiffViewMode::Inline,
-    );
-}
-
-#[gpui::test]
-fn raw_patch_split_horizontal_range_stable_across_unmeasured_render(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    activate_raw_patch_horizontal_scroll_fixture(
-        cx,
-        &view,
-        gitcomet_state::model::RepoId(286),
-        "raw_patch_split_horizontal_range_stable_unmeasured",
         DiffViewMode::Split,
     );
     assert_diff_horizontal_scroll_range_stable_across_unmeasured_render(
@@ -2949,7 +2462,7 @@ fn assert_collapsed_diff_trailing_down_button_clickable_above_hscrollbar(
 fn collapsed_diff_inline_trailing_down_button_stays_above_hscrollbar(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2965,7 +2478,7 @@ fn collapsed_diff_inline_trailing_down_button_stays_above_hscrollbar(
 
 #[gpui::test]
 fn collapsed_diff_split_trailing_down_button_stays_above_hscrollbar(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2983,7 +2496,7 @@ fn collapsed_diff_split_trailing_down_button_stays_above_hscrollbar(cx: &mut gpu
 fn collapsed_diff_inline_reveal_buttons_expand_context_without_creating_selection(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3071,7 +2584,7 @@ fn collapsed_diff_inline_reveal_buttons_expand_context_without_creating_selectio
 fn collapsed_diff_split_reveal_buttons_expand_context_without_creating_selection(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3157,7 +2670,7 @@ fn collapsed_diff_split_reveal_buttons_expand_context_without_creating_selection
 
 #[gpui::test]
 fn collapsed_diff_split_reveal_arrows_show_directional_tooltips(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3196,7 +2709,7 @@ fn collapsed_diff_split_reveal_arrows_show_directional_tooltips(cx: &mut gpui::T
 fn collapsed_diff_inline_up_reveal_keeps_header_above_revealed_context(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3311,7 +2824,7 @@ fn collapsed_diff_inline_up_reveal_keeps_header_above_revealed_context(
 fn collapsed_diff_split_up_reveal_keeps_header_above_revealed_context(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3461,7 +2974,7 @@ fn collapsed_diff_split_up_reveal_keeps_header_above_revealed_context(
 fn collapsed_diff_split_down_before_reveal_moves_both_columns_without_vertical_sync(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3595,7 +3108,7 @@ fn collapsed_diff_split_down_before_reveal_moves_both_columns_without_vertical_s
 
 #[gpui::test]
 fn collapsed_diff_short_gap_merge_moves_following_file_row(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });

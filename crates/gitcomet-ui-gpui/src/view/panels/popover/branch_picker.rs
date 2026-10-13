@@ -133,6 +133,26 @@ fn branch_row(
     item.secondary_parts(metadata_parts(repo, lookup_name, now))
 }
 
+/// The canonical remote-branch row used by every picker that offers a remote
+/// tracking ref. Keeping this here makes the upstream picker inherit the exact
+/// icon, section header, two-line metadata, truncation and search behaviour of
+/// the Checkout Branch picker.
+pub(super) fn remote_branch_row(
+    repo: &RepoState,
+    display_name: String,
+    lookup_name: &str,
+    now: std::time::SystemTime,
+) -> components::PickerPromptItem {
+    branch_row(
+        repo,
+        display_name,
+        lookup_name,
+        "icons/cloud.svg",
+        REMOTE_SECTION,
+        now,
+    )
+}
+
 /// Rows for the checkout picker: local branches, remote branches, and a create
 /// row. Both the panel and keyboard navigation go through this, so the rendered
 /// list and the list Enter walks can never disagree.
@@ -163,6 +183,9 @@ pub(super) fn rows(repo: &RepoState, query: &str, now: std::time::SystemTime) ->
     if let Loadable::Ready(branches) = &repo.branches {
         for branch in branches.iter() {
             local_names.push(branch.name.as_str());
+            if repo.hides_annex_ref(&branch.name) && head_branch != Some(branch.name.as_str()) {
+                continue;
+            }
             if head_branch == Some(branch.name.as_str()) {
                 marked_index = Some(items.len());
             }
@@ -182,18 +205,11 @@ pub(super) fn rows(repo: &RepoState, query: &str, now: std::time::SystemTime) ->
         for remote_branch in remote_branches.iter() {
             // `refs/remotes/<remote>/HEAD` is a symref, not a branch anyone
             // checks out by that name.
-            if remote_branch.name == "HEAD" {
+            if remote_branch.name == "HEAD" || repo.hides_annex_ref(&remote_branch.name) {
                 continue;
             }
             let display = format!("{}/{}", remote_branch.remote, remote_branch.name);
-            items.push(branch_row(
-                repo,
-                display.clone(),
-                &display,
-                "icons/cloud.svg",
-                REMOTE_SECTION,
-                now,
-            ));
+            items.push(remote_branch_row(repo, display.clone(), &display, now));
             rows.push(BranchPickerNavTarget::RemoteBranch {
                 remote: remote_branch.remote.clone(),
                 branch: remote_branch.name.clone(),
@@ -297,6 +313,7 @@ fn ref_rows_signature(repo: &RepoState, spec: RefRowsSpec) -> u64 {
         repo.id.hash(hasher);
         repo.head_branch_rev.hash(hasher);
         repo.branches_rev.hash(hasher);
+        repo.annex_refs_hidden.hash(hasher);
         if spec.with_refs {
             repo.tags_rev.hash(hasher);
         }
@@ -342,7 +359,10 @@ pub(super) fn ref_rows_cached(
         }
         if let Loadable::Ready(branches) = &repo.branches {
             for branch in branches.iter() {
-                if spec.hide_current_branch && head_branch == Some(branch.name.as_str()) {
+                let is_head = head_branch == Some(branch.name.as_str());
+                if (spec.hide_current_branch && is_head)
+                    || (repo.hides_annex_ref(&branch.name) && !is_head)
+                {
                     continue;
                 }
                 push(branch.name.clone(), "icons/git_branch.svg");
@@ -386,7 +406,6 @@ pub(super) fn ref_picker_prompt(
         .marked_index(built.marked_index)
         .leading_icon("icons/git_branch.svg")
         .selected_hint("Enter")
-        .accent_selection()
         .attached_list_surface()
 }
 
@@ -404,6 +423,7 @@ pub(super) fn rows_signature(repo: &RepoState) -> u64 {
         repo.branches_rev.hash(hasher);
         repo.remote_branches_rev.hash(hasher);
         repo.ref_metadata_rev.hash(hasher);
+        repo.annex_refs_hidden.hash(hasher);
         super::rows_cache::date_bucket(std::time::SystemTime::now()).hash(hasher);
     })
 }
@@ -425,7 +445,8 @@ pub(super) fn cached(
         super::rows_cache::RowsCacheOwner::BranchCheckout,
         rows_signature(repo),
         query,
-    );
+    )
+    .with_query_dependent_model();
     super::rows_cache::get_or_build(&this.branch_picker_rows_cache, key, |now| {
         let built = rows(repo, query, now);
         (built.items, built.rows, built.marked_index)
@@ -475,6 +496,7 @@ pub(super) fn activate(
                 repo_id,
                 name,
                 target,
+                force: false,
             });
             this.close_popover(cx);
         }
@@ -485,7 +507,7 @@ pub(super) fn panel(this: &mut PopoverHost, cx: &mut gpui::Context<PopoverHost>)
     let theme = this.theme;
     let ui_scale = super::popover_ui_scale(cx);
     let ui_scale_percent = ui_scale.percent();
-    let scaled_px = |value: f32| super::popover_scaled_px_from_percent(value, ui_scale_percent);
+    let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
     let is_checkout = is_checkout_picker(this);
     let width = if is_checkout {
         super::LARGE_PICKER_WIDTH
@@ -517,8 +539,8 @@ pub(super) fn panel(this: &mut PopoverHost, cx: &mut gpui::Context<PopoverHost>)
         .flex_col()
         .min_w(width.min_px(ui_scale))
         .max_w(width.max_px(ui_scale))
-        .child(popover_title(title))
-        .child(div().border_t_1().border_color(theme.colors.stroke.default));
+        .child(popover_title(theme, title))
+        .child(super::popover_rule(theme));
 
     // The checkout picker renders sectioned, metadata-bearing rows and a create
     // row, so it drives PickerPrompt directly rather than through
@@ -633,7 +655,11 @@ pub(super) fn panel(this: &mut PopoverHost, cx: &mut gpui::Context<PopoverHost>)
                             ),
                     );
                 } else {
-                    for (ix, branch) in branches.iter().enumerate() {
+                    for (ix, branch) in branches
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, branch)| !repo.hides_annex_ref(&branch.name))
+                    {
                         let repo_id = repo.id;
                         let name = branch.name.clone();
                         let label: SharedString = name.clone().into();
@@ -647,9 +673,11 @@ pub(super) fn panel(this: &mut PopoverHost, cx: &mut gpui::Context<PopoverHost>)
                                     ),
                             )
                             .tooltip_host(this.tooltip_host.clone())
-                            .render(theme, ui_scale_percent, cx)
-                            .on_click(cx.listener(
-                                move |this, _e: &ClickEvent, window, cx| {
+                            .on_select(
+                                theme,
+                                ui_scale_percent,
+                                cx,
+                                move |this, _e, window, cx| {
                                     this.handle_inline_branch_picker_select(
                                         name.clone(),
                                         repo_id,
@@ -657,7 +685,7 @@ pub(super) fn panel(this: &mut PopoverHost, cx: &mut gpui::Context<PopoverHost>)
                                         cx,
                                     );
                                 },
-                            )),
+                            ),
                         );
                     }
                 }
@@ -686,7 +714,7 @@ fn branch_picker_status_panel(
 ) -> gpui::Div {
     let theme = this.theme;
     let ui_scale_percent = super::popover_ui_scale_percent(cx);
-    let scaled_px = |value: f32| super::popover_scaled_px_from_percent(value, ui_scale_percent);
+    let scaled_px = crate::ui_scale::scaler(ui_scale_percent);
 
     if let Some(search) = this.branch_picker_search_input.clone() {
         // No rows at all — this panel exists to say why, in the picker's own
@@ -706,5 +734,71 @@ fn branch_picker_status_panel(
             Some(this.tooltip_host.clone()),
             cx,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gitcomet_core::domain::{Branch, CommitId, RemoteBranch};
+    use std::sync::Arc;
+
+    fn branch(name: &str) -> Branch {
+        Branch {
+            name: name.to_string(),
+            target: CommitId("a".repeat(40).into()),
+            upstream: None,
+            divergence: None,
+        }
+    }
+
+    fn targets(repo: &RepoState) -> Vec<String> {
+        rows(repo, "", std::time::SystemTime::UNIX_EPOCH)
+            .rows
+            .into_iter()
+            .map(|target| match target {
+                BranchPickerNavTarget::Ref(name) => name,
+                BranchPickerNavTarget::RemoteBranch { remote, branch } => {
+                    format!("{remote}/{branch}")
+                }
+                BranchPickerNavTarget::CreateBranch(name) => format!("+{name}"),
+                BranchPickerNavTarget::RowAction(ix) => format!("#{ix}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn checkout_rows_hide_annex_bookkeeping_branches_unless_checked_out() {
+        let mut repo = RepoState::new_opening(
+            RepoId(1),
+            gitcomet_core::domain::RepoSpec {
+                workdir: std::path::PathBuf::from("/tmp/annex_picker"),
+            },
+        );
+        repo.head_branch = Loadable::Ready("synced/main".to_string());
+        repo.branches = Loadable::Ready(Arc::new(vec![
+            branch("main"),
+            branch("git-annex"),
+            branch("synced/main"),
+            branch("synced/other"),
+        ]));
+        repo.remote_branches = Loadable::Ready(Arc::new(
+            ["main", "git-annex", "synced/main"]
+                .into_iter()
+                .map(|name| RemoteBranch {
+                    remote: "origin".to_string(),
+                    name: name.to_string(),
+                    target: CommitId("a".repeat(40).into()),
+                })
+                .collect(),
+        ));
+        let all = targets(&repo);
+        assert_eq!(all.len(), 7, "{all:?}");
+
+        repo.annex_refs_hidden = true;
+        assert_eq!(targets(&repo), ["main", "synced/main", "origin/main"]);
+        let before = rows_signature(&repo);
+        repo.annex_refs_hidden = false;
+        assert_ne!(before, rows_signature(&repo));
     }
 }
