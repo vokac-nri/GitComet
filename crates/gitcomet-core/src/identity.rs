@@ -333,13 +333,8 @@ impl ProductIdentity {
                     "https://github.com/Auto-Explore/GitComet",
                     "/releases"
                 ))),
-                survey: Some(SurveyLink {
-                    id: Cow::Borrowed("gitcomet_user_survey_2026_04"),
-                    message: Cow::Borrowed("Help shape GitComet by taking a short user survey."),
-                    url: Cow::Borrowed(
-                        "https://docs.google.com/forms/d/e/1FAIpQLSd8DKIl222UomSXrpv1q9rWodRlBSQo9pJDD62GbZEANTgD1A/viewform",
-                    ),
-                }),
+                // No startup prompts asking users to fill in upstream's survey.
+                survey: None,
             },
             // This fork does not track upstream releases, so a check would
             // only tell upstream's host that the app was launched.
@@ -735,9 +730,12 @@ mod tests {
         assert_eq!(identity.macos_bundle_id(), "ai.autoexplore.gitcomet");
         assert_eq!(identity.version(), env!("CARGO_PKG_VERSION"));
         // Nothing in the default identity may point the app at upstream's
-        // issue tracker or release feed on its own.
+        // issue tracker or release feed on its own, or prompt for its
+        // promotions and survey.
         assert_eq!(identity.links().new_issue, None);
         assert_eq!(identity.update_source(), &UpdateSource::Disabled);
+        assert_eq!(identity.links().editions, None);
+        assert_eq!(identity.links().survey, None);
         assert_eq!(
             identity.links().repository.as_deref(),
             Some(env!("CARGO_PKG_REPOSITORY"))

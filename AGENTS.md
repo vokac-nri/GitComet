@@ -34,6 +34,8 @@ or advertised. Do not "restore" them:
   chip, a FREE badge, and Discord, website and release links; Settings → Links has a
   "Professional Edition waitlist" row. The status bar shows the mark, name and version as plain
   text, and the default identity's `editions` link is `None`, which hides the waitlist row.
+- **No survey prompt.** Upstream shows a startup toast asking users to fill in its Google Forms
+  survey. The default identity's `survey` link is `None`, so the prompt never appears.
 
 The app has **no telemetry, analytics, or advertising**, one HTTP stack (`ureq`/`rustls`), and no
 raw sockets. Adding an outbound request is a significant change — say so explicitly in the PR.
@@ -49,7 +51,7 @@ without touching the fork's lines, and that merges silently. After resolving, gr
 the surfaces above before building:
 
 ```bash
-git grep -n -E "update_check|check_for_updates|CheckForUpdates|UpdateSource::GitHub|releases/latest|issue_url|new_issue|pro_launch|editions|community_url|http_client|AlwaysLoad"
+git grep -n -E "update_check|check_for_updates|CheckForUpdates|UpdateSource::GitHub|releases/latest|issue_url|new_issue|pro_launch|editions|community_url|survey: Some|http_client|AlwaysLoad"
 ```
 
 Every hit should be one this file explains. Do not use `git merge -X ours`: it only decides
