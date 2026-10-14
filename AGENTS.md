@@ -77,6 +77,8 @@ This fork also runs less CI than upstream, on purpose:
   Intel and Fedora lanes are removed. The Fedora lane was the only one with `git-annex`, so the
   annex integration tests now skip in CI. Upstream syncs that touch these matrices will
   conflict; keep the trimmed list.
+- **Prose-only changes skip CI.** `ci.yml` ignores top-level `*.md` and `docs/`. Markdown under
+  `crates/` is not ignored, because some of it is test fixtures.
 - **Package deployment** (`deploy-*.yml`, `deployment-ci.yml`) and the weekly `perf.yml` are
   disabled in the repo's Actions settings, not deleted, so syncs still merge cleanly. They publish
   to upstream-owned channels with secrets this fork does not have.
