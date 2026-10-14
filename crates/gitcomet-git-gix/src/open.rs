@@ -157,23 +157,30 @@ mod trust_tests {
     /// silent: no remotes, no upstreams, and `push` falls back to a bare `git push`.
     /// Trust cannot be forced low by owning a directory differently in a test, so pin
     /// the filtering behaviour by asking gix for reduced trust directly.
+    ///
+    /// Both opens ignore system, global and environment config. Since 0.89, gix
+    /// restores full trust to any repository listed in `safe.directory`, and
+    /// GitHub's hosted runners set `safe.directory = *` system-wide, which would
+    /// undo the reduced trust this test asks for.
     #[test]
     fn repository_local_config_survives_reduced_trust() {
         let dir = tempfile::tempdir().expect("create tempdir");
         let repo = repo_with_origin(dir.path());
+        let reduced = |options: gix::open::Options| {
+            options
+                .permissions(gix::open::Permissions::isolated())
+                .with(gix::sec::Trust::Reduced)
+        };
 
-        let untrusted = gix::open_opts(
-            &repo,
-            gix::open::Options::default().with(gix::sec::Trust::Reduced),
-        )
-        .expect("open with gix defaults");
+        let untrusted = gix::open_opts(&repo, reduced(gix::open::Options::default()))
+            .expect("open with gix defaults");
         assert!(
             untrusted.remote_names().is_empty(),
             "precondition: gix's default filter hides repository-local config at reduced trust"
         );
 
-        let trusted = gix::open_opts(&repo, super::open_options().with(gix::sec::Trust::Reduced))
-            .expect("open with crate options");
+        let trusted =
+            gix::open_opts(&repo, reduced(super::open_options())).expect("open with crate options");
         assert!(
             trusted.remote_names().iter().any(|name| name == "origin"),
             "crate options must keep repository-local config readable, got {:?}",
