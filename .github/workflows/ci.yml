@@ -1,10 +1,14 @@
 name: CI
 
+# Prose-only changes skip CI. Only top-level `*.md` and `docs/` are ignored:
+# Markdown under `crates/` includes test fixtures.
 on:
   push:
     branches: [main, dev]
+    paths-ignore: ["*.md", "docs/**"]
   pull_request:
     branches: [main, dev]
+    paths-ignore: ["*.md", "docs/**"]
   workflow_dispatch:
     inputs:
       cold-cache:
