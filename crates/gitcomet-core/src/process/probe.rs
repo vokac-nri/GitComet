@@ -18,20 +18,10 @@ pub(crate) fn probe_output(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut command = CommandWrap::from(command);
-    #[cfg(windows)]
-    {
-        let mut flags = CreationFlags(Default::default());
-        flags.0.0 = 0x0800_0000; // CREATE_NO_WINDOW
-        command.wrap(flags).wrap(JobObject);
-    }
-    #[cfg(unix)]
-    command.wrap(ProcessGroup::leader());
     let deadline = Instant::now() + timeout;
-    let mut child = command.spawn()?;
+    let mut child = spawn_owned(command)?;
     let stdout = reader(child.stdout().take());
     let stderr = reader(child.stderr().take());
-    drop(command);
     let mut status = None;
     let failure = loop {
         if cancellation.is_cancelled() {
@@ -64,6 +54,52 @@ pub(crate) fn probe_output(
         stdout: stdout.join().unwrap_or_else(|_| Ok(Vec::new()))?,
         stderr: stderr.join().unwrap_or_else(|_| Ok(Vec::new()))?,
     })
+}
+
+/// Spawns `command` in its own process group (Unix) or job (Windows), so a
+/// timeout or cancellation can terminate its descendants too.
+#[cfg(unix)]
+fn spawn_owned(command: Command) -> io::Result<Box<dyn ChildWrapper>> {
+    let mut command = CommandWrap::from(command);
+    command.wrap(ProcessGroup::leader());
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn spawn_owned(command: Command) -> io::Result<Box<dyn ChildWrapper>> {
+    fn no_window() -> CreationFlags {
+        let mut flags = CreationFlags(Default::default());
+        flags.0.0 = 0x0800_0000; // CREATE_NO_WINDOW
+        flags
+    }
+
+    let mut command = CommandWrap::from(command);
+    command.wrap(no_window()).wrap(JobObject);
+    match command.spawn() {
+        // Endpoint software can hold programs such as git.exe in a job of its
+        // own that Windows will not nest inside ours. process-wrap has already
+        // killed the suspended child, so run the probe without the job: the
+        // deadline still applies, but a descendant outliving a killed probe is
+        // no longer reaped.
+        Err(error) if job_assignment_denied(&error) => {
+            let mut command = CommandWrap::from(command.into_command());
+            // CreationFlags replaces the CREATE_SUSPENDED the job wrapper set.
+            command.wrap(no_window());
+            command.spawn()
+        }
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+fn job_assignment_denied(error: &io::Error) -> bool {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    // How the `windows` crate's HRESULT for ERROR_ACCESS_DENIED reaches io::Error.
+    const E_ACCESSDENIED: i32 = 0x8007_0005_u32 as i32;
+    matches!(
+        error.raw_os_error(),
+        Some(ERROR_ACCESS_DENIED | E_ACCESSDENIED)
+    )
 }
 
 fn reader<R: Read + Send + 'static>(pipe: Option<R>) -> JoinHandle<io::Result<Vec<u8>>> {
@@ -135,6 +171,17 @@ mod tests {
         // holds those pipes until it writes the marker and exits, so an escaped
         // descendant would already have written it by the time we get here.
         assert!(!marker.exists(), "descendant escaped the owned group/job");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_refused_job_assignment_is_recognised() {
+        // The code GitComet reported when AssignProcessToJobObject refused git.exe.
+        let refused = io::Error::from_raw_os_error(-2_147_024_891);
+        assert!(job_assignment_denied(&refused));
+        assert!(!job_assignment_denied(&io::Error::from(
+            io::ErrorKind::NotFound
+        )));
     }
 
     #[test]

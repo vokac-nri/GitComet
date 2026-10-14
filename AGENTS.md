@@ -95,8 +95,6 @@ against this list before suspecting your change. `gitcomet-ui-gpui` currently ha
   the read content) and `repo::line_stats::tests::empty_supplied_status_does_not_launch_clean_filter_or_rescan_worktree`.
   They fail even with `GIT_CONFIG_NOSYSTEM=1`, and also with `open_worktree_repo` swapped back to a
   plain `gix::open`, so the fork's `open.rs` is not the cause. Not yet diagnosed.
-- `gitcomet-state`: `tests/op_trace_integration.rs`: resolving `git` on `PATH` fails with
-  "Access is denied (os error -2147024891)". Looks like a `PATH` entry the process cannot read.
 
 Fixing any of these is welcome. Skipping them on Windows without first establishing that
 production behaviour is correct is not; the undiagnosed ones may be masking a real Windows bug.
