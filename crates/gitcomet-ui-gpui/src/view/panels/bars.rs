@@ -19,7 +19,7 @@ impl GitCometView {
             .rounded(px(theme.radii.panel))
             .child(
                 div()
-                    .text_sm()
+                    .text_size(theme.ui_text(14.0))
                     .text_color(theme.colors.foreground.secondary)
                     .child("Path"),
             )
@@ -46,8 +46,7 @@ impl GitCometView {
             .open_repo_input
             .read_with(cx, |input, _| input.text().trim().to_string());
         if !path.is_empty() {
-            self.store.dispatch(Msg::OpenRepo(path.into()));
-            self.open_repo_panel = false;
+            self.open_repo_path(path.into(), cx);
         }
         cx.notify();
     }

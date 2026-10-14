@@ -1,4 +1,43 @@
 use super::*;
+use gitcomet_core::domain::Upstream;
+
+#[test]
+fn markdown_save_uses_the_callers_disk_baseline_without_a_loaded_conflict() {
+    let mut repos = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let original: Arc<[u8]> = Arc::from(b"- [ ] ship it\n".as_slice());
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::SaveWorktreeFile {
+            repo_id,
+            path: PathBuf::from("README.md"),
+            contents: "- [x] ship it\n".into(),
+            expected_contents: Some(original.clone()),
+            stage: false,
+            completion: None,
+        },
+    );
+    assert!(matches!(effects.as_slice(), [Effect::SaveWorktreeFile {
+        expected_contents: Some(baseline), contents, stage: false, ..
+    }] if baseline == &original && contents == "- [x] ship it\n"));
+}
+
+fn upstream_target(remote: &str, branch: &str) -> Upstream {
+    Upstream {
+        remote: remote.to_string(),
+        branch: branch.to_string(),
+    }
+}
 
 fn test_force_push_lease() -> gitcomet_core::services::ForcePushLease {
     gitcomet_core::services::ForcePushLease {
@@ -44,7 +83,7 @@ fn repo_with_head_dependent_cached_state(repo_id: RepoId) -> RepoState {
 fn pull_and_push_mark_in_flight_until_command_finished() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     let workdir = PathBuf::from("/tmp/repo");
@@ -67,7 +106,12 @@ fn pull_and_push_mark_in_flight_until_command_finished() {
     );
     assert_eq!(state.repos[0].pull_in_flight, 1);
 
-    reduce(&mut repos, &id_alloc, &mut state, Msg::FetchAll { repo_id });
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Fetch(crate::msg::FetchMsg::All { repo_id }),
+    );
     assert_eq!(state.repos[0].pull_in_flight, 2);
 
     reduce(
@@ -270,7 +314,7 @@ fn pull_and_push_mark_in_flight_until_command_finished() {
 fn pull_and_push_do_not_mark_in_flight_before_repo_is_opened() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
@@ -289,7 +333,12 @@ fn pull_and_push_do_not_mark_in_flight_before_repo_is_opened() {
             mode: PullMode::Default,
         },
     );
-    reduce(&mut repos, &id_alloc, &mut state, Msg::FetchAll { repo_id });
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Fetch(crate::msg::FetchMsg::All { repo_id }),
+    );
     reduce(&mut repos, &id_alloc, &mut state, Msg::Push { repo_id });
 
     assert_eq!(state.repos[0].pull_in_flight, 0);
@@ -297,10 +346,59 @@ fn pull_and_push_do_not_mark_in_flight_before_repo_is_opened() {
 }
 
 #[test]
+fn pull_stopped_at_conflicts_is_summarized_as_a_conflict_stop() {
+    use gitcomet_core::error::{GitFailure, GitFailureId};
+
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+
+    let error = Error::new(ErrorKind::Git(GitFailure::new(
+        "git pull --no-rebase --ff --no-prune . dev",
+        GitFailureId::StoppedAtConflicts,
+        Some(1),
+        b"CONFLICT (content): Merge conflict in a.txt\n".to_vec(),
+        b"From .\n * branch dev -> FETCH_HEAD\n".to_vec(),
+        Some(
+            "Merge conflict in a.txt. Resolve it, then commit, or abort the merge.\n\nCONFLICT (content): Merge conflict in a.txt"
+                .to_string(),
+        ),
+    )));
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+            repo_id,
+            command: RepoCommandKind::PullBranch {
+                remote: ".".to_string(),
+                branch: "dev".to_string(),
+            },
+            result: Err(error),
+        }),
+    );
+
+    let summary = &state.repos[0].feedback.command_log[0].summary;
+    assert!(
+        summary.starts_with(
+            "Pull stopped at conflicts:\n\n    git pull --no-rebase --ff --no-prune . dev\n\n    Merge conflict in a.txt."
+        ),
+        "{summary}"
+    );
+}
+
+#[test]
 fn pull_error_is_formatted_as_command_and_output() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
@@ -343,23 +441,28 @@ fn pull_error_is_formatted_as_command_and_output() {
 }
 
 #[test]
-fn fetch_all_emits_effect_with_repo_prune_setting() {
+fn fetch_all_emits_effect_with_global_prune_setting() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
-    let mut repo_state = RepoState::new_opening(
+    let repo_state = RepoState::new_opening(
         repo_id,
         RepoSpec {
             workdir: PathBuf::from("/tmp/repo"),
         },
     );
-    repo_state.fetch_prune_deleted_remote_tracking_branches = false;
     state.repos.push(repo_state);
+    state.remote_settings.prune_deleted_remote_branches_on_fetch = false;
 
-    let fetch_without_prune = reduce(&mut repos, &id_alloc, &mut state, Msg::FetchAll { repo_id });
+    let fetch_without_prune = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Fetch(crate::msg::FetchMsg::All { repo_id }),
+    );
     assert!(matches!(
         fetch_without_prune.as_slice(),
         [Effect::FetchAll {
@@ -370,8 +473,13 @@ fn fetch_all_emits_effect_with_repo_prune_setting() {
     ));
     assert_eq!(state.repos[0].pull_in_flight, 1);
 
-    state.repos[0].fetch_prune_deleted_remote_tracking_branches = true;
-    let fetch_with_prune = reduce(&mut repos, &id_alloc, &mut state, Msg::FetchAll { repo_id });
+    state.remote_settings.prune_deleted_remote_branches_on_fetch = true;
+    let fetch_with_prune = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Fetch(crate::msg::FetchMsg::All { repo_id }),
+    );
     assert!(matches!(
         fetch_with_prune.as_slice(),
         [Effect::FetchAll {
@@ -384,10 +492,119 @@ fn fetch_all_emits_effect_with_repo_prune_setting() {
 }
 
 #[test]
+fn a_refspec_fetch_is_a_fetch_in_flight_and_refreshes_remote_branches_when_done() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let refspecs = vec!["refs/heads/topic:refs/remotes/origin/topic".to_string()];
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Fetch(crate::msg::FetchMsg::Refspecs {
+            repo_id,
+            remote: "origin".to_string(),
+            refspecs: refspecs.clone(),
+        }),
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::FetchRefspecs { remote, refspecs: sent, auth: None, .. }]
+            if remote == "origin" && sent == &refspecs
+    ));
+    assert_eq!(state.repos[0].pull_in_flight, 1);
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+            repo_id,
+            command: RepoCommandKind::FetchRefspecs {
+                remote: "origin".to_string(),
+                refspecs,
+            },
+            result: Ok(CommandOutput::empty_success("git fetch origin")),
+        }),
+    );
+    assert_eq!(state.repos[0].pull_in_flight, 0);
+    assert!(
+        matches!(state.repos[0].remote_branches, Loadable::Loading),
+        "a fetch reloads the remote branches"
+    );
+}
+
+#[test]
+fn pull_variants_snapshot_the_global_remote_prune_setting() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+
+    state.remote_settings.prune_deleted_remote_branches_on_fetch = false;
+    let pull = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Pull {
+            repo_id,
+            mode: PullMode::Rebase,
+        },
+    );
+    assert!(matches!(
+        pull.as_slice(),
+        [Effect::Pull {
+            repo_id: RepoId(1),
+            mode: PullMode::Rebase,
+            prune: false,
+            ..
+        }]
+    ));
+
+    state.remote_settings.prune_deleted_remote_branches_on_fetch = true;
+    let pull_branch = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::PullBranch {
+            repo_id,
+            remote: "origin".to_string(),
+            branch: "feature".to_string(),
+        },
+    );
+    assert!(matches!(
+        pull_branch.as_slice(),
+        [Effect::PullBranch {
+            repo_id: RepoId(1),
+            remote,
+            branch,
+            prune: true,
+            ..
+        }] if remote == "origin" && branch == "feature"
+    ));
+}
+
+#[test]
 fn commit_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -417,7 +634,7 @@ fn commit_emits_effect() {
 fn checkout_conflict_base_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -447,7 +664,7 @@ fn checkout_conflict_base_emits_effect() {
 fn accept_conflict_deletion_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -477,7 +694,7 @@ fn accept_conflict_deletion_emits_effect() {
 fn reset_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -508,7 +725,7 @@ fn reset_emits_effect() {
 fn revert_commit_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -524,6 +741,9 @@ fn revert_commit_emits_effect() {
         Msg::RevertCommit {
             repo_id: RepoId(1),
             commit_id: gitcomet_core::domain::CommitId("deadbeef".into()),
+            commit: false,
+            mainline: Some(2),
+            summary: "revert me".into(),
         },
     );
 
@@ -531,16 +751,101 @@ fn revert_commit_emits_effect() {
         effects.as_slice(),
         [Effect::RevertCommit {
             repo_id: RepoId(1),
-            commit_id: _
-        }]
+            commit_id: _,
+            commit: false,
+            mainline: Some(2),
+            summary,
+            auth: None,
+        }] if summary == "revert me"
     ));
+    assert_eq!(state.repos[0].local_actions_in_flight, 1);
+}
+
+#[test]
+fn apply_file_change_emits_effect_and_keeps_the_diff_target() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    state.active_repo = Some(repo_id);
+    let target = DiffTarget::commit_range(
+        CommitId("1111111111111111111111111111111111111111".into()),
+        Some(CommitId("2222222222222222222222222222222222222222".into())),
+        Some(PathBuf::from("src/lib.rs")),
+    );
+    let apply_target = gitcomet_core::domain::ApplyChangeTarget::from_diff_target(&target)
+        .expect("a comparison between commits can be applied");
+
+    for commit in [false, true] {
+        state.repos[0].set_diff_target(Some(target.clone()));
+        let effects = reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::ApplyFileChange {
+                commit_retry: None,
+                repo_id,
+                target: apply_target.clone(),
+                commit,
+            },
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::ApplyFileChange {
+                    commit_retry: None,
+                    repo_id: RepoId(1),
+                    target: effect_target,
+                    commit: effect_commit,
+                    auth: None,
+                }] if effect_target == &apply_target && *effect_commit == commit
+            ),
+            "commit={commit}: {effects:?}"
+        );
+        assert_eq!(state.repos[0].local_actions_in_flight, 1);
+        // A committing apply counts as a git operation while it runs, so the
+        // worktree write it makes is not taken for an outside edit.
+        assert_eq!(
+            state.repos[0].sequencer_actions_in_flight,
+            u32::from(commit)
+        );
+        assert_eq!(state.repos[0].git_operation_in_flight(), commit);
+
+        reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command: RepoCommandKind::ApplyFileChange {
+                    commit_retry: None,
+                    target: apply_target.clone(),
+                    commit,
+                },
+                result: Ok(CommandOutput::default()),
+            }),
+        );
+        assert_eq!(state.repos[0].local_actions_in_flight, 0);
+        assert_eq!(state.repos[0].sequencer_actions_in_flight, 0);
+        // The source diff did not change, so the user keeps their place.
+        assert_eq!(
+            state.repos[0].diff_state.diff_target.as_ref(),
+            Some(&target)
+        );
+    }
 }
 
 #[test]
 fn commit_amend_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -570,7 +875,7 @@ fn commit_amend_emits_effect() {
 fn worktree_commands_reload_worktrees_on_success() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
@@ -632,7 +937,7 @@ fn worktree_commands_reload_worktrees_on_success() {
 fn worktree_remove_closes_tab_for_removed_worktree() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     state.repos.push(RepoState::new_opening(
         RepoId(1),
@@ -677,7 +982,7 @@ fn worktree_remove_closes_tab_for_removed_worktree() {
 fn submodule_commands_reload_submodules_on_success() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
@@ -786,7 +1091,7 @@ fn selected_submodule_command_reloads_selected_summary() {
         repo_id: RepoId,
         command_path: &std::path::Path,
     ) -> (AppState, gitcomet_core::domain::DiffTarget) {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let mut repo = RepoState::new_opening(
             repo_id,
             RepoSpec {
@@ -794,12 +1099,12 @@ fn selected_submodule_command_reloads_selected_summary() {
             },
         );
         repo.set_status(Loadable::Ready(Arc::new(RepoStatus {
-            unstaged: vec![FileStatus {
+            unstaged: std::sync::Arc::new(vec![FileStatus {
                 path: command_path.to_path_buf(),
                 kind: FileStatusKind::Modified,
                 conflict: None,
-            }],
-            staged: Vec::new(),
+            }]),
+            staged: std::sync::Arc::new(Vec::new()),
         })));
         repo.set_submodules(Loadable::Ready(vec![Submodule {
             path: command_path.to_path_buf(),
@@ -807,15 +1112,13 @@ fn selected_submodule_command_reloads_selected_summary() {
             checked_out_head: None,
             status: SubmoduleStatus::NotInitialized,
         }]));
-        let target = DiffTarget::WorkingTree {
-            path: command_path.to_path_buf(),
-            area: DiffArea::Unstaged,
-        };
+        let target = DiffTarget::working_tree(command_path.to_path_buf(), DiffArea::Unstaged);
         repo.diff_state.diff_target = Some(target.clone());
         repo.diff_state.submodule_summary = Loadable::Ready(Arc::new(SubmoduleDiffSummary {
             path: command_path.to_path_buf(),
             mode: SubmoduleDiffSummaryMode::Worktree,
             status: Some(SubmoduleStatus::NotInitialized),
+            checkout_available: true,
             commit_id: None,
             parent_commit_id: None,
             checked_out_head: None,
@@ -823,10 +1126,7 @@ fn selected_submodule_command_reloads_selected_summary() {
             live_staged: Vec::new(),
             live_unstaged: Vec::new(),
         }));
-        let inline_target = DiffTarget::WorkingTree {
-            path: PathBuf::from("inner.rs"),
-            area: DiffArea::Unstaged,
-        };
+        let inline_target = DiffTarget::working_tree(PathBuf::from("inner.rs"), DiffArea::Unstaged);
         repo.diff_state.inline_submodule_diff = Some(crate::model::InlineSubmoduleDiffState {
             origin: crate::model::ForeignDiffOrigin::Submodule,
             submodule_repo_path: PathBuf::from("/tmp/repo/vendor/lib"),
@@ -836,7 +1136,8 @@ fn selected_submodule_command_reloads_selected_summary() {
                 kind: FileStatusKind::Modified,
                 target: inline_target.clone(),
                 section: crate::model::InlineSubmoduleDiffSection::LiveUnstaged,
-            }],
+            }]
+            .into(),
             selected_ix: 0,
             target: inline_target,
             rev: 1,
@@ -899,7 +1200,7 @@ fn selected_submodule_command_reloads_selected_summary() {
 fn merge_ref_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -928,7 +1229,7 @@ fn merge_ref_emits_effect() {
 fn squash_ref_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -958,7 +1259,7 @@ fn squash_ref_emits_effect() {
 fn rebase_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -987,7 +1288,7 @@ fn rebase_emits_effect() {
 fn create_rename_and_delete_branch_emit_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1023,6 +1324,7 @@ fn create_rename_and_delete_branch_emit_effects() {
             repo_id: RepoId(1),
             old_name: "feature".to_string(),
             new_name: "renamed-feature".to_string(),
+            force: false,
         },
     );
     assert!(matches!(
@@ -1031,6 +1333,7 @@ fn create_rename_and_delete_branch_emit_effects() {
             repo_id: RepoId(1),
             old_name,
             new_name,
+            force: false,
         }] if old_name == "feature" && new_name == "renamed-feature"
     ));
 
@@ -1067,7 +1370,7 @@ fn create_rename_and_delete_branch_emit_effects() {
 fn create_and_delete_tag_emit_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1142,7 +1445,7 @@ fn create_and_delete_tag_emit_effects() {
 fn apply_pop_and_drop_stash_emit_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1207,7 +1510,7 @@ fn apply_pop_and_drop_stash_emit_effects() {
 fn checkout_commit_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1247,7 +1550,7 @@ fn checkout_commit_emits_effect() {
 fn discard_worktree_changes_path_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(2);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1279,7 +1582,7 @@ fn discard_worktree_changes_path_emits_effect() {
 fn repo_operations_emit_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -1432,7 +1735,7 @@ fn repo_operations_emit_effects() {
         Msg::SetUpstreamBranch {
             repo_id: RepoId(1),
             branch: "feature/local".to_string(),
-            upstream: "origin/feature/foo".to_string(),
+            upstream: upstream_target("origin", "feature/foo"),
         },
     );
     assert!(matches!(
@@ -1441,7 +1744,7 @@ fn repo_operations_emit_effects() {
             repo_id: RepoId(1),
             branch,
             upstream,
-        }] if branch == "feature/local" && upstream == "origin/feature/foo"
+        }] if branch == "feature/local" && upstream == &upstream_target("origin", "feature/foo")
     ));
 
     let unset_upstream = reduce(
@@ -1486,7 +1789,7 @@ fn repo_operations_emit_effects() {
 fn pull_push_bump_ops_rev() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -1542,7 +1845,7 @@ fn pull_push_bump_ops_rev() {
 fn pull_branch_and_extended_push_commands_bump_in_flight_and_ops_rev() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -1608,7 +1911,7 @@ fn pull_branch_and_extended_push_commands_bump_in_flight_and_ops_rev() {
         Msg::SetUpstreamBranch {
             repo_id,
             branch: "feature/test".to_string(),
-            upstream: "origin/feature/test".to_string(),
+            upstream: upstream_target("origin", "feature/test"),
         },
     );
     assert_eq!(state.repos[0].push_in_flight, 2);
@@ -1638,7 +1941,7 @@ fn pull_branch_and_extended_push_commands_bump_in_flight_and_ops_rev() {
 fn commit_bumps_ops_rev() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -1670,7 +1973,7 @@ fn commit_bumps_ops_rev() {
 fn pull_push_do_not_bump_unrelated_revs() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -1706,7 +2009,7 @@ fn pull_push_do_not_bump_unrelated_revs() {
 fn commit_finished_clears_commit_state_and_requests_primary_refreshes() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -1716,10 +2019,10 @@ fn commit_finished_clears_commit_state_and_requests_primary_refreshes() {
     ));
     state.repos[0].local_actions_in_flight = 1;
     state.repos[0].commit_in_flight = 1;
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: PathBuf::from("README.md"),
-        area: DiffArea::Unstaged,
-    });
+    state.repos[0].diff_state.diff_target = Some(DiffTarget::working_tree(
+        PathBuf::from("README.md"),
+        DiffArea::Unstaged,
+    ));
     state.repos[0].diff_state.diff = Loadable::Loading;
     state.repos[0].diff_state.diff_file = Loadable::Loading;
     state.repos[0].diff_state.diff_file_image = Loadable::Loading;
@@ -1769,7 +2072,7 @@ fn commit_finished_clears_commit_state_and_requests_primary_refreshes() {
 fn repo_command_finished_stage_hunk_triggers_diff_reload_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -1778,10 +2081,10 @@ fn repo_command_finished_stage_hunk_triggers_diff_reload_effects() {
         },
     ));
     state.repos[0].local_actions_in_flight = 1;
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: PathBuf::from("src/lib.rs"),
-        area: DiffArea::Unstaged,
-    });
+    state.repos[0].diff_state.diff_target = Some(DiffTarget::working_tree(
+        PathBuf::from("src/lib.rs"),
+        DiffArea::Unstaged,
+    ));
 
     let effects = reduce(
         &mut repos,
@@ -1840,7 +2143,7 @@ fn repo_command_finished_stage_hunk_invalidates_loaded_blame() {
     // skip a reload (same target, already attempted) and paint stale attribution.
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -1849,15 +2152,15 @@ fn repo_command_finished_stage_hunk_invalidates_loaded_blame() {
         },
     ));
     state.repos[0].local_actions_in_flight = 1;
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: PathBuf::from("src/lib.rs"),
-        area: DiffArea::Unstaged,
-    });
-    state.repos[0].history_state.blame_path = Some(PathBuf::from("src/lib.rs"));
-    state.repos[0].history_state.blame_source = Some(
-        gitcomet_core::domain::BlameSource::WorkingTree(DiffArea::Unstaged),
-    );
-    state.repos[0].history_state.blame = ready_working_tree_blame();
+    state.repos[0].diff_state.diff_target = Some(DiffTarget::working_tree(
+        PathBuf::from("src/lib.rs"),
+        DiffArea::Unstaged,
+    ));
+    state.repos[0].diff_state.blame_path = Some(PathBuf::from("src/lib.rs"));
+    state.repos[0].diff_state.blame_source = Some(gitcomet_core::domain::BlameSource::WorkingTree(
+        DiffArea::Unstaged,
+    ));
+    state.repos[0].diff_state.blame = ready_working_tree_blame();
 
     reduce(
         &mut repos,
@@ -1871,16 +2174,16 @@ fn repo_command_finished_stage_hunk_invalidates_loaded_blame() {
     );
 
     assert!(
-        matches!(state.repos[0].history_state.blame, Loadable::NotLoaded),
+        matches!(state.repos[0].diff_state.blame, Loadable::NotLoaded),
         "blame must be invalidated so the annotation column reloads after staging"
     );
     // The target is preserved so the reload re-blames the same file/source.
     assert_eq!(
-        state.repos[0].history_state.blame_path.as_deref(),
+        state.repos[0].diff_state.blame_path.as_deref(),
         Some(std::path::Path::new("src/lib.rs"))
     );
     assert_eq!(
-        state.repos[0].history_state.blame_source,
+        state.repos[0].diff_state.blame_source,
         Some(gitcomet_core::domain::BlameSource::WorkingTree(
             DiffArea::Unstaged
         ))
@@ -1893,7 +2196,7 @@ fn commit_finished_invalidates_loaded_blame() {
     // would mislabel them. Blame must be dropped along with the diff.
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -1903,11 +2206,11 @@ fn commit_finished_invalidates_loaded_blame() {
     ));
     state.repos[0].local_actions_in_flight = 1;
     state.repos[0].commit_in_flight = 1;
-    state.repos[0].history_state.blame_path = Some(PathBuf::from("src/lib.rs"));
-    state.repos[0].history_state.blame_source = Some(
-        gitcomet_core::domain::BlameSource::WorkingTree(DiffArea::Staged),
-    );
-    state.repos[0].history_state.blame = ready_working_tree_blame();
+    state.repos[0].diff_state.blame_path = Some(PathBuf::from("src/lib.rs"));
+    state.repos[0].diff_state.blame_source = Some(gitcomet_core::domain::BlameSource::WorkingTree(
+        DiffArea::Staged,
+    ));
+    state.repos[0].diff_state.blame = ready_working_tree_blame();
 
     reduce(
         &mut repos,
@@ -1920,7 +2223,7 @@ fn commit_finished_invalidates_loaded_blame() {
     );
 
     assert!(
-        matches!(state.repos[0].history_state.blame, Loadable::NotLoaded),
+        matches!(state.repos[0].diff_state.blame, Loadable::NotLoaded),
         "blame must be invalidated after a commit so the annotation column reloads"
     );
 }
@@ -1929,7 +2232,7 @@ fn commit_finished_invalidates_loaded_blame() {
 fn repo_command_finished_stage_hunk_with_svg_diff_triggers_text_and_image_reload_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -1938,10 +2241,10 @@ fn repo_command_finished_stage_hunk_with_svg_diff_triggers_text_and_image_reload
         },
     ));
     state.repos[0].local_actions_in_flight = 1;
-    state.repos[0].diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: PathBuf::from("icon.svg"),
-        area: DiffArea::Unstaged,
-    });
+    state.repos[0].diff_state.diff_target = Some(DiffTarget::working_tree(
+        PathBuf::from("icon.svg"),
+        DiffArea::Unstaged,
+    ));
 
     let effects = reduce(
         &mut repos,
@@ -1985,7 +2288,7 @@ fn repo_command_finished_stage_hunk_with_svg_diff_triggers_text_and_image_reload
 fn additional_routing_messages_emit_effects_and_update_counters() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -2001,7 +2304,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         &mut state,
         Msg::ApplyWorktreePatch {
             repo_id,
-            patch: "@@ -1 +1 @@\n-old\n+new\n".to_string(),
+            patch: "@@ -1 +1 @@\n-old\n+new\n".to_string().into(),
             reverse: true,
         },
     );
@@ -2023,12 +2326,14 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             remote: "origin".to_string(),
             branch: "feature".to_string(),
             local_branch: "feature".to_string(),
+            mode: gitcomet_core::services::CheckoutRemoteBranchMode::Overwrite,
         },
     );
     assert!(matches!(
         effects.as_slice(),
         [Effect::CheckoutRemoteBranch {
             repo_id: RepoId(1),
+            mode: gitcomet_core::services::CheckoutRemoteBranchMode::Overwrite,
             ..
         }]
     ));
@@ -2064,6 +2369,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             repo_id,
             name: "feature/new".to_string(),
             target: "HEAD".to_string(),
+            force: false,
         },
     );
     assert!(matches!(
@@ -2071,8 +2377,31 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         [Effect::CreateBranchAndCheckout {
             repo_id: RepoId(1),
             target,
+            force: false,
             ..
         }] if target == "HEAD"
+    ));
+
+    // The force flag travels with the message: an overwrite request still
+    // reaches the effect layer, just marked.
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::CreateBranchAndCheckout {
+            repo_id,
+            name: "feature/new".to_string(),
+            target: "HEAD".to_string(),
+            force: true,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CreateBranchAndCheckout {
+            repo_id: RepoId(1),
+            force: true,
+            ..
+        }]
     ));
 
     let effects = reduce(
@@ -2133,7 +2462,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         Msg::SetUpstreamBranch {
             repo_id,
             branch: "feature/current".to_string(),
-            upstream: "origin/feature/current".to_string(),
+            upstream: upstream_target("origin", "feature/current"),
         },
     );
     assert!(matches!(
@@ -2142,7 +2471,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             repo_id: RepoId(1),
             branch,
             upstream,
-        }] if branch == "feature/current" && upstream == "origin/feature/current"
+        }] if branch == "feature/current" && upstream == &upstream_target("origin", "feature/current")
     ));
 
     let effects = reduce(
@@ -2163,7 +2492,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
     ));
 
     assert_eq!(
-        state.repos[0].local_actions_in_flight, 9,
+        state.repos[0].local_actions_in_flight, 10,
         "expected begin_local_action for all routed local-action messages"
     );
 
@@ -2246,8 +2575,10 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         Msg::SaveWorktreeFile {
             repo_id,
             path: PathBuf::from("src/lib.rs"),
-            contents: "fn main() {}".to_string(),
+            contents: "fn main() {}".to_string().into(),
+            expected_contents: None,
             stage: true,
+            completion: None,
         },
     );
     assert!(matches!(
@@ -2280,6 +2611,9 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
          to re-derive or reorder them"
     );
 
+    // The messages above never finished; Continue/Abort wait for the
+    // sequencer ones (`continue_and_abort_wait_only_for_sequencer_commands`).
+    state.repos[0].sequencer_actions_in_flight = 0;
     let effects = reduce(
         &mut repos,
         &id_alloc,
@@ -2293,6 +2627,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             auth: None,
         }]
     ));
+    state.repos[0].sequencer_actions_in_flight = 0;
 
     let effects = reduce(
         &mut repos,
@@ -2304,6 +2639,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         effects.as_slice(),
         [Effect::RebaseAbort { repo_id: RepoId(1) }]
     ));
+    state.repos[0].sequencer_actions_in_flight = 0;
 
     let effects = reduce(
         &mut repos,
@@ -2378,7 +2714,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
         Msg::SetUpstreamBranch {
             repo_id,
             branch: "feature/current".to_string(),
-            upstream: "origin/feature/current".to_string(),
+            upstream: upstream_target("origin", "feature/current"),
         },
     );
     assert!(matches!(
@@ -2387,7 +2723,7 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
             repo_id: RepoId(1),
             branch,
             upstream,
-        }] if branch == "feature/current" && upstream == "origin/feature/current"
+        }] if branch == "feature/current" && upstream == &upstream_target("origin", "feature/current")
     ));
 
     let effects = reduce(
@@ -2445,10 +2781,190 @@ fn additional_routing_messages_emit_effects_and_update_counters() {
 }
 
 #[test]
+fn branch_collision_prompt_choices_emit_exact_follow_up_actions() {
+    fn seeded_state(repo_id: RepoId) -> AppState {
+        let mut state = AppState::test_default();
+        state.repos.push(RepoState::new_opening(
+            repo_id,
+            RepoSpec {
+                workdir: PathBuf::from("/tmp/repo"),
+            },
+        ));
+        state.active_repo = Some(repo_id);
+        state
+    }
+
+    let repo_id = RepoId(1);
+    let prompt = crate::model::BranchExistsPromptState {
+        repo_id,
+        name: "feature".to_string(),
+        target: "origin/feature-one".to_string(),
+        operation: crate::model::BranchExistsPromptOperation::CreateBranch,
+    };
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+
+    let mut state = seeded_state(repo_id);
+    state.branch_exists_prompt = Some(prompt.clone());
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: prompt.clone(),
+            choice: crate::msg::BranchExistsChoice::Cancel,
+        },
+    );
+    assert!(effects.is_empty());
+    assert!(state.branch_exists_prompt.is_none());
+    assert_eq!(state.repos[0].local_actions_in_flight, 0);
+
+    let mut state = seeded_state(repo_id);
+    state.branch_exists_prompt = Some(prompt.clone());
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: prompt.clone(),
+            choice: crate::msg::BranchExistsChoice::CheckoutExisting,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CheckoutBranch { repo_id: id, name }]
+            if *id == repo_id && name == "feature"
+    ));
+    assert!(state.branch_exists_prompt.is_none());
+    assert_eq!(state.repos[0].local_actions_in_flight, 1);
+
+    let remote_prompt = crate::model::BranchExistsPromptState {
+        repo_id,
+        name: "feature".to_string(),
+        target: "upstream/feature-two".to_string(),
+        operation: crate::model::BranchExistsPromptOperation::CheckoutRemoteBranch {
+            remote: "upstream".to_string(),
+            branch: "feature-two".to_string(),
+        },
+    };
+    let mut state = seeded_state(repo_id);
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ShowBranchExistsPrompt {
+            prompt: remote_prompt.clone(),
+        },
+    );
+    assert!(effects.is_empty());
+    assert_eq!(state.branch_exists_prompt, Some(remote_prompt.clone()));
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: remote_prompt,
+            choice: crate::msg::BranchExistsChoice::OverwriteAndCheckout,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CheckoutRemoteBranch {
+            repo_id: id,
+            remote,
+            branch,
+            local_branch,
+            mode: gitcomet_core::services::CheckoutRemoteBranchMode::Overwrite,
+        }] if *id == repo_id
+            && remote == "upstream"
+            && branch == "feature-two"
+            && local_branch == "feature"
+    ));
+    assert!(state.branch_exists_prompt.is_none());
+    assert_eq!(state.repos[0].local_actions_in_flight, 1);
+
+    let mut state = seeded_state(repo_id);
+    state.branch_exists_prompt = Some(prompt.clone());
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: prompt.clone(),
+            choice: crate::msg::BranchExistsChoice::OverwriteAndCheckout,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::CreateBranchAndCheckout {
+            repo_id: id,
+            name,
+            target,
+            force: true,
+        }] if *id == repo_id
+            && name == "feature"
+            && target == "origin/feature-one"
+    ));
+    assert!(state.branch_exists_prompt.is_none());
+    assert_eq!(state.repos[0].local_actions_in_flight, 1);
+
+    let rename_prompt = crate::model::BranchExistsPromptState {
+        repo_id,
+        name: "feature".to_string(),
+        target: "old".to_string(),
+        operation: crate::model::BranchExistsPromptOperation::RenameBranch {
+            old_name: "old".to_string(),
+        },
+    };
+    let mut state = seeded_state(repo_id);
+    state.branch_exists_prompt = Some(rename_prompt.clone());
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: rename_prompt,
+            choice: crate::msg::BranchExistsChoice::OverwriteAndCheckout,
+        },
+    );
+    assert!(matches!(
+        effects.as_slice(),
+        [Effect::RenameBranch {
+            repo_id: id,
+            old_name,
+            new_name,
+            force: true,
+        }] if *id == repo_id && old_name == "old" && new_name == "feature"
+    ));
+    assert!(state.branch_exists_prompt.is_none());
+    assert_eq!(state.repos[0].local_actions_in_flight, 1);
+
+    let mut state = seeded_state(repo_id);
+    state.branch_exists_prompt = Some(prompt.clone());
+    let stale_prompt = crate::model::BranchExistsPromptState {
+        name: "different".to_string(),
+        ..prompt.clone()
+    };
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveBranchExistsPrompt {
+            prompt: stale_prompt,
+            choice: crate::msg::BranchExistsChoice::OverwriteAndCheckout,
+        },
+    );
+    assert!(effects.is_empty());
+    assert_eq!(state.branch_exists_prompt, Some(prompt));
+    assert_eq!(state.repos[0].local_actions_in_flight, 0);
+}
+
+#[test]
 fn repo_command_finished_error_summaries_cover_additional_labels() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -2483,7 +2999,7 @@ fn repo_command_finished_error_summaries_cover_additional_labels() {
         (
             RepoCommandKind::SetUpstreamBranch {
                 branch: "feature/current".to_string(),
-                upstream: "origin/feature/current".to_string(),
+                upstream: upstream_target("origin", "feature/current"),
             },
             "Set as tracking upstream",
         ),
@@ -2623,7 +3139,7 @@ fn repo_command_finished_error_summaries_cover_additional_labels() {
 fn repo_command_finished_success_summaries_cover_additional_commands() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -2743,7 +3259,7 @@ fn repo_command_finished_success_summaries_cover_additional_commands() {
 fn apply_worktree_patch_command_finished_reloads_png_diff_preview() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let mut repo_state = RepoState::new_opening(
         repo_id,
@@ -2751,10 +3267,7 @@ fn apply_worktree_patch_command_finished_reloads_png_diff_preview() {
             workdir: PathBuf::from("/tmp/repo"),
         },
     );
-    let target = DiffTarget::WorkingTree {
-        path: PathBuf::from("image.png"),
-        area: DiffArea::Unstaged,
-    };
+    let target = DiffTarget::working_tree(PathBuf::from("image.png"), DiffArea::Unstaged);
     repo_state.diff_state.diff_target = Some(target.clone());
     repo_state.diff_state.diff = Loadable::NotLoaded;
     repo_state.diff_state.diff_file = Loadable::NotLoaded;
@@ -2806,7 +3319,7 @@ fn apply_worktree_patch_command_finished_reloads_png_diff_preview() {
 fn checkout_branch_and_submodule_messages_emit_effects() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -2875,7 +3388,10 @@ fn checkout_branch_and_submodule_messages_emit_effects() {
     );
     assert!(matches!(
         update_submodules.as_slice(),
-        [Effect::CheckSubmoduleUpdateTrust { repo_id: RepoId(1) }]
+        [Effect::CheckSubmoduleUpdateTrust {
+            repo_id: RepoId(1),
+            ..
+        }]
     ));
 
     let remove_submodule = reduce(
@@ -2900,7 +3416,7 @@ fn checkout_branch_and_submodule_messages_emit_effects() {
 fn local_submodule_add_trust_prompt_confirms_into_add_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -2981,7 +3497,7 @@ fn local_submodule_add_trust_prompt_confirms_into_add_effect() {
 fn submodule_trust_check_pending_marks_and_clears_around_the_check() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3045,10 +3561,97 @@ fn submodule_trust_check_pending_marks_and_clears_around_the_check() {
 }
 
 #[test]
+fn a_failed_submodule_trust_check_is_reported_on_its_repo() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::SubmoduleUpdateTrustChecked {
+            repo_id,
+            result: Err(Error::new(ErrorKind::Backend(
+                "config unreadable".to_string(),
+            ))),
+        }),
+    );
+
+    assert!(effects.is_empty());
+    let diagnostics = &state.repos[0].feedback.diagnostics;
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].kind, crate::model::DiagnosticKind::Error);
+    assert!(
+        diagnostics[0]
+            .message
+            .starts_with("Submodule trust check failed")
+    );
+    assert!(diagnostics[0].message.contains("config unreadable"));
+}
+
+#[test]
+fn report_error_lands_on_its_repo_or_as_an_app_notification() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let report = |repo_id, message: &str| Msg::ReportError {
+        repo_id,
+        message: message.to_string(),
+    };
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        report(Some(repo_id), "repo error"),
+    );
+    // A closed repo's error still reaches the user.
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        report(Some(RepoId(9)), "closed repo"),
+    );
+    reduce(&mut repos, &id_alloc, &mut state, report(None, "app error"));
+    reduce(&mut repos, &id_alloc, &mut state, report(None, "  "));
+
+    let diagnostics = &state.repos[0].feedback.diagnostics;
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].message, "repo error");
+    let notifications = state
+        .notifications
+        .iter()
+        .map(|notification| (notification.kind, notification.message.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        notifications,
+        vec![
+            (crate::model::AppNotificationKind::Error, "closed repo"),
+            (crate::model::AppNotificationKind::Error, "app error"),
+        ]
+    );
+}
+
+#[test]
 fn submodule_add_progress_starts_when_trust_check_proceeds() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3099,7 +3702,7 @@ fn submodule_add_progress_starts_when_trust_check_proceeds() {
 fn submodule_add_progress_clears_on_failed_add_command() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3144,7 +3747,7 @@ fn submodule_add_progress_clears_on_failed_add_command() {
 fn local_submodule_update_trust_prompt_cancels_cleanly() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3193,7 +3796,7 @@ fn local_submodule_update_trust_prompt_cancels_cleanly() {
 fn pull_branch_and_push_variants_mark_in_flight_when_repo_is_opened() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -3267,7 +3870,7 @@ fn pull_branch_and_push_variants_mark_in_flight_when_repo_is_opened() {
         Msg::SetUpstreamBranch {
             repo_id,
             branch: "feature/local".to_string(),
-            upstream: "origin/feature/xyz".to_string(),
+            upstream: upstream_target("origin", "feature/xyz"),
         },
     );
     assert!(matches!(
@@ -3276,7 +3879,7 @@ fn pull_branch_and_push_variants_mark_in_flight_when_repo_is_opened() {
             repo_id: RepoId(1),
             branch,
             upstream
-        }] if branch == "feature/local" && upstream == "origin/feature/xyz"
+        }] if branch == "feature/local" && upstream == &upstream_target("origin", "feature/xyz")
     ));
     assert_eq!(state.repos[0].push_in_flight, 2);
 }
@@ -3285,7 +3888,7 @@ fn pull_branch_and_push_variants_mark_in_flight_when_repo_is_opened() {
 fn commit_and_amend_finished_cover_success_error_and_unknown_repo_paths() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3297,10 +3900,10 @@ fn commit_and_amend_finished_cover_success_error_and_unknown_repo_paths() {
         let repo = &mut state.repos[0];
         repo.local_actions_in_flight = 1;
         repo.commit_in_flight = 1;
-        repo.diff_state.diff_target = Some(DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        });
+        repo.diff_state.diff_target = Some(DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ));
         repo.diff_state.diff = Loadable::Loading;
         repo.diff_state.diff_file = Loadable::Loading;
         repo.diff_state.diff_file_image = Loadable::Loading;
@@ -3420,7 +4023,7 @@ fn commit_and_amend_finished_cover_success_error_and_unknown_repo_paths() {
 fn commit_finished_push_after_commit_enqueues_safe_push_only_on_success() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     repos.insert(repo_id, Arc::new(DummyRepo::new("/tmp/repo")));
     state.repos.push(RepoState::new_opening(
@@ -3494,7 +4097,7 @@ fn commit_finished_push_after_commit_enqueues_safe_push_only_on_success() {
 fn safe_push_after_commit_decision_push_enqueues_checked_push() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let target = gitcomet_core::services::SafePushAfterCommitTarget {
         remote: "origin".to_string(),
@@ -3550,7 +4153,7 @@ fn safe_push_after_commit_decision_push_enqueues_checked_push() {
 fn safe_push_after_commit_decision_push_set_upstream_enqueues_checked_push() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let target = gitcomet_core::services::SafePushAfterCommitTarget {
         remote: "origin".to_string(),
@@ -3603,7 +4206,7 @@ fn safe_push_after_commit_decision_push_set_upstream_enqueues_checked_push() {
 fn safe_push_after_commit_published_amend_block_stores_lease_offer() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3661,7 +4264,7 @@ fn safe_push_after_commit_published_amend_block_stores_lease_offer() {
 fn safe_push_after_commit_published_amend_lease_survives_followup_git_state_refresh() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -3717,7 +4320,7 @@ fn safe_push_after_commit_published_amend_lease_survives_followup_git_state_refr
 fn checkout_branch_clears_stale_force_push_lease_and_recent_messages() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state
         .repos
@@ -3754,7 +4357,7 @@ fn checkout_branch_clears_stale_force_push_lease_and_recent_messages() {
 fn cherry_pick_clears_recent_messages_from_previous_head() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state
         .repos
@@ -3781,10 +4384,438 @@ fn cherry_pick_clears_recent_messages_from_previous_head() {
 }
 
 #[test]
+fn continue_and_abort_wait_only_for_sequencer_commands() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    state.active_repo = Some(repo_id);
+    let commit_id = CommitId("3333333333333333333333333333333333333333".into());
+    // A revert's commit step still running while REVERT_HEAD is on disk.
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::RevertCommit {
+            repo_id,
+            commit_id: commit_id.clone(),
+            commit: true,
+            mainline: None,
+            summary: "revert me".into(),
+        },
+    );
+    assert_eq!(state.repos[0].sequencer_actions_in_flight, 1);
+
+    for msg in [
+        Msg::RebaseAbort { repo_id },
+        Msg::RebaseContinue { repo_id },
+        Msg::MergeAbort { repo_id },
+    ] {
+        let effects = reduce(&mut repos, &id_alloc, &mut state, msg);
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+    assert!(
+        state
+            .notifications
+            .iter()
+            .any(|notification| notification.message.contains("Wait for the running Git")),
+        "a blocked Continue/Abort should say why"
+    );
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+            repo_id,
+            command: RepoCommandKind::Revert {
+                commit_id,
+                commit: true,
+                mainline: None,
+                summary: "revert me".into(),
+            },
+            result: Ok(CommandOutput::empty_success("git revert 3333333")),
+        }),
+    );
+    assert_eq!(state.repos[0].sequencer_actions_in_flight, 0);
+
+    // A merge tool blocks for as long as the user keeps it open, but touches
+    // no sequencer state, so it must not lock Continue/Abort out.
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::LaunchMergetool {
+            repo_id,
+            path: PathBuf::from("conflicted.txt"),
+        },
+    );
+    assert!(state.repos[0].local_actions_in_flight > 0);
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::RebaseAbort { repo_id },
+    );
+    assert!(
+        matches!(effects.as_slice(), [Effect::RebaseAbort { .. }]),
+        "a running merge tool must not block Abort: {effects:?}"
+    );
+}
+
+#[test]
+fn a_suggested_commit_message_is_stored_for_the_commit_box() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let before = state.repos[0].suggested_commit_message_rev;
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::CommitMessageSuggested {
+            repo_id,
+            message: "Revert \"change\"".to_string(),
+        }),
+    );
+
+    assert_eq!(
+        state.repos[0].suggested_commit_message.as_deref(),
+        Some("Revert \"change\"")
+    );
+    assert_ne!(state.repos[0].suggested_commit_message_rev, before);
+
+    for (consumed, expected) in [
+        ("some older message", Some("Revert \"change\"")),
+        ("Revert \"change\"", None),
+    ] {
+        reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::Internal(crate::msg::InternalMsg::CommitMessageSuggestionConsumed {
+                repo_id,
+                message: consumed.to_owned(),
+            }),
+        );
+        assert_eq!(state.repos[0].suggested_commit_message.as_deref(), expected);
+    }
+}
+
+#[test]
+fn the_mainline_lookup_does_not_disturb_the_reveal_dialogs() {
+    use crate::model::CommitLookupPurpose;
+
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    let typed = CommitId("aaaaaaaa".into());
+    let merge = CommitId("bbbbbbbb".into());
+
+    // The Go-to dialog is resolving what the user typed.
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveCommitLookup {
+            repo_id,
+            reference: typed.clone(),
+            purpose: CommitLookupPurpose::RevealDialog,
+        },
+    );
+    // Opening a revert/cherry-pick confirmation asks for a merge's parents.
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::ResolveCommitLookup {
+            repo_id,
+            reference: merge.clone(),
+            purpose: CommitLookupPurpose::MainlineParents,
+        },
+    );
+    let Some(Effect::ResolveCommitLookup { request, .. }) = effects.first().cloned() else {
+        panic!("expected a lookup effect: {effects:?}");
+    };
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::CommitLookupResolved {
+            repo_id,
+            reference: merge.clone(),
+            request,
+            purpose: CommitLookupPurpose::MainlineParents,
+            result: Err(Error::new(ErrorKind::Backend("nope".to_string()))),
+        }),
+    );
+
+    let history = &state.repos[0].history_state;
+    assert_eq!(history.commit_lookup.reference.as_ref(), Some(&typed));
+    assert!(
+        history.commit_lookup.result.is_loading(),
+        "the Go-to dialog's own lookup must still be in flight"
+    );
+    assert_eq!(history.mainline_lookup.reference.as_ref(), Some(&merge));
+    assert!(matches!(history.mainline_lookup.result, Loadable::Error(_)));
+}
+
+#[test]
+fn sequencer_commands_release_their_in_flight_count() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state.repos.push(RepoState::new_opening(
+        repo_id,
+        RepoSpec {
+            workdir: PathBuf::from("/tmp/repo"),
+        },
+    ));
+    state.active_repo = Some(repo_id);
+    let commit_id = CommitId("3333333333333333333333333333333333333333".into());
+
+    // Every counted effect must be released by the command it schedules.
+    let cases: Vec<(Msg, RepoCommandKind)> = vec![
+        (
+            Msg::RevertCommit {
+                repo_id,
+                commit_id: commit_id.clone(),
+                commit: true,
+                mainline: None,
+                summary: "revert me".into(),
+            },
+            RepoCommandKind::Revert {
+                commit_id: commit_id.clone(),
+                commit: true,
+                mainline: None,
+                summary: "revert me".into(),
+            },
+        ),
+        (
+            Msg::CherryPickCommit {
+                repo_id,
+                commit_id: commit_id.clone(),
+                commit: true,
+                mainline: None,
+                summary: "pick me".into(),
+            },
+            RepoCommandKind::CherryPick {
+                commit_id: commit_id.clone(),
+                commit: true,
+                mainline: None,
+                summary: "pick me".into(),
+            },
+        ),
+        (
+            Msg::ApplyFileChange {
+                commit_retry: None,
+                repo_id,
+                target: gitcomet_core::domain::ApplyChangeTarget::commit(
+                    commit_id.clone(),
+                    PathBuf::from("a.txt"),
+                ),
+                commit: true,
+            },
+            RepoCommandKind::ApplyFileChange {
+                commit_retry: None,
+                target: gitcomet_core::domain::ApplyChangeTarget::commit(
+                    commit_id.clone(),
+                    PathBuf::from("a.txt"),
+                ),
+                commit: true,
+            },
+        ),
+        (
+            Msg::RebaseContinue { repo_id },
+            RepoCommandKind::RebaseContinue,
+        ),
+        (Msg::RebaseAbort { repo_id }, RepoCommandKind::RebaseAbort),
+        (Msg::MergeAbort { repo_id }, RepoCommandKind::MergeAbort),
+        (
+            Msg::Rebase {
+                repo_id,
+                onto: "main".into(),
+            },
+            RepoCommandKind::Rebase {
+                onto: "main".into(),
+            },
+        ),
+        (
+            Msg::Reset {
+                repo_id,
+                target: "HEAD~1".into(),
+                mode: gitcomet_core::services::ResetMode::Mixed,
+            },
+            RepoCommandKind::Reset {
+                mode: gitcomet_core::services::ResetMode::Mixed,
+                target: "HEAD~1".into(),
+            },
+        ),
+        (
+            Msg::MergeRef {
+                repo_id,
+                reference: "topic".into(),
+            },
+            RepoCommandKind::MergeRef {
+                reference: "topic".into(),
+            },
+        ),
+    ];
+
+    for (msg, command) in cases {
+        let label = format!("{command:?}");
+        reduce(&mut repos, &id_alloc, &mut state, msg);
+        assert_eq!(
+            state.repos[0].sequencer_actions_in_flight, 1,
+            "{label} should count while it runs"
+        );
+        reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+                repo_id,
+                command,
+                result: Ok(CommandOutput::empty_success("git")),
+            }),
+        );
+        assert_eq!(
+            state.repos[0].sequencer_actions_in_flight, 0,
+            "{label} should release its count"
+        );
+    }
+}
+
+#[test]
+fn revert_clears_recent_messages_from_previous_head() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state
+        .repos
+        .push(repo_with_head_dependent_cached_state(repo_id));
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::RevertCommit {
+            repo_id,
+            commit_id: CommitId("3333333333333333333333333333333333333333".into()),
+            commit: true,
+            mainline: None,
+            summary: "revert me".into(),
+        },
+    );
+
+    assert!(matches!(
+        &state.repos[0].recent_commit_messages,
+        Loadable::NotLoaded
+    ));
+    assert_eq!(state.repos[0].pending.force_push_lease, None);
+}
+
+#[test]
+fn revert_finished_releases_local_action_and_clears_stale_force_push_lease() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    let mut repo_state = repo_with_head_dependent_cached_state(repo_id);
+    repo_state.local_actions_in_flight = 1;
+    state.repos.push(repo_state);
+
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+            repo_id,
+            command: RepoCommandKind::Revert {
+                commit_id: CommitId("3333333333333333333333333333333333333333".into()),
+                commit: true,
+                mainline: None,
+                summary: "revert me".into(),
+            },
+            result: Ok(CommandOutput::empty_success("git revert 3333333")),
+        }),
+    );
+
+    assert_eq!(state.repos[0].local_actions_in_flight, 0);
+    assert_eq!(state.repos[0].pending.force_push_lease, None);
+}
+
+#[test]
+fn interactive_cherry_pick_carries_the_commit_choice_to_its_effect() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    state
+        .repos
+        .push(repo_with_head_dependent_cached_state(repo_id));
+    let entries = vec![gitcomet_core::services::InteractiveRebaseEntry {
+        action: gitcomet_core::services::InteractiveRebaseAction::Pick,
+        commit_id: "3333333333333333333333333333333333333333".to_string(),
+        summary: "pick me".to_string(),
+        message: "pick me".to_string(),
+        new_message: None,
+    }];
+
+    for commit in [true, false] {
+        let effects = reduce(
+            &mut repos,
+            &id_alloc,
+            &mut state,
+            Msg::InteractiveCherryPick {
+                repo_id,
+                entries: entries.clone(),
+                commit,
+            },
+        );
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::InteractiveCherryPick {
+                    repo_id: RepoId(1),
+                    entries: sent,
+                    commit: sent_commit,
+                }] if sent == &entries && *sent_commit == commit
+            ),
+            "commit={commit}: {effects:?}"
+        );
+    }
+}
+
+#[test]
 fn interactive_cherry_pick_finished_clears_stale_force_push_lease() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state
         .repos
@@ -3804,6 +4835,7 @@ fn interactive_cherry_pick_finished_clears_stale_force_push_lease() {
                     message: "pick me".to_string(),
                     new_message: None,
                 }],
+                commit: true,
             },
             result: Ok(CommandOutput::empty_success("git cherry-pick")),
         }),
@@ -3816,7 +4848,7 @@ fn interactive_cherry_pick_finished_clears_stale_force_push_lease() {
 fn head_changing_repo_action_finish_invalidates_data_loaded_while_in_flight() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let mut repo_state = repo_with_head_dependent_cached_state(repo_id);
     repo_state.local_actions_in_flight = 1;
@@ -3845,7 +4877,7 @@ fn head_changing_repo_action_finish_invalidates_data_loaded_while_in_flight() {
 fn stale_recent_commit_messages_loaded_after_head_change_is_ignored() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let mut repo_state = RepoState::new_opening(
         repo_id,
@@ -3959,13 +4991,13 @@ fn stale_recent_commit_messages_loaded_after_head_change_is_ignored() {
 fn repo_command_finished_reset_clears_diff_state_and_unknown_repo_is_noop() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     let mut repo_state = repo_with_head_dependent_cached_state(repo_id);
-    repo_state.diff_state.diff_target = Some(DiffTarget::WorkingTree {
-        path: PathBuf::from("a.txt"),
-        area: DiffArea::Staged,
-    });
+    repo_state.diff_state.diff_target = Some(DiffTarget::working_tree(
+        PathBuf::from("a.txt"),
+        DiffArea::Staged,
+    ));
     repo_state.diff_state.diff = Loadable::Loading;
     repo_state.diff_state.diff_file = Loadable::Loading;
     repo_state.diff_state.diff_file_image = Loadable::Loading;
@@ -4016,7 +5048,7 @@ fn repo_command_finished_reset_clears_diff_state_and_unknown_repo_is_noop() {
 fn hunk_staging_is_logged_without_announcing_success() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(2);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(RepoState::new_opening(
         repo_id,
@@ -4076,12 +5108,9 @@ fn hunk_staging_is_logged_without_announcing_success() {
 fn stage_hunk_command_finished_reloads_commit_png_image_preview_only() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
-    let target = DiffTarget::Commit {
-        commit_id: CommitId("abc123".into()),
-        path: Some(PathBuf::from("assets/icon.png")),
-    };
+    let target = DiffTarget::commit(CommitId("abc123".into()), PathBuf::from("assets/icon.png"));
     let mut repo_state = RepoState::new_opening(
         repo_id,
         RepoSpec {
@@ -4144,10 +5173,67 @@ fn repo_state_with_tags_loaded(repo_id: RepoId) -> RepoState {
 }
 
 #[test]
+fn fetch_completion_reloads_remote_refs_and_loaded_tag_metadata() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let repo_id = RepoId(1);
+    let mut repo_state = repo_state_with_tags_loaded(repo_id);
+    repo_state.pull_in_flight = 1;
+    repo_state.set_remote_branches(Loadable::Ready(vec![RemoteBranch {
+        remote: "origin".to_string(),
+        name: "deleted".to_string(),
+        target: CommitId("abc123".into()),
+    }]));
+    repo_state.set_remote_tags(Loadable::Ready(vec![gitcomet_core::domain::RemoteTag {
+        remote: "origin".to_string(),
+        name: "v1.0.0".to_string(),
+        target: CommitId("abc123".into()),
+    }]));
+    let remote_branches_rev = repo_state.remote_branches_rev;
+    state.repos.push(repo_state);
+
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoCommandFinished {
+            repo_id,
+            command: RepoCommandKind::FetchAll,
+            result: Ok(CommandOutput::empty_success("git fetch --all --prune")),
+        }),
+    );
+
+    assert!(matches!(
+        &state.repos[0].remote_branches,
+        Loadable::Ready(branches)
+            if branches.len() == 1
+                && branches[0].remote == "origin"
+                && branches[0].name == "deleted"
+    ));
+    assert_eq!(state.repos[0].remote_branches_rev, remote_branches_rev);
+    assert!(matches!(state.repos[0].tags, Loadable::Loading));
+    assert!(matches!(state.repos[0].remote_tags, Loadable::Loading));
+    assert!(effects.iter().any(
+        |effect| matches!(effect, Effect::LoadRemoteBranches { repo_id: id } if *id == repo_id)
+    ));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::LoadTags { repo_id: id } if *id == repo_id))
+    );
+    assert!(
+        effects.iter().any(
+            |effect| matches!(effect, Effect::LoadRemoteTags { repo_id: id } if *id == repo_id)
+        )
+    );
+}
+
+#[test]
 fn create_tag_command_finished_reloads_tags() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(repo_state_with_tags_loaded(repo_id));
 
@@ -4185,7 +5271,7 @@ fn create_tag_command_finished_reloads_tags() {
 fn delete_tag_command_finished_reloads_tags() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(repo_state_with_tags_loaded(repo_id));
 
@@ -4218,7 +5304,7 @@ fn delete_tag_command_finished_reloads_tags() {
 fn prune_local_tags_command_finished_reloads_tags() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(repo_state_with_tags_loaded(repo_id));
     state.repos[0].local_actions_in_flight = 0;
@@ -4251,7 +5337,7 @@ fn prune_local_tags_command_finished_reloads_tags() {
 fn create_tag_failed_does_not_reload_tags() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let repo_id = RepoId(1);
     state.repos.push(repo_state_with_tags_loaded(repo_id));
 
@@ -4283,7 +5369,7 @@ fn create_tag_failed_does_not_reload_tags() {
 fn create_tag_with_message_propagates_to_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -4317,7 +5403,7 @@ fn cherry_pick_setup_loads_full_messages_and_patches_entries() {
     const SHA: &str = "1111111111111111111111111111111111111111";
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -4383,7 +5469,7 @@ fn cherry_pick_setup_applies_repository_topological_order() {
     const ANCESTOR: &str = "1111111111111111111111111111111111111111";
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -4447,7 +5533,7 @@ fn cherry_pick_setup_never_enables_rewording_after_partial_or_stale_message_load
     const NEW_SHA: &str = "2222222222222222222222222222222222222222";
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -4525,3 +5611,5 @@ fn cherry_pick_setup_never_enables_rewording_after_partial_or_stale_message_load
     assert!(matches!(setup.full_messages, Loadable::Error(_)));
     assert_eq!(setup.entries[0].message, "subject");
 }
+
+mod large_files;

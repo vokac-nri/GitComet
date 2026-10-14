@@ -7,10 +7,6 @@ pub(crate) fn empty_log_page() -> LogPage {
     }
 }
 
-pub(crate) fn object_id_from_commit_id(id: &CommitId) -> Option<gix::ObjectId> {
-    gix::ObjectId::from_hex(id.as_ref().as_bytes()).ok()
-}
-
 pub(crate) fn log_paged_walk_handle(repo: &gix::ThreadSafeRepository) -> gix::OdbHandleArc {
     gix::odb::memory::Proxy::from(gix::odb::Cache::from(repo.objects.to_handle()))
         .with_write_passthrough()
@@ -57,12 +53,14 @@ impl gix::objs::Find for CancellableLogWalkFind {
         &self,
         id: &gix::oid,
         buffer: &'a mut Vec<u8>,
-    ) -> std::result::Result<Option<gix::objs::Data<'a>>, gix::objs::find::Error> {
+    ) -> gix::Result<Option<gix::objs::Data<'a>>> {
         if self.cancellation.is_cancelled() {
-            return Err(
-                std::io::Error::new(std::io::ErrorKind::Interrupted, "log walk cancelled").into(),
-            );
+            return Err(gix::Error::from_error(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "log walk cancelled",
+            )));
         }
+        gitcomet_core::history_perf::record(gitcomet_core::history_perf::Work::LogWalkObjectRead);
         gix::objs::Find::try_find(&self.inner, id, buffer)
     }
 }
@@ -74,7 +72,11 @@ impl gix::objs::Find for CancellableLogWalkFind {
 /// is mtime-only and can therefore retain old contents after a timestamp
 /// collision.
 pub(crate) fn shallow_snapshot(repo: &gix::Repository) -> Result<super::ShallowSnapshot> {
-    let path = repo.shallow_file();
+    let path = repo.shallow_file().map_err(|error| {
+        Error::new(ErrorKind::Backend(format!(
+            "resolve shallow boundary: {error}"
+        )))
+    })?;
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -118,19 +120,17 @@ pub(crate) fn log_paged_walk_filter(
 
     let shallow_commits = Arc::clone(&shallow.0);
     let objects = log_paged_walk_handle(repo);
-    let mut grafted_parents_to_skip: Vec<gix::ObjectId> = Vec::new();
+    let mut grafted_parents_to_skip: FxHashSet<gix::ObjectId> = FxHashSet::default();
     let mut buf = Vec::new();
     let filter: super::LogPagedWalkFilter = Box::new(move |id| {
         let id = id.to_owned();
-        if let Ok(index) = grafted_parents_to_skip.binary_search(&id) {
-            grafted_parents_to_skip.remove(index);
+        if grafted_parents_to_skip.remove(&id) {
             return false;
         }
         if shallow_commits.binary_search(&id).is_ok()
             && let Ok(commit) = objects.find_commit_iter(&id, &mut buf)
         {
             grafted_parents_to_skip.extend(commit.parent_ids());
-            grafted_parents_to_skip.sort();
         }
         true
     });
@@ -157,7 +157,7 @@ pub(crate) fn new_commit_time_walk(
         .sorting(gix::traverse::commit::simple::Sorting::ByCommitTime(
             CommitTimeOrder::NewestFirst,
         ))
-        .map_err(|e| Error::new(ErrorKind::Backend(format!("gix walk: {e}"))))?
+        .map_err(|e| crate::repo::object_store::gix_error("gix walk", &e))?
         // Set after the sorting, the way `rev_walk` does: first-parent mode
         // walks the chain in order rather than by date, and asking for it
         // swaps the queue.
@@ -173,6 +173,7 @@ pub(crate) fn new_log_paged_walk(
     shallow: &super::ShallowSnapshot,
     cancellation: Option<&CancellationToken>,
     mut chunks: Option<&mut ChunkEmitter<'_>>,
+    topology_cache: Option<(&TopologyCache, u64)>,
 ) -> Result<super::LogPagedWalkState> {
     let parents = if mode == HistoryMode::FirstParent {
         gix::traverse::commit::Parents::First
@@ -204,23 +205,29 @@ pub(crate) fn new_log_paged_walk(
             .commit_graph_if_enabled()
             .ok()
             .flatten();
-        let find = CancellableLogWalkFind {
-            inner: log_paged_walk_handle(repo),
-            cancellation: walk_cancellation.clone(),
+        let built = if commit_graph.is_none() {
+            TopologyWalk::new(repo, &tips, &walk_cancellation, topology_cache)
+                .map(super::LogPagedWalk::CachedDateOrder)
+        } else {
+            let find = CancellableLogWalkFind {
+                inner: log_paged_walk_handle(repo),
+                cancellation: walk_cancellation.clone(),
+            };
+            gix::traverse::commit::topo::Builder::new(find)
+                .with_predicate(filter)
+                .with_tips(tips.iter().copied())
+                .sorting(gix::traverse::commit::topo::Sorting::DateOrder)
+                .parents(parents)
+                .with_commit_graph(commit_graph)
+                .build()
+                .map(super::LogPagedWalk::DateOrder)
         };
-        match gix::traverse::commit::topo::Builder::new(find)
-            .with_predicate(filter)
-            .with_tips(tips.iter().copied())
-            .sorting(gix::traverse::commit::topo::Sorting::DateOrder)
-            .parents(parents)
-            .with_commit_graph(commit_graph)
-            .build()
-        {
+        match built {
             Ok(walk) => {
                 if let Some(cancellation) = cancellation {
                     cancellation.check_cancelled()?;
                 }
-                super::LogPagedWalk::DateOrder(walk)
+                walk
             }
             // Fall back lazily when a missing ancestor prevents the in-degree pass.
             Err(error) if topo_build_error_is_missing_object(&error) => {
@@ -234,9 +241,10 @@ pub(crate) fn new_log_paged_walk(
                 if let Some(cancellation) = cancellation {
                     cancellation.check_cancelled()?;
                 }
-                return Err(Error::new(ErrorKind::Backend(format!(
-                    "gix date-order walk: {error}"
-                ))));
+                return Err(crate::repo::object_store::gix_error(
+                    "gix date-order walk",
+                    &error,
+                ));
             }
         }
     };
@@ -247,15 +255,8 @@ pub(crate) fn new_log_paged_walk(
     })
 }
 
-pub(crate) fn topo_build_error_is_missing_object(
-    error: &gix::traverse::commit::topo::Error,
-) -> bool {
-    matches!(
-        error,
-        gix::traverse::commit::topo::Error::Find(
-            gix::objs::find::existing_iter::Error::NotFound { .. }
-        )
-    )
+pub(crate) fn topo_build_error_is_missing_object(error: &gix::Error) -> bool {
+    error.is_not_found()
 }
 
 pub(crate) fn apply_first_parent_resume_hint(page: &mut LogPage) {
@@ -268,8 +269,7 @@ pub(crate) fn apply_first_parent_resume_hint(page: &mut LogPage) {
 }
 
 pub(crate) fn reflog_unborn_head_error(repo: &gix::Repository) -> Error {
-    let branch = repo
-        .head_name()
+    let branch = crate::refs::head_name(repo)
         .ok()
         .flatten()
         .map(|name| {
@@ -291,6 +291,11 @@ pub(crate) fn reflog_unborn_head_error(repo: &gix::Repository) -> Error {
     )))
 }
 
+/// Upper bound on how much of a caller-supplied page limit is pre-reserved.
+/// The limit is still enforced while iterating; a huge one (`usize::MAX` reads
+/// as "every commit after the cursor") must not reserve that much up front.
+pub(crate) const LOG_PAGE_RESERVE_MAX: usize = 512;
+
 pub(crate) fn paginate_commits(
     commits: impl Iterator<Item = Result<Commit>>,
     limit: usize,
@@ -301,7 +306,7 @@ pub(crate) fn paginate_commits(
     }
 
     let mut cursor_gate = CursorGate::new(cursor);
-    let mut result: Vec<Commit> = Vec::with_capacity(limit);
+    let mut result: Vec<Commit> = Vec::with_capacity(limit.min(LOG_PAGE_RESERVE_MAX));
     let mut next_cursor: Option<LogCursor> = None;
 
     for commit in commits {
@@ -494,7 +499,7 @@ impl DecodeWorkers {
         ) -> Result<()> {
             for info in chunk {
                 out.push(commit_from_walk_parts(
-                    repo,
+                    &repo.objects,
                     &info.id,
                     &info.parent_ids,
                     info.commit_time,
@@ -604,7 +609,7 @@ pub(crate) fn log_page_from_paged_walk_state(
                         if let Some(cancellation) = cancellation {
                             cancellation.check_cancelled()?;
                         }
-                        return Err(Error::new(ErrorKind::Backend(format!("gix walk: {error}"))));
+                        return Err(crate::repo::object_store::gix_error("gix walk", &*error));
                     }
                 };
 

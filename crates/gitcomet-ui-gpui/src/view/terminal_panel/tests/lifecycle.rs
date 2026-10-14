@@ -2,6 +2,132 @@ use super::super::*;
 use super::support::*;
 
 #[gpui::test]
+fn terminal_toolbar_fill_tracks_panel_lifetime_and_target(cx: &mut gpui::TestAppContext) {
+    let _guard = crate::test_support::lock_visual_test();
+    assert_terminal_toolbar_fill_tracks_panel_lifetime_and_target(cx);
+}
+
+struct StatusBarTerminal;
+
+impl gitcomet_extension_api::Extension for StatusBarTerminal {
+    fn id(&self) -> gitcomet_extension_api::ExtensionId {
+        gitcomet_extension_api::ExtensionId::new("com.example.terminal-layout").unwrap()
+    }
+
+    fn register(&self, registrar: &mut gitcomet_extension_api::Registrar) {
+        registrar.place_bar_item(
+            gitcomet_extension_api::BuiltinBarItem::Terminal,
+            gitcomet_extension_api::BarItemLocation::StatusBarEnd,
+        );
+    }
+}
+
+#[gpui::test]
+fn relocated_terminal_toolbar_fill_tracks_panel_lifetime_and_target(cx: &mut gpui::TestAppContext) {
+    let _guard = crate::test_support::lock_visual_test();
+    cx.update(|app| {
+        crate::view::extension_host::install(
+            gitcomet_extension_api::Registry::build(vec![Box::new(StatusBarTerminal)]).unwrap(),
+            app,
+        );
+    });
+    assert_terminal_toolbar_fill_tracks_panel_lifetime_and_target(cx);
+}
+
+fn assert_terminal_toolbar_fill_tracks_panel_lifetime_and_target(cx: &mut gpui::TestAppContext) {
+    use crate::test_support::painted_control_quads as paint;
+    use crate::view::test_support::redraw;
+
+    let (view, repo_id, cx) = test_root_view_with_active_repo(cx);
+    cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            let state = Arc::clone(&view.state);
+            crate::view::test_support::push_test_state(view, state, cx);
+            view.terminal_preferences.terminal_button_target = TerminalButtonTarget::Embedded;
+            view.sync_terminal_button_target(cx);
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    let closed = paint(cx, "terminal");
+    cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.terminal_sessions
+                .insert(repo_id, test_terminal_session(vec![(10, None)], 0, cx));
+            view.sync_terminal_indicator_views(cx);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_ne!(
+        paint(cx, "terminal"),
+        closed,
+        "an open embedded terminal must highlight its toggle"
+    );
+    cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            view.terminal_preferences.terminal_button_target = TerminalButtonTarget::External;
+            view.sync_terminal_button_target(cx);
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        paint(cx, "terminal"),
+        closed,
+        "the external terminal launcher is momentary"
+    );
+    cx.update(|window, app| {
+        view.update(app, |view, cx| {
+            view.terminal_preferences.terminal_button_target = TerminalButtonTarget::Embedded;
+            view.sync_terminal_button_target(cx);
+            view.close_terminal_tab(repo_id, 0, window, cx);
+        })
+    });
+    cx.run_until_parked();
+    redraw(cx);
+    assert_eq!(
+        paint(cx, "terminal"),
+        closed,
+        "closing the last tab must clear the toggle"
+    );
+}
+
+#[gpui::test]
+fn the_terminal_toggle_defaults_to_the_action_bar(cx: &mut gpui::TestAppContext) {
+    let _guard = crate::test_support::lock_visual_test();
+    let (view, _repo_id, cx) = test_root_view_with_active_repo(cx);
+    cx.update(|_, app| {
+        view.update(app, |view, cx| {
+            let state = Arc::clone(&view.state);
+            crate::view::test_support::push_test_state(view, state, cx);
+        })
+    });
+    cx.run_until_parked();
+    crate::test_support::refresh_and_draw(cx);
+
+    let terminal = cx.debug_bounds("terminal").expect("the terminal toggle");
+    let branch = cx.debug_bounds("create_branch").expect("the branch action");
+    let stash = cx.debug_bounds("stash").expect("the stash action");
+    let actions = cx
+        .debug_bounds("right_action_group")
+        .expect("the action bar's right group");
+    assert!(
+        actions.contains(&terminal.center()),
+        "Terminal belongs in the action bar: {terminal:?} vs {actions:?}"
+    );
+    assert!(
+        terminal.right() <= branch.left() && branch.right() <= stash.left(),
+        "Terminal, Branch and Stash retain their original order"
+    );
+    assert!(
+        (terminal.center().y - branch.center().y).abs() < gpui::px(1.0),
+        "on the action bar's row: {terminal:?} vs {branch:?}"
+    );
+}
+
+#[gpui::test]
 fn shell_exit_closes_the_matching_tab_after_indices_shift(cx: &mut gpui::TestAppContext) {
     let _visual_guard = crate::test_support::lock_visual_test();
     let (view, repo_id, cx) = test_root_view_with_active_repo(cx);
@@ -166,4 +292,76 @@ fn shutdown_confirmation_for_an_exited_tab_does_not_close_its_sibling(
         assert_eq!(session.instances[0].session_seq, 80);
         assert_eq!(session.active_index, 0);
     });
+}
+
+/// Both bottom-panel strips and the terminal's own tabs: click targets that
+/// used to sit at a fixed pixel size whatever the density.
+#[gpui::test]
+fn comfortable_bottom_panel_tabs_grow_with_the_density(cx: &mut gpui::TestAppContext) {
+    use crate::appearance::{Appearance, UiDensity};
+    let _visual_guard = crate::test_support::lock_visual_test();
+    let (view, repo_id, cx) = test_root_view_with_active_repo(cx);
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.terminal_sessions
+                .insert(repo_id, test_terminal_session(vec![(10, None)], 0, cx));
+            this.open_reflog_panel(repo_id, cx);
+            this.active_bottom_panel
+                .insert(repo_id, crate::view::BottomPanelTab::Terminal);
+        })
+    });
+
+    let selectors = [
+        "terminal_tab-0",
+        "terminal_tab_close-0",
+        "bottom_panel_tab_terminal",
+        "bottom_panel_tab_terminal_close",
+        "bottom_panel_tab_reflog",
+    ];
+    let mut per_density: Vec<Vec<gpui::Pixels>> = Vec::new();
+
+    for density in UiDensity::ALL {
+        cx.update(|_window, app| {
+            app.set_global(Appearance {
+                density,
+                ..Appearance::default()
+            });
+            view.update(app, |this, cx| this.notify_font_preferences_changed(cx));
+        });
+        cx.update(|window, app| {
+            let _ = window.draw(app);
+        });
+        cx.run_until_parked();
+
+        let mut height = |selector: &'static str| {
+            cx.debug_bounds(selector)
+                .unwrap_or_else(|| panic!("missing {selector} at {density:?} density"))
+                .size
+                .height
+        };
+        per_density.push(selectors.into_iter().map(&mut height).collect());
+
+        // Both strips are built from `panel_tab`, so they must agree.
+        assert_eq!(
+            height("terminal_tab-0"),
+            height("bottom_panel_tab_terminal")
+        );
+        assert_eq!(
+            height("terminal_tab_close-0"),
+            height("bottom_panel_tab_terminal_close")
+        );
+    }
+
+    for (step, pair) in per_density.windows(2).enumerate() {
+        for (ix, selector) in selectors.into_iter().enumerate() {
+            assert!(
+                pair[1][ix] > pair[0][ix],
+                "{selector} must grow from {:?} to {:?}, stayed {:?}",
+                UiDensity::ALL[step],
+                UiDensity::ALL[step + 1],
+                pair[1][ix]
+            );
+        }
+    }
 }

@@ -5,6 +5,7 @@
 //! previews.
 
 use super::*;
+use crate::kit::click::PointerClickExt as _;
 
 pub(super) use conflict_resolver::CONFLICT_BOTTOM_OVERSCROLL_ROWS;
 
@@ -34,56 +35,23 @@ fn conflict_output_post_layout_scroll_y(gutter_y: Pixels, editor_max_y: Pixels) 
     gutter_y.clamp(-editor_max_y.max(px(0.0)), px(0.0))
 }
 
-#[cfg(test)]
-mod wheel_tests {
-    use super::*;
-
-    #[test]
-    fn resolved_output_vertical_wheel_keeps_gutter_sync_render_scheduled() {
-        assert!(conflict_output_wheel_requires_notify(px(-1.0), false));
-        assert!(conflict_output_wheel_requires_notify(px(0.0), true));
-        assert!(!conflict_output_wheel_requires_notify(px(0.0), false));
-    }
-
-    #[test]
-    fn resolved_output_post_layout_scroll_clamps_to_editor_range() {
-        assert_eq!(
-            conflict_output_post_layout_scroll_y(px(-240.0), px(180.0)),
-            px(-180.0)
-        );
-        assert_eq!(
-            conflict_output_post_layout_scroll_y(px(-120.0), px(180.0)),
-            px(-120.0)
-        );
-        assert_eq!(
-            conflict_output_post_layout_scroll_y(px(12.0), px(180.0)),
-            px(0.0)
-        );
-    }
-}
-
 impl MainPaneView {
     /// Toolbar controls for simple conflict strategies (binary, keep/delete,
-    /// decision-only): file navigation plus resolved counts.
+    /// decision-only): resolved counts. File navigation is in the bottom bar.
     pub(super) fn conflict_toolbar_simple_controls(
         &self,
         mut controls: gpui::Div,
-        prev_file_btn: Option<AnyElement>,
-        next_file_btn: Option<AnyElement>,
         theme: AppTheme,
     ) -> gpui::Div {
         // Binary, keep/delete, and decision-only conflicts handle actions
-        // inline in their dedicated panels; only show file navigation.
-        controls = controls
-            .when_some(prev_file_btn, |d, btn| d.child(btn))
-            .when_some(next_file_btn, |d, btn| d.child(btn));
+        // inline in their dedicated panels.
         let conflict_count = self.conflict_resolver_conflict_count();
         if conflict_count > 0 {
             let resolved_count = self.conflict_resolver_resolved_count();
             let unresolved_count = conflict_count.saturating_sub(resolved_count);
             controls = controls.child(
                 div()
-                    .text_xs()
+                    .text_size(theme.ui_text(12.0))
                     .text_color(if unresolved_count == 0 {
                         theme.colors.status.success.foreground
                     } else {
@@ -94,7 +62,7 @@ impl MainPaneView {
             if unresolved_count > 0 {
                 controls = controls.child(
                     div()
-                        .text_xs()
+                        .text_size(theme.ui_text(12.0))
                         .text_color(theme.colors.status.danger.foreground)
                         .child(format!("{unresolved_count} unresolved")),
                 );
@@ -109,8 +77,6 @@ impl MainPaneView {
     pub(super) fn conflict_toolbar_full_controls(
         &self,
         mut controls: gpui::Div,
-        prev_file_btn: Option<AnyElement>,
-        next_file_btn: Option<AnyElement>,
         conflict_rendered_preview_active: bool,
         repo_id: Option<RepoId>,
         conflict_target_path: &Option<std::path::PathBuf>,
@@ -126,7 +92,6 @@ impl MainPaneView {
         );
         let active_pick_state = self.conflict_resolver_active_pick_state();
         controls = controls
-            .when_some(prev_file_btn, |d, btn| d.child(btn))
             .when(!conflict_rendered_preview_active, |d| {
                 let can_nav_prev = self.conflict_has_prev();
                 let can_nav_next = self.conflict_has_next();
@@ -346,8 +311,7 @@ impl MainPaneView {
                             ))
                     }
                 },
-            )
-            .when_some(next_file_btn, |d, btn| d.child(btn));
+            );
 
         if let (Some(repo_id), Some(path)) = (repo_id, conflict_target_path.clone()) {
             let total = self.conflict_resolver_conflict_count();
@@ -403,12 +367,18 @@ impl MainPaneView {
                         return;
                     }
                     let text = this.conflict_resolver_save_contents_from_text(text);
+                    let Some(contents) = this.conflict_output_bytes_for_save(text, cx) else {
+                        return;
+                    };
                     this.store.dispatch(Msg::SaveWorktreeFile {
                         repo_id,
                         path: save_path.clone(),
-                        contents: text,
+                        contents,
+                        expected_contents: None,
                         stage: false,
+                        completion: None,
                     });
+                    this.mark_conflict_resolved_output_saved(cx);
                 });
             controls = controls
                 .child(
@@ -439,12 +409,19 @@ impl MainPaneView {
                                     cx.notify();
                                 } else {
                                     let text = this.conflict_resolver_save_contents_from_text(text);
-                                    this.store.dispatch(Msg::SaveWorktreeFile {
-                                        repo_id,
-                                        path: stage_path.clone(),
-                                        contents: text,
-                                        stage: true,
-                                    });
+                                    if let Some(contents) =
+                                        this.conflict_output_bytes_for_save(text, cx)
+                                    {
+                                        this.store.dispatch(Msg::SaveWorktreeFile {
+                                            repo_id,
+                                            path: stage_path.clone(),
+                                            contents,
+                                            expected_contents: None,
+                                            stage: true,
+                                            completion: None,
+                                        });
+                                        this.mark_conflict_resolved_output_saved(cx);
+                                    }
                                 }
                             });
                     if gate_unresolved > 0 {
@@ -502,7 +479,7 @@ impl MainPaneView {
 
         let status: AnyElement = if total == 0 {
             div()
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .text_color(theme.colors.foreground.secondary)
                 .child("No conflicts in this file")
                 .into_any_element()
@@ -514,7 +491,7 @@ impl MainPaneView {
             };
             div()
                 .id("conflict_resolver_status")
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .text_color(theme.colors.status.warning.foreground)
                 .child(format!("⚠ {unresolved} {noun} unresolved"))
                 .gitcomet_tooltip(
@@ -527,7 +504,7 @@ impl MainPaneView {
         } else {
             div()
                 .id("conflict_resolver_status")
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .text_color(theme.colors.status.success.foreground)
                 .child("✓ All conflicts resolved")
                 .gitcomet_tooltip(
@@ -567,7 +544,7 @@ impl MainPaneView {
                             };
                             d.child(
                                 div()
-                                    .text_xs()
+                                    .text_size(theme.ui_text(12.0))
                                     .text_color(theme.colors.foreground.secondary)
                                     .child(format!("{whitespace} {noun}")),
                             )
@@ -576,7 +553,7 @@ impl MainPaneView {
                     .when(has_conflict_markers, |d| {
                         d.child(
                             div()
-                                .text_xs()
+                                .text_size(theme.ui_text(12.0))
                                 .text_color(theme.colors.status.danger.foreground)
                                 .child("markers remain"),
                         )
@@ -729,7 +706,7 @@ impl MainPaneView {
                                     if let Some(label) = active_autosolve_trace.as_ref() {
                                         d = d.child(
                                             div()
-                                                .text_xs()
+                                                .text_size(theme.ui_text(12.0))
                                                 .text_color(theme.colors.accent.foreground)
                                                 .child(label.clone()),
                                         );
@@ -760,7 +737,8 @@ impl MainPaneView {
                                 })
                                 ;
 
-                            let preview_kind = super::super::preview_path_rendered_kind(&path);
+                            let preview_kind = super::super::preview_path_rendered_kind(&path)
+                                .filter(|kind| *kind != RenderedPreviewKind::Diagram);
                             let show_preview_toggle = preview_kind.is_some();
                             let preview_mode = self.conflict_resolver.resolver_preview_mode;
                             let is_rendered_preview_active =
@@ -784,7 +762,7 @@ impl MainPaneView {
                                     .id("conflict_preview_toggle")
                                     .flex()
                                     .items_center()
-                                    .h(components::control_height(ui_scale_percent))
+                                    .h(components::control_height(ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics)))
                                     .rounded(px(theme.radii.row))
                                     .border_1()
                                     .border_color(view_toggle_border)
@@ -920,6 +898,7 @@ impl MainPaneView {
                                             MouseButton::Left,
                                             cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
                                                 cx.stop_propagation();
+                                                crate::text_selection_owner::preserve(cx);
                                                 this.conflict_hsplit_resize =
                                                     Some(ConflictHSplitResizeState {
                                                         handle: which,
@@ -1042,6 +1021,7 @@ impl MainPaneView {
                                         MouseButton::Left,
                                         cx.listener(|this, e: &MouseDownEvent, _w, cx| {
                                             cx.stop_propagation();
+                                            crate::text_selection_owner::preserve(cx);
                                             this.conflict_diff_split_resize =
                                                 Some(ConflictDiffSplitResizeState {
                                                     start_x: e.position.x,
@@ -1093,7 +1073,7 @@ impl MainPaneView {
                             };
 
                             let top_title_row = div()
-                                .h(components::control_height(ui_scale_percent))
+                                .h(components::control_height(ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics)))
                                 .w_full()
                                 .flex()
                                 .items_center()
@@ -1111,14 +1091,14 @@ impl MainPaneView {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .when(show_line_numbers, |d| {
                                                 d.child(
                                                     div()
                                                         .w(crate::view::rows::conflict_line_no_width(
-                                                            ui_scale_percent,
+                                                            ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
                                                         ))
                                                         .flex_shrink_0(),
                                                 )
@@ -1137,14 +1117,14 @@ impl MainPaneView {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .when(show_line_numbers, |d| {
                                                 d.child(
                                                     div()
                                                         .w(crate::view::rows::conflict_line_no_width(
-                                                            ui_scale_percent,
+                                                            ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
                                                         ))
                                                         .flex_shrink_0(),
                                                 )
@@ -1164,14 +1144,14 @@ impl MainPaneView {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .when(show_line_numbers, |d| {
                                                 d.child(
                                                     div()
                                                         .w(crate::view::rows::conflict_line_no_width(
-                                                            ui_scale_percent,
+                                                            ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
                                                         ))
                                                         .flex_shrink_0(),
                                                 )
@@ -1189,14 +1169,14 @@ impl MainPaneView {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .when(show_line_numbers, |d| {
                                                 d.child(
                                                     div()
                                                         .w(crate::view::rows::conflict_line_no_width(
-                                                            ui_scale_percent,
+                                                            ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
                                                         ))
                                                         .flex_shrink_0(),
                                                 )
@@ -1215,14 +1195,14 @@ impl MainPaneView {
                                             .flex()
                                             .items_center()
                                             .gap_2()
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.foreground.secondary)
                                             .whitespace_nowrap()
                                             .when(show_line_numbers, |d| {
                                                 d.child(
                                                     div()
                                                         .w(crate::view::rows::conflict_line_no_width(
-                                                            ui_scale_percent,
+                                                            ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
                                                         ))
                                                         .flex_shrink_0(),
                                                 )
@@ -1240,7 +1220,7 @@ impl MainPaneView {
                                         .render_conflict_resolver_svg_preview(theme, cx),
                                     Some(RenderedPreviewKind::Markdown) => self
                                         .render_conflict_resolver_markdown_preview(theme, cx),
-                                    None => components::empty_state(
+                                    None | Some(RenderedPreviewKind::Diagram) => components::empty_state(
                                         theme,
                                         "Preview",
                                         "Preview is not available for this file.",
@@ -1757,7 +1737,7 @@ impl MainPaneView {
                                         .flex()
                                         .items_center()
                                         .gap_1()
-                                        .text_xs()
+                                        .text_size(theme.ui_text(12.0))
                                         .text_color(theme.colors.foreground.secondary)
                                         .child("Resolved output")
                                         .when(output_modified, |d| {
@@ -1809,6 +1789,7 @@ impl MainPaneView {
                                     MouseButton::Left,
                                     cx.listener(move |this, e: &MouseDownEvent, _w, cx| {
                                         cx.stop_propagation();
+                                        crate::text_selection_owner::preserve(cx);
                                         this.conflict_resolver_vsplit_resize =
                                             Some(ConflictVSplitResizeState {
                                                 start_y: e.position.y,
@@ -1909,7 +1890,7 @@ impl MainPaneView {
                                                 theme.colors.accent.foreground,
                                                 if theme.is_dark { 0.14 } else { 0.10 },
                                             ))
-                                            .text_xs()
+                                            .text_size(theme.ui_text(12.0))
                                             .text_color(theme.colors.accent.foreground)
                                             .child(summary),
                                     )
@@ -2065,7 +2046,7 @@ impl MainPaneView {
                                                                     !self
                                                                         .conflict_resolved_output_is_streamed(),
                                                                     |d| {
-                                                                        d.on_mouse_down(
+                                                                        d.on_pointer_click(
                                                                             MouseButton::Right,
                                                                             cx.listener(
                                                                                 |this,
@@ -2311,7 +2292,7 @@ impl MainPaneView {
                         .flex()
                         .items_center()
                         .bg(theme.colors.surface.raised)
-                        .text_xs()
+                        .text_size(theme.ui_text(12.0))
                         .text_color(theme.colors.foreground.secondary)
                         .child(label),
                 )
@@ -2338,22 +2319,22 @@ impl MainPaneView {
                                     .into_any_element()
                             }
                             Loadable::NotLoaded | Loadable::Loading if has_source => div()
-                                .text_xs()
+                                .text_size(theme.ui_text(12.0))
                                 .text_color(theme.colors.foreground.secondary)
                                 .child("Processing preview...")
                                 .into_any_element(),
                             Loadable::Error(error) => div()
-                                .text_xs()
+                                .text_size(theme.ui_text(12.0))
                                 .text_color(theme.colors.foreground.secondary)
                                 .child(error)
                                 .into_any_element(),
                             Loadable::Ready(None) if has_source => div()
-                                .text_xs()
+                                .text_size(theme.ui_text(12.0))
                                 .text_color(theme.colors.foreground.secondary)
                                 .child("Preview unavailable.")
                                 .into_any_element(),
                             _ => div()
-                                .text_xs()
+                                .text_size(theme.ui_text(12.0))
                                 .text_color(theme.colors.foreground.secondary)
                                 .child("(empty)")
                                 .into_any_element(),
@@ -2396,8 +2377,10 @@ impl MainPaneView {
         theme: AppTheme,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
-        self.ensure_conflict_markdown_preview_cache();
+        self.ensure_conflict_markdown_preview_cache(cx);
         self.sync_conflict_preview_scroll();
+        // One matcher for the three columns: each compiles a regex.
+        let query = self.markdown_preview_search_query();
 
         let scroll_for = |side: ThreeWayColumn| -> ScrollHandle {
             match side {
@@ -2411,11 +2394,14 @@ impl MainPaneView {
             .clone()
         };
 
-        let row_count = |side: ThreeWayColumn| -> usize {
-            match self.conflict_resolver.markdown_preview.document(side) {
+        // The shared scrollbar follows the column with the most to scroll;
+        // before the first layout, the longest document.
+        let extent = |side: ThreeWayColumn| -> (f32, usize) {
+            let rows = match self.conflict_resolver.markdown_preview.document(side) {
                 Loadable::Ready(doc) => doc.rows.len(),
                 _ => 0,
-            }
+            };
+            (f32::from(scroll_for(side).max_offset().y), rows)
         };
         let tallest = [
             ThreeWayColumn::Base,
@@ -2423,7 +2409,10 @@ impl MainPaneView {
             ThreeWayColumn::Theirs,
         ]
         .into_iter()
-        .max_by_key(|s| row_count(*s))
+        .max_by(|a, b| {
+            let (a, b) = (extent(*a), extent(*b));
+            a.0.total_cmp(&b.0).then(a.1.cmp(&b.1))
+        })
         .unwrap_or(ThreeWayColumn::Base);
         let vertical_handle = scroll_for(tallest);
         let vertical_sync_enabled = self.diff_scroll_sync.includes_vertical();
@@ -2441,6 +2430,9 @@ impl MainPaneView {
             .relative()
             .flex_1()
             .min_h(px(0.0))
+            // A column, so the row of documents gets a height to scroll in.
+            .flex()
+            .flex_col()
             .w_full()
             .p_2()
             .bg(theme.colors.surface.canvas)
@@ -2455,16 +2447,19 @@ impl MainPaneView {
                     .child(self.render_conflict_markdown_preview_column(
                         theme,
                         ThreeWayColumn::Base,
+                        query.clone(),
                         cx,
                     ))
                     .child(self.render_conflict_markdown_preview_column(
                         theme,
                         ThreeWayColumn::Ours,
+                        query.clone(),
                         cx,
                     ))
                     .child(self.render_conflict_markdown_preview_column(
                         theme,
                         ThreeWayColumn::Theirs,
+                        query.clone(),
                         cx,
                     )),
             )
@@ -2485,15 +2480,17 @@ impl MainPaneView {
         &mut self,
         theme: AppTheme,
         side: ThreeWayColumn,
+        query: Option<rows::MarkdownPreviewQuery>,
         cx: &mut gpui::Context<Self>,
     ) -> AnyElement {
+        let tab_width = self.display_tab_width;
+
         let ui_scale_percent = crate::ui_scale::current(cx).percent;
-        let (id, list_id, vscrollbar_id, hscrollbar_id, label, scroll) = match side {
+        let (id, list_id, vscrollbar_id, label, scroll) = match side {
             ThreeWayColumn::Base => (
                 "conflict_preview_base",
                 "conflict_preview_base_list",
                 "conflict_preview_base_scrollbar",
-                "conflict_preview_base_hscrollbar",
                 "Base (A)",
                 self.conflict_resolver_diff_scroll.clone(),
             ),
@@ -2501,7 +2498,6 @@ impl MainPaneView {
                 "conflict_preview_ours",
                 "conflict_preview_ours_list",
                 "conflict_preview_ours_scrollbar",
-                "conflict_preview_ours_hscrollbar",
                 "Local (B)",
                 self.conflict_preview_ours_scroll.clone(),
             ),
@@ -2509,7 +2505,6 @@ impl MainPaneView {
                 "conflict_preview_theirs",
                 "conflict_preview_theirs_list",
                 "conflict_preview_theirs_scrollbar",
-                "conflict_preview_theirs_hscrollbar",
                 "Remote (C)",
                 self.conflict_preview_theirs_scroll.clone(),
             ),
@@ -2523,28 +2518,50 @@ impl MainPaneView {
                 .items_center()
                 .justify_center()
                 .p_2()
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .text_color(theme.colors.foreground.secondary)
                 .child(message)
                 .into_any_element()
         };
 
-        // Macro to build the column list+scrollbar from a side-specific processor.
-        // Each side needs its own fn item type for `cx.processor()`.
-        macro_rules! mk_list {
-            ($document:expr, $processor:expr) => {{
-                let list = uniform_list(list_id, $document.rows.len(), cx.processor($processor))
-                    .h_full()
-                    .min_h(px(0.0))
-                    .track_scroll(&scroll)
-                    .with_horizontal_sizing_behavior(
-                        gpui::ListHorizontalSizingBehavior::Unconstrained,
-                    );
+        let body = match self.conflict_resolver.markdown_preview.document(side) {
+            Loadable::NotLoaded | Loadable::Loading => status("Processing preview…".into()),
+            Loadable::Error(error) => status(error.clone().into()),
+            Loadable::Ready(document) if document.rows.is_empty() => status("Empty file.".into()),
+            Loadable::Ready(document) => {
+                // The file preview's renderer, read-only: the columns are for
+                // comparing, and scroll in step through their shared handles.
+                let document = Arc::clone(document);
+                let column = self.conflict_resolver.markdown_preview.columns[side].clone();
+                let handle = scroll.0.borrow().base_handle.clone();
+                let context = rows::MarkdownDocumentContext {
+                    theme,
+                    ui_scale_percent,
+                    editor_font_family: crate::font_preferences::current_editor_font_family(cx)
+                        .into(),
+                    image_root: self.conflict_markdown_image_root(),
+                    remote_image_access: self.markdown_remote_image_access(Some(cx.entity())),
+                    picture_sizes: Default::default(),
+                    drawn_pictures: None,
+                    row_boxes: Default::default(),
+                    block_scrolls: column.block_scrolls,
+                    blocks: column.blocks,
+                    layout: column.layout,
+                    view: None,
+                    text_region: DiffTextRegion::Inline,
+                    change_bar_color: None,
+                    query,
+                    reveal: column.reveal,
+                    scroll: Some(handle.clone()),
+                    hovered_link: None,
+                    change_extents: None,
+                    tasks_editable: false,
+                };
                 let vertical_scrollbar_gutter = if vertical_sync_enabled {
                     px(0.0)
                 } else {
                     components::Scrollbar::visible_gutter(
-                        scroll.clone(),
+                        handle.clone(),
                         components::ScrollbarAxis::Vertical,
                     )
                 };
@@ -2554,41 +2571,24 @@ impl MainPaneView {
                     .min_h(px(0.0))
                     .child(
                         div()
-                            .h_full()
+                            .id(list_id)
+                            .size_full()
                             .min_h(px(0.0))
+                            .overflow_y_scroll()
+                            .track_scroll(&handle)
                             .pr(vertical_scrollbar_gutter)
-                            .child(list),
+                            .child(rows::render_markdown_document(
+                                tab_width, &document, &context,
+                            )),
                     )
                     .when(!vertical_sync_enabled, |d| {
                         d.child(
-                            components::Scrollbar::new(vscrollbar_id, scroll.clone())
+                            components::Scrollbar::new(vscrollbar_id, handle)
                                 .always_visible()
                                 .render(theme),
                         )
                     })
-                    .child(
-                        components::Scrollbar::horizontal(hscrollbar_id, scroll.clone())
-                            .always_visible()
-                            .render(theme),
-                    )
                     .into_any_element()
-            }};
-        }
-
-        let body = match (side, self.conflict_resolver.markdown_preview.document(side)) {
-            (_, Loadable::NotLoaded | Loadable::Loading) => status("Processing preview…".into()),
-            (_, Loadable::Error(error)) => status(error.clone().into()),
-            (_, Loadable::Ready(document)) if document.rows.is_empty() => {
-                status("Empty file.".into())
-            }
-            (ThreeWayColumn::Base, Loadable::Ready(doc)) => {
-                mk_list!(doc, Self::render_conflict_markdown_base_rows)
-            }
-            (ThreeWayColumn::Ours, Loadable::Ready(doc)) => {
-                mk_list!(doc, Self::render_conflict_markdown_ours_rows)
-            }
-            (ThreeWayColumn::Theirs, Loadable::Ready(doc)) => {
-                mk_list!(doc, Self::render_conflict_markdown_theirs_rows)
             }
         };
 
@@ -2610,7 +2610,7 @@ impl MainPaneView {
                     .flex()
                     .items_center()
                     .bg(theme.colors.surface.raised)
-                    .text_xs()
+                    .text_size(theme.ui_text(12.0))
                     .text_color(theme.colors.foreground.secondary)
                     .child(label),
             )
@@ -2618,9 +2618,39 @@ impl MainPaneView {
                 div()
                     .flex_1()
                     .min_h(px(0.0))
+                    .flex()
+                    .flex_col()
                     .bg(theme.colors.surface.canvas)
                     .child(body),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(test)]
+mod wheel_tests {
+    use super::*;
+
+    #[test]
+    fn resolved_output_vertical_wheel_keeps_gutter_sync_render_scheduled() {
+        assert!(conflict_output_wheel_requires_notify(px(-1.0), false));
+        assert!(conflict_output_wheel_requires_notify(px(0.0), true));
+        assert!(!conflict_output_wheel_requires_notify(px(0.0), false));
+    }
+
+    #[test]
+    fn resolved_output_post_layout_scroll_clamps_to_editor_range() {
+        assert_eq!(
+            conflict_output_post_layout_scroll_y(px(-240.0), px(180.0)),
+            px(-180.0)
+        );
+        assert_eq!(
+            conflict_output_post_layout_scroll_y(px(-120.0), px(180.0)),
+            px(-120.0)
+        );
+        assert_eq!(
+            conflict_output_post_layout_scroll_y(px(12.0), px(180.0)),
+            px(0.0)
+        );
     }
 }

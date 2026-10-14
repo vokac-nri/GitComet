@@ -1,6 +1,12 @@
 use super::*;
+use crate::kit::click::PointerClickExt as _;
+use crate::kit::interaction::{self as controls, ControlInteractionExt as _};
 use std::cell::RefCell;
 use std::rc::Rc;
+
+/// Rows in the refs hover card share the sidebar tree's row rhythm.
+const HISTORY_REFS_HOVER_ROW_HEIGHT_PX: f32 = 24.0;
+const HISTORY_REFS_HOVER_ROW_COMFORTABLE_HEIGHT_PX: f32 = 32.0;
 
 const HISTORY_REFS_HOVER_CLOSE_GRACE_MS: u64 = 120;
 const HISTORY_REFS_HOVER_OPEN_DELAY_MS: u64 = 160;
@@ -74,7 +80,6 @@ impl HistoryRefsHoverHost {
         source_bounds: Bounds<Pixels>,
         items: Arc<[HistoryRefListItem]>,
         pointer: Point<Pixels>,
-        window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
         if items.is_empty() {
@@ -107,7 +112,7 @@ impl HistoryRefsHoverHost {
 
         if self.state.is_some() {
             self.cancel_pending_show();
-            self.show_now(next, window, cx);
+            self.show_now(next, cx);
             return;
         }
 
@@ -155,12 +160,7 @@ impl HistoryRefsHoverHost {
         .detach();
     }
 
-    fn show_now(
-        &mut self,
-        next: HistoryRefsHoverState,
-        window: &mut Window,
-        cx: &mut gpui::Context<Self>,
-    ) {
+    fn show_now(&mut self, next: HistoryRefsHoverState, cx: &mut gpui::Context<Self>) {
         self.close_seq = self.close_seq.wrapping_add(1);
         let changed = self
             .state
@@ -172,8 +172,10 @@ impl HistoryRefsHoverHost {
             self.pinned_item_ix = None;
             *self.panel_bounds.borrow_mut() = None;
             self.state = Some(next);
+            // The host is an uncached overlay of the root view, so notifying it
+            // redraws the card; `window.refresh()` would also re-render every
+            // cached pane for this frame.
             cx.notify();
-            window.refresh();
         }
     }
 
@@ -327,29 +329,11 @@ impl HistoryRefsHoverHost {
         commit_id: &CommitId,
         item: &HistoryRefListItem,
     ) -> Option<PopoverKind> {
-        match &item.kind {
-            HistoryRefListItemKind::Tag { name } => Some(PopoverKind::TagRefMenu {
-                repo_id,
-                commit_id: commit_id.clone(),
-                name: name.clone(),
-            }),
-            HistoryRefListItemKind::LocalBranch { name } => Some(PopoverKind::BranchMenu {
-                repo_id,
-                section: BranchSection::Local,
-                name: name.clone(),
-            }),
-            HistoryRefListItemKind::RemoteBranch { name } => Some(PopoverKind::BranchMenu {
-                repo_id,
-                section: BranchSection::Remote,
-                name: name.clone(),
-            }),
-            HistoryRefListItemKind::AttachedHead { branch } => Some(PopoverKind::BranchMenu {
-                repo_id,
-                section: BranchSection::Local,
-                name: branch.clone(),
-            }),
-            HistoryRefListItemKind::DetachedHead => None,
-        }
+        let _ = item;
+        Some(PopoverKind::CommitMenu {
+            repo_id,
+            commit_id: commit_id.clone(),
+        })
     }
 
     fn item_debug_selector(item: &HistoryRefListItem) -> String {
@@ -387,8 +371,19 @@ impl HistoryRefsHoverHost {
     fn select_commit(&self, repo_id: RepoId, commit_id: CommitId, cx: &mut gpui::Context<Self>) {
         let root_view = self.root_view.clone();
         let _ = root_view.update(cx, |root, cx| {
-            root.store
-                .dispatch(Msg::SelectCommit { repo_id, commit_id });
+            let history = root.main_pane.read(cx).history_view.clone();
+            let request_id = Some(history.update(cx, |history, _| {
+                history.cancel_history_find_navigation();
+                history.note_history_selection(
+                    repo_id,
+                    HistoryPrimarySelection::Commit(commit_id.clone()),
+                )
+            }));
+            root.store.dispatch(Msg::SelectCommit {
+                request_id,
+                repo_id,
+                commit_id,
+            });
             cx.notify();
         });
     }
@@ -418,9 +413,8 @@ impl HistoryRefsHoverHost {
         self.set_item_menu_open(true, cx);
         let root_view = self.root_view.clone();
         let _ = root_view.update(cx, |root, cx| {
-            root.set_active_context_menu_invoker(Some(invoker), cx);
             root.popover_host.update(cx, |host, cx| {
-                host.open_popover_at(kind, position, window, cx)
+                host.open_popover_at(kind.invoked_by(invoker), position, window, cx)
             });
             cx.notify();
         });
@@ -512,20 +506,22 @@ impl Render for HistoryRefsHoverHost {
                 Self::item_popover_kind(state.repo_id, &state.commit_id, item).is_some();
             let frozen = self.item_menu_open;
             let pinned = self.pinned_item_ix == Some(ix);
-            let debug_selector = Self::item_debug_selector(item);
             let icon = Self::item_icon(item);
             let icon_color = Self::item_icon_color(theme, &item.kind);
             div()
                 .id(("history_refs_hover_item", ix))
-                .debug_selector(move || debug_selector.clone())
-                .h(ui_scale.px(24.0))
+                .debug_selector(|| Self::item_debug_selector(item))
+                .h(ui_scale.row_height(
+                    HISTORY_REFS_HOVER_ROW_HEIGHT_PX,
+                    HISTORY_REFS_HOVER_ROW_COMFORTABLE_HEIGHT_PX,
+                ))
                 .w_full()
                 .min_w(px(0.0))
                 .px_2()
                 .flex()
                 .items_center()
                 .gap_1()
-                .text_xs()
+                .text_size(theme.ui_text(12.0))
                 .line_height(ui_scale.px(16.0))
                 .rounded(px(theme.radii.row))
                 .text_color(if actionable {
@@ -533,36 +529,11 @@ impl Render for HistoryRefsHoverHost {
                 } else {
                     theme.colors.foreground.secondary
                 })
-                .cursor(if actionable && !frozen {
-                    CursorStyle::PointingHand
-                } else {
-                    CursorStyle::Arrow
-                })
-                .when(pinned, |row| {
-                    row.bg(theme.colors.interaction.pressed_background)
-                })
-                .hover(move |row| {
-                    if pinned {
-                        row.bg(theme.colors.interaction.pressed_background)
-                    } else if frozen {
-                        row
-                    } else {
-                        // `theme.colors.interaction.hover_background` is nearly identical to the
-                        // elevated popover surface; use a text-tinted overlay
-                        // that reads clearly.
-                        row.bg(with_alpha(
-                            theme.colors.foreground.primary,
-                            if theme.is_dark { 0.08 } else { 0.05 },
-                        ))
-                    }
-                })
-                .active(move |row| {
-                    if pinned || !frozen {
-                        row.bg(theme.colors.interaction.pressed_background)
-                    } else {
-                        row
-                    }
-                })
+                .control_interaction(
+                    controls::InteractionStyle::new(theme).pointer_feedback(!frozen),
+                    controls::InteractionState::default()
+                        .selected(pinned, theme.colors.interaction.selected_background),
+                )
                 .child(svg_icon(icon, icon_color, ui_scale.px(12.0)))
                 .child(
                     div()
@@ -577,33 +548,37 @@ impl Render for HistoryRefsHoverHost {
                 // shows on hover, so it can slide under a button that is
                 // already held, and gpui only fires these when the press
                 // landed on this row too.
-                .on_click(cx.listener({
-                    let commit_id = state.commit_id.clone();
-                    let item_for_left = item.clone();
-                    move |this, e: &ClickEvent, window, cx| {
-                        if !e.standard_click() {
-                            return;
-                        }
-                        cx.stop_propagation();
-                        if actionable {
-                            this.open_item_menu(
-                                state.repo_id,
-                                commit_id.clone(),
-                                ix,
-                                &item_for_left,
-                                e.position(),
-                                window,
-                                cx,
-                            );
-                        } else {
-                            if this.item_menu_open {
+                .on_activate(
+                    false,
+                    controls::ControlActivation::Composite,
+                    cx.listener({
+                        let commit_id = state.commit_id.clone();
+                        let item_for_left = item.clone();
+                        move |this, e: &ClickEvent, window, cx| {
+                            if !e.standard_click() {
                                 return;
                             }
-                            this.select_commit(state.repo_id, commit_id.clone(), cx);
-                            this.close(cx);
+                            cx.stop_propagation();
+                            if actionable {
+                                this.open_item_menu(
+                                    state.repo_id,
+                                    commit_id.clone(),
+                                    ix,
+                                    &item_for_left,
+                                    e.position(),
+                                    window,
+                                    cx,
+                                );
+                            } else {
+                                if this.item_menu_open {
+                                    return;
+                                }
+                                this.select_commit(state.repo_id, commit_id.clone(), cx);
+                                this.close(cx);
+                            }
                         }
-                    }
-                }))
+                    }),
+                )
                 .when(actionable, |row| {
                     row.on_aux_click(cx.listener({
                         let commit_id = state.commit_id.clone();
@@ -625,7 +600,7 @@ impl Render for HistoryRefsHoverHost {
                     }))
                 })
                 .when(!actionable, |row| {
-                    row.on_mouse_down(
+                    row.on_pointer_click(
                         MouseButton::Right,
                         cx.listener(|_this, _e: &MouseDownEvent, _window, cx| {
                             cx.stop_propagation();
@@ -646,7 +621,6 @@ impl Render for HistoryRefsHoverHost {
             .border_1()
             .border_color(theme.colors.stroke.default)
             .rounded(px(theme.radii.popover))
-            .shadow(crate::theme::shadow_popover(theme))
             .occlude()
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _window, cx| {
                 this.keep_open_at(e.position);
@@ -719,6 +693,8 @@ mod tests {
         };
         let remote = HistoryRefListItemKind::RemoteBranch {
             name: "origin/main".to_string(),
+            remote: "origin".to_string(),
+            branch: "main".to_string(),
         };
 
         for theme in [AppTheme::gitcomet_dark(), AppTheme::gitcomet_light()] {

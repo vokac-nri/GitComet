@@ -1,8 +1,42 @@
 use super::*;
 
 impl GitCometView {
+    pub(in crate::view) fn set_remote_url_policy(
+        &mut self,
+        next: RemoteUrlPolicy,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.remote_url_policy == next {
+            return;
+        }
+        self.remote_url_policy = next;
+        self.store.dispatch(Msg::SetRemoteUrlPolicy(next));
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.security.remote_url_policy = next;
+        });
+        self.schedule_ui_settings_persist(cx);
+    }
+
+    pub(in crate::view) fn set_remote_markdown_image_policy(
+        &mut self,
+        next: RemoteMarkdownImagePolicy,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.remote_markdown_image_policy == next {
+            return;
+        }
+        self.remote_markdown_image_policy = next;
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.security.remote_markdown_images = next;
+        });
+        self.main_pane.update(cx, |pane, cx| {
+            pane.set_remote_markdown_image_policy(next, cx);
+        });
+        self.schedule_ui_settings_persist(cx);
+    }
+
     pub(super) fn ui_scale(&self) -> ui_scale::UiScale {
-        ui_scale::UiScale::from_percent(self.ui_scale_percent)
+        ui_scale::UiScale::from_percent(self.ui_scale_percent).with_appearance(self.theme.metrics)
     }
 
     pub(in crate::view) fn update_ui_preferences(
@@ -108,6 +142,8 @@ impl GitCometView {
         self.schedule_ui_settings_persist(cx);
     }
 
+    /// Change the global theme preference. A window whose workspace
+    /// overrides the theme records it but keeps its own look.
     pub(super) fn set_theme_mode(
         &mut self,
         mode: ThemeMode,
@@ -119,12 +155,46 @@ impl GitCometView {
         }
 
         self.theme_mode = mode.clone();
+        self.window_appearance = appearance;
         let shared_mode = mode.clone();
         self.update_ui_preferences(cx, move |preferences| {
             preferences.appearance.theme_mode = shared_mode;
         });
-        self.set_theme(mode.resolve_theme(appearance), cx);
+        let host_mode = mode.clone();
+        self.popover_host
+            .update(cx, |host, _cx| host.sync_global_theme_mode(host_mode));
+        if self.workspace_theme_mode.is_none() {
+            self.set_theme(mode.resolve_theme(appearance), cx);
+        }
         self.schedule_ui_settings_persist(cx);
+    }
+
+    pub(super) fn effective_theme_mode(&self) -> &ThemeMode {
+        self.workspace_theme_mode
+            .as_ref()
+            .unwrap_or(&self.theme_mode)
+    }
+
+    /// Re-read this window's workspace theme override from the manager.
+    /// An unknown key (for example a deleted user theme) counts as no override.
+    pub(crate) fn sync_workspace_theme_override(&mut self, cx: &mut gpui::Context<Self>) {
+        let mode = self.workspace_id.and_then(|id| {
+            crate::workspaces::with_workspace(cx, id, |workspace| {
+                workspace
+                    .theme_mode
+                    .as_deref()
+                    .and_then(ThemeMode::from_key)
+            })
+            .flatten()
+        });
+        if self.workspace_theme_mode == mode {
+            return;
+        }
+        self.workspace_theme_mode = mode;
+        let theme = self
+            .effective_theme_mode()
+            .resolve_theme(self.window_appearance);
+        self.set_theme(theme, cx);
     }
 
     fn sync_date_preferences_to_children(&mut self, cx: &mut gpui::Context<Self>) {
@@ -211,6 +281,48 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_change_tracking_view(next, cx));
         self.popover_host
             .update(cx, |host, cx| host.sync_change_tracking_view(next, cx));
+        self.schedule_ui_settings_persist(cx);
+    }
+
+    pub(in crate::view) fn set_file_list_layout(
+        &mut self,
+        next: FileListLayout,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.file_list_layout == next {
+            return;
+        }
+
+        self.file_list_layout = next;
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.file_lists.layout = next;
+        });
+        cx.update_default_global::<crate::view::FileListDefaults, _>(|defaults, _| {
+            defaults.layout = next;
+        });
+        self.details_pane
+            .update(cx, |pane, cx| pane.set_file_list_layout(next, cx));
+        self.schedule_ui_settings_persist(cx);
+    }
+
+    pub(in crate::view) fn set_file_list_sort(
+        &mut self,
+        next: crate::view::rows::CommitFileSort,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.file_list_sort == next {
+            return;
+        }
+
+        self.file_list_sort = next;
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.file_lists.sort = next;
+        });
+        cx.update_default_global::<crate::view::FileListDefaults, _>(|defaults, _| {
+            defaults.sort = next;
+        });
+        self.details_pane
+            .update(cx, |pane, cx| pane.set_default_file_list_sort(next, cx));
         self.schedule_ui_settings_persist(cx);
     }
 
@@ -468,6 +580,21 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_diff_word_wrap(next, cx));
     }
 
+    /// The default tab size, from the settings window.
+    pub(in crate::view) fn set_diff_tab_size(&mut self, next: u8, cx: &mut gpui::Context<Self>) {
+        let next = next.clamp(1, crate::view::tab_width::MAX_TAB_WIDTH);
+        if self.diff_tab_size == next {
+            return;
+        }
+        self.diff_tab_size = next;
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.diff.tab_size = next;
+        });
+        self.schedule_ui_settings_persist(cx);
+        self.main_pane
+            .update(cx, |pane, cx| pane.set_default_tab_size(next, cx));
+    }
+
     pub(super) fn apply_diff_show_line_numbers_preference(
         &mut self,
         next: bool,
@@ -542,24 +669,26 @@ impl GitCometView {
             .update(cx, |pane, cx| pane.set_auto_save_file_edits(next, cx));
     }
 
-    /// Mirrors the settings window's remote-image toggle into the pane that
-    /// renders markdown previews. The main window never writes this back (the
-    /// settings window is the only writer), so there is no persist call here.
-    pub(in crate::view) fn set_markdown_preview_load_remote_images(
+    fn dismiss_history_layout_popovers(&mut self, cx: &mut gpui::Context<Self>) {
+        self.dismiss_history_refs_menus(cx);
+        self.dismiss_commit_message_hover(cx);
+        if self.active_context_menu_invoker.as_deref() == Some("history_mode_header") {
+            self.popover_host
+                .update(cx, |host, cx| host.close_popover(cx));
+        }
+    }
+
+    pub(in crate::view) fn set_history_branch_names(
         &mut self,
-        next: bool,
+        next: HistoryBranchNamesMode,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.markdown_preview_load_remote_images == next {
-            return;
-        }
-        self.markdown_preview_load_remote_images = next;
+        self.dismiss_history_layout_popovers(cx);
         self.update_ui_preferences(cx, move |preferences| {
-            preferences.privacy.load_remote_markdown_images = next;
+            preferences.history.branch_names = next;
         });
-        self.main_pane.update(cx, |pane, cx| {
-            pane.set_markdown_preview_load_remote_images(next, cx)
-        });
+        self.main_pane
+            .update(cx, |pane, cx| pane.set_history_branch_names(next, cx));
     }
 
     pub(in crate::view) fn set_history_column_preferences(
@@ -570,6 +699,7 @@ impl GitCometView {
         show_sha: bool,
         cx: &mut gpui::Context<Self>,
     ) {
+        self.dismiss_history_layout_popovers(cx);
         self.update_ui_preferences(cx, move |preferences| {
             preferences.history.show_graph = show_graph;
             preferences.history.show_author = show_author;
@@ -583,6 +713,7 @@ impl GitCometView {
     }
 
     pub(in crate::view) fn reset_history_column_widths(&mut self, cx: &mut gpui::Context<Self>) {
+        self.dismiss_history_layout_popovers(cx);
         self.main_pane
             .update(cx, |pane, cx| pane.reset_history_column_widths(cx));
         self.schedule_ui_settings_persist(cx);
@@ -613,6 +744,8 @@ impl GitCometView {
         self.main_pane.update(cx, |pane, cx| {
             pane.set_history_relative_dates(enabled, cx);
         });
+        self.popover_host
+            .update(cx, |host, cx| host.set_history_relative_dates(enabled, cx));
         self.schedule_ui_settings_persist(cx);
     }
 
@@ -633,9 +766,16 @@ impl GitCometView {
         self.main_pane.update(cx, |pane, cx| {
             pane.set_history_tag_preferences(show_tags, auto_fetch_tags_on_repo_activation, cx);
         });
+        let verify_commit_signatures = self
+            .ui_model
+            .read(cx)
+            .preferences
+            .history
+            .verify_commit_signatures;
         self.store.dispatch(Msg::SetGitLogSettings {
             show_history_tags: show_tags,
             tag_fetch_mode,
+            verify_commit_signatures,
         });
         if show_tags
             && auto_fetch_tags_on_repo_activation
@@ -652,6 +792,31 @@ impl GitCometView {
         self.schedule_ui_settings_persist(cx);
     }
 
+    pub(in crate::view) fn set_verify_commit_signatures_preference(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.history.verify_commit_signatures = enabled;
+        });
+        let (show_history_tags, tag_fetch_mode) = {
+            let history = &self.ui_model.read(cx).preferences.history;
+            (history.show_tags, history.tag_fetch_mode)
+        };
+        self.store.dispatch(Msg::SetGitLogSettings {
+            show_history_tags,
+            tag_fetch_mode,
+            verify_commit_signatures: enabled,
+        });
+        if enabled {
+            self.refresh_signing_tools(true, cx);
+        } else {
+            self.cancel_signing_tools_probe();
+        }
+        self.schedule_ui_settings_persist(cx);
+    }
+
     pub(in crate::view) fn set_default_tag_type_preference(
         &mut self,
         tag_type: DefaultTagType,
@@ -661,6 +826,58 @@ impl GitCometView {
             preferences.repository.default_tag_type = tag_type;
         });
         self.store.dispatch(Msg::SetDefaultTagType(tag_type));
+    }
+
+    pub(in crate::view) fn set_large_file_settings_preference(
+        &mut self,
+        settings: gitcomet_state::model::LargeFileSettings,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.large_files = settings;
+        });
+        self.store.dispatch(Msg::SetLargeFileSettings(settings));
+    }
+
+    pub(in crate::view) fn set_remote_prune_preference(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.remotes.prune_deleted_remote_branches_on_fetch = enabled;
+        });
+        self.store.dispatch(Msg::SetRemoteSettings(RemoteSettings {
+            prune_deleted_remote_branches_on_fetch: enabled,
+        }));
+    }
+
+    pub(in crate::view) fn set_maintenance_recommendation_preference(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.maintenance.recommend = enabled;
+        });
+        self.store
+            .dispatch(Msg::SetMaintenanceSettings(MaintenanceSettings {
+                recommend: enabled,
+            }));
+    }
+
+    pub(in crate::view) fn set_files_follow_selected_commit_preference(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.update_ui_preferences(cx, move |preferences| {
+            preferences.history.files_follow_selected_commit = enabled;
+        });
+        self.store
+            .dispatch(Msg::SetFileBrowserSettings(FileBrowserSettings {
+                follow_selected_commit: enabled,
+            }));
     }
 
     pub(in crate::view) fn set_default_history_mode_preference(

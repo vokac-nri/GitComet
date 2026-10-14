@@ -57,7 +57,11 @@ struct HistoryShortShaVm(SharedString);
 
 impl HistoryShortShaVm {
     fn new(commit_id: &str) -> Self {
-        Self(commit_id.chars().take(7).collect::<String>().into())
+        Self(
+            gitcomet_core::domain::short_commit_id(commit_id)
+                .to_owned()
+                .into(),
+        )
     }
 
     fn as_str(&self) -> &str {
@@ -450,6 +454,20 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
     for row in rows.iter().take(256) {
         std::mem::discriminant(row).hash(&mut h);
         match row {
+            BranchSidebarRow::ContributionHeader {
+                title,
+                collapsed,
+                collapse_key,
+                ..
+            } => {
+                title.hash(&mut h);
+                collapsed.hash(&mut h);
+                collapse_key.hash(&mut h);
+            }
+            BranchSidebarRow::ContributionItem { label, key, .. } => {
+                label.hash(&mut h);
+                key.hash(&mut h);
+            }
             BranchSidebarRow::SectionHeader {
                 section,
                 top_border,
@@ -463,13 +481,6 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
                 .hash(&mut h);
                 top_border.hash(&mut h);
                 collapsed.hash(&mut h);
-            }
-            BranchSidebarRow::FilterGroupHeader { section } => {
-                match section {
-                    BranchSection::Local => 0u8,
-                    BranchSection::Remote => 1u8,
-                }
-                .hash(&mut h);
             }
             BranchSidebarRow::Placeholder { section, message } => {
                 match section {
@@ -540,13 +551,22 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
                 detached.hash(&mut h);
                 is_active.hash(&mut h);
             }
-            BranchSidebarRow::SubmoduleItem { path } => {
+            BranchSidebarRow::SubmoduleItem {
+                path,
+                status,
+                recorded_head,
+                checked_out_head,
+            } => {
                 let path_len = path
                     .to_str()
                     .map_or_else(|| path.to_string_lossy().len(), str::len);
                 let path_label = path_display::path_display_shared_fast(path.as_path());
                 path_len.hash(&mut h);
                 path_label.len().hash(&mut h);
+                // The badge, tooltip and icon colour are built from these.
+                status.hash(&mut h);
+                recorded_head.hash(&mut h);
+                checked_out_head.hash(&mut h);
             }
             BranchSidebarRow::StashItem {
                 index,
@@ -558,14 +578,14 @@ pub(in crate::view) fn hash_branch_sidebar_rows(rows: &[BranchSidebarRow]) -> u6
                 message.len().hash(&mut h);
                 tooltip.len().hash(&mut h);
             }
-            BranchSidebarRow::PinnedHeader { collapsed, .. } => {
-                collapsed.hash(&mut h);
-            }
             BranchSidebarRow::SectionSpacer
             | BranchSidebarRow::WorktreesHeader { .. }
             | BranchSidebarRow::WorktreePlaceholder { .. }
             | BranchSidebarRow::SubmodulesHeader { .. }
             | BranchSidebarRow::SubmodulePlaceholder { .. }
+            | BranchSidebarRow::AnnexHeader { .. }
+            | BranchSidebarRow::AnnexPlaceholder { .. }
+            | BranchSidebarRow::AnnexRepositoryItem { .. }
             | BranchSidebarRow::StashHeader { .. }
             | BranchSidebarRow::StashPlaceholder { .. } => {}
         }
@@ -1023,11 +1043,13 @@ impl RepoSwitchMetrics {
 fn hash_repo_switch_outcome(state: &AppState, effects: &[Effect]) -> u64 {
     fn hash_diff_target(target: &DiffTarget, h: &mut FxHasher) {
         match target {
-            DiffTarget::WorkingTree { path, area } => {
+            DiffTarget::WorkingTree { path, area, .. } => {
                 path.hash(h);
                 (*area as u8).hash(h);
             }
-            DiffTarget::Commit { commit_id, path } => {
+            DiffTarget::Commit {
+                commit_id, path, ..
+            } => {
                 commit_id.hash(h);
                 path.hash(h);
             }
@@ -1035,6 +1057,7 @@ fn hash_repo_switch_outcome(state: &AppState, effects: &[Effect]) -> u64 {
                 from_commit_id,
                 to_commit_id,
                 path,
+                ..
             } => {
                 from_commit_id.hash(h);
                 to_commit_id.hash(h);
@@ -1974,7 +1997,7 @@ impl HistoryLoadMoreAppendFixture {
     }
 
     pub fn fresh_state(&self) -> AppState {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let mut repo_state = RepoState::new_opening(
             self.repo_id,
             RepoSpec {
@@ -1985,21 +2008,29 @@ impl HistoryLoadMoreAppendFixture {
         state.repos.push(repo_state);
         state.active_repo = Some(self.repo_id);
 
+        let seq = state.repos[0]
+            .loads_in_flight
+            .request_log(gitcomet_state::model::PendingLogLoad {
+                scope: self.scope,
+                author: None,
+                limit: self.existing_commits.len(),
+                cursor: None,
+            })
+            .expect("initial fixture load");
         // Seed the initial page through the reducer so benchmark setup matches
         // the production initial-load path, including any pagination slack.
         let _ = dispatch_sync(
             &mut state,
             Msg::Internal(InternalMsg::LogLoaded {
                 repo_id: self.repo_id,
-                // Nothing is tracking a walk in the fixture, so any sequence
-                // number is accepted; production carries the request's own.
-                seq: 0,
+                seq,
                 scope: self.scope,
                 cursor: None,
-                result: Ok(LogPage {
+                result: Ok(std::sync::Arc::new(LogPage {
                     commits: self.existing_commits.clone(),
                     next_cursor: self.request_cursor(),
-                }),
+                })
+                .into()),
             }),
         );
 
@@ -2033,16 +2064,29 @@ impl HistoryLoadMoreAppendFixture {
             .map(|repo| repo.history_state.log_rev)
             .unwrap_or_default();
 
+        let repo = state
+            .repos
+            .iter_mut()
+            .find(|repo| repo.id == self.repo_id)
+            .unwrap();
+        let seq = repo.loads_in_flight.active_log_seq().unwrap_or_else(|| {
+            repo.loads_in_flight
+                .request_log(gitcomet_state::model::PendingLogLoad {
+                    scope: self.scope,
+                    author: None,
+                    limit: page.commits.len(),
+                    cursor: cursor.clone(),
+                })
+                .expect("fixture load")
+        });
         let effects = dispatch_sync(
             state,
             Msg::Internal(InternalMsg::LogLoaded {
                 repo_id: self.repo_id,
-                // Nothing is tracking a walk in the fixture, so any sequence
-                // number is accepted; production carries the request's own.
-                seq: 0,
+                seq,
                 scope: self.scope,
                 cursor,
-                result: Ok(page),
+                result: Ok(page.into()),
             }),
         );
 
@@ -2139,7 +2183,7 @@ impl HistoryScopeSwitchFixture {
     }
 
     pub fn fresh_state(&self) -> AppState {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let mut repo_state = RepoState::new_opening(
             self.repo_id,
             RepoSpec {

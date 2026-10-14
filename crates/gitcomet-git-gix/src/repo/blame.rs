@@ -10,7 +10,6 @@ use crate::util::{
 use gitcomet_core::domain::{DiffArea, is_uncommitted_commit_id};
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::services::{BlameLine, CommandOutput, ConflictSide, Result};
-use gix::bstr::ByteSlice as _;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::fs;
@@ -56,11 +55,11 @@ fn tree_contains_path(repo: &gix::Repository, id: gix::ObjectId, path: &Path) ->
 /// when there is no `HEAD` (unborn branch) or the path is absent there — exactly
 /// when `git blame` would fail with "no such path ... in HEAD" because the file
 /// has no committed history and all of its lines are local changes.
-fn path_exists_at_head(repo: &gix::Repository, path: &Path) -> bool {
-    let Ok(id) = repo.head_id() else {
-        return false;
+fn path_exists_at_head(repo: &gix::Repository, path: &Path) -> Result<bool> {
+    let Some(id) = crate::refs::head_oid(repo)? else {
+        return Ok(false);
     };
-    tree_contains_path(repo, id.detach(), path)
+    Ok(tree_contains_path(repo, id, path))
 }
 
 /// Read the staged (index) content for `path` to blame. This is normally the
@@ -84,11 +83,10 @@ fn staged_blob_for_blame(repo: &gix::Repository, path: &Path) -> Result<Vec<u8>>
 /// committed history (newly added / untracked) where every line is local. The
 /// all-zero object id matches what `git blame --line-porcelain` emits for
 /// uncommitted lines, so the UI treats these rows the same way.
-fn synthesize_uncommitted_blame(contents: &[u8]) -> Vec<BlameLine> {
+fn synthesize_uncommitted_blame(contents: &[u8], null_id: gix::ObjectId) -> Vec<BlameLine> {
     const NOT_COMMITTED: &str = "Not Committed Yet";
-    const UNCOMMITTED_ID: &str = "0000000000000000000000000000000000000000";
 
-    let commit_id: Arc<str> = Arc::from(UNCOMMITTED_ID);
+    let commit_id: Arc<str> = Arc::from(null_id.to_string());
     let author: Arc<str> = Arc::from(NOT_COMMITTED);
     blame_blob_lines(contents)
         .map(|line| BlameLine {
@@ -380,10 +378,9 @@ impl GixRepo {
     pub(super) fn blame_file_impl(&self, path: &Path, rev: Option<&str>) -> Result<Vec<BlameLine>> {
         const BLOB_LINE_MISMATCH: &str = "gix blame blob line count did not match blame entries";
 
-        let repo = self._repo.to_thread_local();
+        let repo = self.repo();
         let spec = rev.unwrap_or("HEAD");
-        let suspect = repo
-            .rev_parse_single(spec)
+        let suspect = crate::refs::resolve_required(&repo, spec)
             .map_err(|e| Error::new(ErrorKind::Backend(format!("gix rev-parse {spec}: {e}"))))?
             .detach();
         let git_path = gix::path::os_str_into_bstr(path.as_os_str())
@@ -426,7 +423,10 @@ impl GixRepo {
             let source_path = entry
                 .source_file_name
                 .as_ref()
-                .map(|name| gix::path::from_bstr(name.as_bstr()).into_owned())
+                .map(|name| {
+                    crate::util::path_buf_from_git_bytes(name.as_ref(), "gix blame source path")
+                })
+                .transpose()?
                 .filter(|source| source.as_path() != path);
             let metadata = blame_commit_metadata(
                 &repo,
@@ -473,8 +473,8 @@ impl GixRepo {
         // from HEAD, so `git blame` fails with "no such path ... in HEAD". Every
         // line is local, so synthesize the blame directly from the shown content
         // (working tree for unstaged, the staged blob for staged).
-        let repo = self._repo.to_thread_local();
-        if !path_exists_at_head(&repo, path) {
+        let repo = self.repo();
+        if !path_exists_at_head(&repo, path)? {
             let contents = match area {
                 DiffArea::Unstaged => {
                     let abs_path = self.spec.workdir.join(path);
@@ -482,7 +482,10 @@ impl GixRepo {
                 }
                 DiffArea::Staged => staged_blob_for_blame(&repo, path)?,
             };
-            return Ok(synthesize_uncommitted_blame(&contents));
+            return Ok(synthesize_uncommitted_blame(
+                &contents,
+                repo.object_hash().null(),
+            ));
         }
 
         let mut cmd = self.git_workdir_cmd();
@@ -524,7 +527,7 @@ impl GixRepo {
             ConflictSide::Theirs => 3,
         };
 
-        let repo = self._repo.to_thread_local();
+        let repo = self.repo();
 
         if !gix_index_stage_exists(&repo, path, desired_stage)? {
             let mut rm = self.git_workdir_cmd();
@@ -572,7 +575,7 @@ impl GixRepo {
     }
 
     pub(super) fn checkout_conflict_base_impl(&self, path: &Path) -> Result<CommandOutput> {
-        let repo = self._repo.to_thread_local();
+        let repo = self.repo();
         let base_bytes = gix_index_stage_blob_bytes_optional(&repo, path, 1)?.ok_or_else(|| {
             Error::new(ErrorKind::Backend(format!(
                 "base conflict stage is not available for {}",
@@ -729,7 +732,8 @@ mod tests {
         // A newly added file with no committed history: every line is surfaced as
         // an uncommitted ("Not Committed Yet") entry with the all-zero object id
         // and no parent revision to navigate to.
-        let lines = synthesize_uncommitted_blame(b"first\nsecond\nthird");
+        let lines =
+            synthesize_uncommitted_blame(b"first\nsecond\nthird", gix::hash::Kind::Sha1.null());
         assert_eq!(lines.len(), 3);
         assert_eq!(
             lines.iter().map(|l| l.line.as_str()).collect::<Vec<_>>(),
@@ -751,7 +755,7 @@ mod tests {
 
     #[test]
     fn synthesize_uncommitted_blame_is_empty_for_empty_file() {
-        assert!(synthesize_uncommitted_blame(b"").is_empty());
+        assert!(synthesize_uncommitted_blame(b"", gix::hash::Kind::Sha1.null()).is_empty());
     }
 
     #[test]

@@ -1,79 +1,55 @@
 mod clone;
+mod commit_details;
+mod diff_session;
+mod history_authors;
+mod history_find;
+mod indexed_history;
+mod load_tokens;
 mod open_repo;
 mod repo_actions;
 mod repo_commands;
 mod repo_load;
+mod unavailable;
 mod util;
 
 /// Called by the reducer as it drops a repo's handle, so the worktree scan's
 /// cached repository handles go with it. See [`repo_load`].
 pub(super) use repo_load::release_worktree_scan_handles;
 
+pub(super) use load_tokens::RepoTaskToken;
+
 use crate::model::{AppState, Loadable};
-use crate::msg::{Effect, Msg, RepoActionKind, RepoCommandKind};
+use crate::msg::{Effect, Msg};
 use crate::session;
 use gitcomet_core::domain::DiffTarget;
 use gitcomet_core::error::{Error, ErrorKind};
-use gitcomet_core::process::GitRuntimeState;
 use gitcomet_core::services::{CancellationToken, GitBackend, GitRepository};
 use rustc_hash::FxHashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
 use super::RepoId;
 use super::executor::TaskExecutor;
-use super::repo_load_trace;
 use super::worker_channel::StoreWorkerSender;
 
-#[derive(Clone)]
-pub(super) struct RepoTaskToken {
-    pub(super) load_epoch: u64,
-    pub(super) cancellation: CancellationToken,
-    /// Cancellation for the *current* log walk alone. An author-filtered walk
-    /// on a large repository runs for tens of seconds and the repo-load pool
-    /// has one or two threads, so a superseded walk has to be stopped for its
-    /// replacement to start at all — but stopping it must not disturb the
-    /// repository's other loads, which share [`Self::cancellation`].
-    log_cancellation: Arc<Mutex<CancellationToken>>,
-}
+/// Ceiling on how often a running filesystem operation may publish progress.
+/// Fast enough to look continuous, slow enough that the per-message AppState
+/// copy stays off the critical path.
+const FILESYSTEM_PROGRESS_TICK: std::time::Duration = std::time::Duration::from_millis(50);
 
-impl RepoTaskToken {
-    fn new(load_epoch: u64) -> Self {
-        Self {
-            load_epoch,
-            cancellation: CancellationToken::new(),
-            log_cancellation: Arc::new(Mutex::new(CancellationToken::new())),
-        }
-    }
-
-    /// Cancels the log walk in flight, if any, and hands out the token for the
-    /// walk that replaces it.
-    fn take_over_log(&self) -> CancellationToken {
-        let mut slot = self
-            .log_cancellation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        slot.cancel();
-        let next = CancellationToken::new();
-        *slot = next.clone();
-        next
-    }
-
-    /// Cancels every task running under this token, log walks included.
-    pub(super) fn cancel(&self) {
-        self.cancellation.cancel();
-        self.log_cancellation
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .cancel();
-    }
-}
+use load_tokens::repo_load_context;
 
 #[derive(Clone, Copy)]
 pub(super) struct EffectExecutors<'a> {
     pub(super) executor: &'a TaskExecutor,
     pub(super) repo_load_executor: &'a TaskExecutor,
+    /// Status scans of other checkouts must not occupy foreground load workers.
+    pub(super) worktree_scan_executor: &'a std::sync::LazyLock<TaskExecutor>,
     pub(super) session_persist_executor: &'a TaskExecutor,
     pub(super) metadata_executor: &'a TaskExecutor,
+    pub(super) signature_executor: &'a TaskExecutor,
+    /// Whole-history find scans, one worker per store: one window's scan
+    /// must not hold up another's.
+    pub(super) history_find_executor: &'a std::sync::LazyLock<TaskExecutor>,
 }
 
 fn selected_diff_target(
@@ -166,1194 +142,20 @@ fn selected_inline_submodule_diff(
         })
 }
 
-fn current_repo_load_epoch(
-    thread_state: &Arc<RwLock<Arc<AppState>>>,
-    repo_id: RepoId,
-) -> Option<u64> {
-    let state = thread_state.read().unwrap_or_else(|e| e.into_inner());
-    state
-        .repos
-        .iter()
-        .find(|repo| repo.id == repo_id)
-        .map(|repo| repo.load_epoch)
-}
-
-fn ensure_repo_task_token(
-    thread_state: &Arc<RwLock<Arc<AppState>>>,
-    repo_task_tokens: &mut FxHashMap<RepoId, RepoTaskToken>,
-    repo_id: RepoId,
-) -> Option<RepoTaskToken> {
-    let load_epoch = current_repo_load_epoch(thread_state, repo_id).unwrap_or(0);
-    if let Some(existing) = repo_task_tokens.get(&repo_id)
-        && existing.load_epoch == load_epoch
-        && !existing.cancellation.is_cancelled()
-    {
-        repo_load_trace::trace!(
-            "repo_load_token reuse repo_id={:?} load_epoch={}",
-            repo_id,
-            load_epoch
-        );
-        return Some(existing.clone());
-    }
-
-    let token = RepoTaskToken::new(load_epoch);
-    if let Some(previous) = repo_task_tokens.insert(repo_id, token.clone()) {
-        repo_load_trace::trace!(
-            "repo_load_token replace_and_cancel_previous repo_id={:?} previous_epoch={} new_epoch={}",
-            repo_id,
-            previous.load_epoch,
-            load_epoch
-        );
-        previous.cancel();
-    } else {
-        repo_load_trace::trace!(
-            "repo_load_token create repo_id={:?} load_epoch={}",
-            repo_id,
-            load_epoch
-        );
-    }
-    Some(token)
-}
-
-fn repo_load_context(
-    thread_state: &Arc<RwLock<Arc<AppState>>>,
-    repo_task_tokens: &mut FxHashMap<RepoId, RepoTaskToken>,
-    msg_tx: StoreWorkerSender,
-    repo_id: RepoId,
-) -> Option<(StoreWorkerSender, CancellationToken)> {
-    let token = ensure_repo_task_token(thread_state, repo_task_tokens, repo_id)?;
-    let msg_tx = msg_tx.with_repo_load_guard(repo_id, token.load_epoch, token.cancellation.clone());
-    Some((msg_tx, token.cancellation))
-}
-
-/// Like [`repo_load_context`], but for the log walk: the returned token covers
-/// this walk alone, and taking it cancels whichever walk it replaces. Messages
-/// still ride the repository-wide guard, so a cancelled walk's reply arrives
-/// and is dropped by the reducer rather than vanishing silently.
-fn log_load_context(
-    thread_state: &Arc<RwLock<Arc<AppState>>>,
-    repo_task_tokens: &mut FxHashMap<RepoId, RepoTaskToken>,
-    msg_tx: StoreWorkerSender,
-    repo_id: RepoId,
-) -> Option<(StoreWorkerSender, CancellationToken)> {
-    let token = ensure_repo_task_token(thread_state, repo_task_tokens, repo_id)?;
-    let msg_tx = msg_tx.with_repo_load_guard(repo_id, token.load_epoch, token.cancellation.clone());
-    Some((msg_tx, token.take_over_log()))
-}
-
 fn effect_requires_available_git(effect: &Effect) -> bool {
     !matches!(
         effect,
-        Effect::PersistSession { .. }
+        Effect::Filesystem(_)
+            | Effect::UpdateRepositoryPreferences { .. }
+            | Effect::PersistSession { .. }
             | Effect::PersistRecentRepo { .. }
             | Effect::PersistRepoHistoryMode { .. }
             | Effect::PersistRepoHistoryModesBatch { .. }
+            | Effect::PersistRepoMaintenanceSnooze { .. }
             | Effect::CancelRepoLoads { .. }
             | Effect::CancelGitOperation { .. }
             | Effect::AbortCloneRepo { .. }
     )
-}
-
-fn git_unavailable_error(runtime: &GitRuntimeState) -> Error {
-    Error::new(ErrorKind::Backend(
-        runtime
-            .unavailable_detail()
-            .unwrap_or("Git executable is unavailable.")
-            .to_string(),
-    ))
-}
-
-fn send_repo_action_unavailable(
-    repo_id: RepoId,
-    action: RepoActionKind,
-    runtime: &GitRuntimeState,
-    send: &impl Fn(Msg),
-) {
-    send(Msg::Internal(crate::msg::InternalMsg::RepoActionFinished {
-        repo_id,
-        action,
-        result: Err(git_unavailable_error(runtime)),
-    }))
-}
-
-fn send_unavailable_git_effect_result(
-    thread_state: &Arc<RwLock<Arc<AppState>>>,
-    msg_tx: &StoreWorkerSender,
-    effect: Effect,
-    runtime: &GitRuntimeState,
-) {
-    let send = |msg| util::send_or_log(msg_tx, msg);
-
-    match effect {
-        Effect::PersistSession { .. }
-        | Effect::PersistRecentRepo { .. }
-        | Effect::PersistRepoHistoryMode { .. }
-        | Effect::PersistRepoHistoryModesBatch { .. }
-        | Effect::PersistRepoHistoryAuthorFilter { .. }
-        | Effect::CancelRepoLoads { .. }
-        | Effect::CancelGitOperation { .. } => {}
-        Effect::OpenRepo { repo_id, path } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RepoOpenedErr {
-                repo_id,
-                spec: gitcomet_core::domain::RepoSpec { workdir: path },
-                error: git_unavailable_error(runtime),
-            }))
-        }
-        Effect::LoadBranches { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::BranchesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadRemotes { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RemotesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadRemoteBranches { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::RemoteBranchesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadWorktreeStatus { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::WorktreeStatusLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadStagedStatus { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::StagedStatusLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadStatus { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::StatusLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadHeadBranch { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::HeadBranchLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadUpstreamDivergence { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::UpstreamDivergenceLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadLog {
-            repo_id,
-            seq,
-            scope,
-            cursor,
-            ..
-        } => send(Msg::Internal(crate::msg::InternalMsg::LogLoaded {
-            repo_id,
-            seq,
-            scope,
-            cursor,
-            result: Err(git_unavailable_error(runtime)),
-        })),
-        Effect::LoadTags { repo_id } => send(Msg::Internal(crate::msg::InternalMsg::TagsLoaded {
-            repo_id,
-            result: Err(git_unavailable_error(runtime)),
-        })),
-        Effect::LoadRemoteTags { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RemoteTagsLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadStashes { repo_id, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::StashesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadConflictFile { repo_id, path, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::ConflictFileLoaded {
-                repo_id,
-                path,
-                result: Box::new(Err(git_unavailable_error(runtime))),
-                conflict_session: None,
-            }))
-        }
-        Effect::LoadReflog { repo_id, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::ReflogLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadRecentCommitMessages {
-            repo_id,
-            request_rev,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RecentCommitMessagesLoaded {
-                repo_id,
-                request_rev,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SaveWorktreeFile {
-            repo_id,
-            path,
-            stage,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::SaveWorktreeFile { path, stage },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::AppendGitignorePatterns { repo_id, patterns } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::AppendGitignorePatterns { patterns },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadFileHistory { repo_id, path, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::FileHistoryLoaded {
-                repo_id,
-                path,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadBlame {
-            repo_id,
-            path,
-            source,
-        } => send(Msg::Internal(crate::msg::InternalMsg::BlameLoaded {
-            repo_id,
-            path,
-            source,
-            result: Err(git_unavailable_error(runtime)),
-        })),
-        Effect::LoadWorktrees { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::WorktreesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadWorktreeDirty { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::WorktreeDirtyLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadRefMetadata { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RefMetadataLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadSubmodules { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::SubmodulesLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadFileBrowser { repo_id, source } => {
-            send(Msg::Internal(crate::msg::InternalMsg::FileBrowserLoaded {
-                repo_id,
-                source,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::CheckSubmoduleAddTrust {
-            repo_id,
-            url,
-            path,
-            branch,
-            name,
-            force,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::SubmoduleAddTrustChecked {
-                repo_id,
-                url,
-                path,
-                branch,
-                name,
-                force,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::CheckSubmoduleUpdateTrust { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::SubmoduleUpdateTrustChecked {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadRebaseAndMergeState { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RebaseStateLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }));
-            send(Msg::Internal(
-                crate::msg::InternalMsg::MergeCommitMessageLoaded {
-                    repo_id,
-                    result: Err(git_unavailable_error(runtime)),
-                },
-            ));
-        }
-        Effect::LoadRebaseState { repo_id } => {
-            send(Msg::Internal(crate::msg::InternalMsg::RebaseStateLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadMergeCommitMessage { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::MergeCommitMessageLoaded {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadCommitDetails { repo_id, commit_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::CommitDetailsLoaded {
-                repo_id,
-                commit_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadHoverCommitMessage { repo_id, commit_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::HoverCommitMessageLoaded {
-                repo_id,
-                commit_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ResolveCommitForReveal { repo_id, reference } => send(Msg::Internal(
-            crate::msg::InternalMsg::CommitRevealResolved {
-                repo_id,
-                reference,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadRangeFiles {
-            repo_id,
-            from,
-            to,
-            request,
-        } => send(Msg::Internal(crate::msg::InternalMsg::RangeFilesLoaded {
-            repo_id,
-            from,
-            to,
-            request,
-            result: Err(git_unavailable_error(runtime)),
-        })),
-        Effect::LoadSquashMessagePreview {
-            repo_id,
-            oldest,
-            head,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::SquashMessagePreviewLoaded {
-                repo_id,
-                oldest,
-                head,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadSquashRebaseSetup {
-            repo_id,
-            base,
-            actual_head,
-            selected_ids,
-            reword_id,
-            message,
-            count,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::SquashRebaseSetupLoaded {
-                repo_id,
-                base: base.as_ref().to_string(),
-                actual_head,
-                selected_ids,
-                reword_id,
-                message,
-                count,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::OpenFileAtCommitParent { .. } | Effect::OpenFileAtCommit { .. } => {
-            // No git backend available; nothing to resolve.
-        }
-        Effect::LoadDiff { repo_id, target } => {
-            send(Msg::Internal(crate::msg::InternalMsg::DiffLoaded {
-                repo_id,
-                target,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadDiffFile { repo_id, target } => {
-            send(Msg::Internal(crate::msg::InternalMsg::DiffFileLoaded {
-                repo_id,
-                target,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::LoadDiffPreviewTextFile {
-            repo_id,
-            target,
-            side,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::DiffPreviewTextFileLoaded {
-                repo_id,
-                target,
-                side,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadSubmoduleSummary { repo_id, target } => send(Msg::Internal(
-            crate::msg::InternalMsg::SubmoduleSummaryLoaded {
-                repo_id,
-                target,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadInlineSubmoduleSelectedDiff {
-            repo_id,
-            inline_rev,
-        } => {
-            let Some((_, target, current_rev)) =
-                selected_inline_submodule_diff(thread_state, repo_id)
-            else {
-                return;
-            };
-            if current_rev != inline_rev {
-                return;
-            }
-            send(Msg::Internal(
-                crate::msg::InternalMsg::InlineSubmoduleDiffLoaded {
-                    repo_id,
-                    inline_rev,
-                    target,
-                    result: Err(git_unavailable_error(runtime)),
-                },
-            ))
-        }
-        Effect::LoadInlineSubmoduleSelectedDiffFile {
-            repo_id,
-            inline_rev,
-        } => {
-            let Some((_, target, current_rev)) =
-                selected_inline_submodule_diff(thread_state, repo_id)
-            else {
-                return;
-            };
-            if current_rev != inline_rev {
-                return;
-            }
-            send(Msg::Internal(
-                crate::msg::InternalMsg::InlineSubmoduleDiffFileLoaded {
-                    repo_id,
-                    inline_rev,
-                    target,
-                    result: Err(git_unavailable_error(runtime)),
-                },
-            ))
-        }
-        Effect::LoadInlineSubmoduleSelectedDiffFileImage {
-            repo_id,
-            inline_rev,
-        } => {
-            let Some((_, target, current_rev)) =
-                selected_inline_submodule_diff(thread_state, repo_id)
-            else {
-                return;
-            };
-            if current_rev != inline_rev {
-                return;
-            }
-            send(Msg::Internal(
-                crate::msg::InternalMsg::InlineSubmoduleDiffFileImageLoaded {
-                    repo_id,
-                    inline_rev,
-                    target,
-                    result: Err(git_unavailable_error(runtime)),
-                },
-            ))
-        }
-        Effect::LoadDiffFileImage { repo_id, target } => send(Msg::Internal(
-            crate::msg::InternalMsg::DiffFileImageLoaded {
-                repo_id,
-                target,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadSelectedDiff {
-            repo_id,
-            load_patch_diff,
-            load_file_text,
-            preview_text_side,
-            load_submodule_summary,
-            load_file_image,
-        } => {
-            let Some((target, _target_rev)) = selected_diff_target(thread_state, repo_id) else {
-                return;
-            };
-            if load_submodule_summary {
-                send(Msg::Internal(
-                    crate::msg::InternalMsg::SubmoduleSummaryLoaded {
-                        repo_id,
-                        target: target.clone(),
-                        result: Err(git_unavailable_error(runtime)),
-                    },
-                ));
-            }
-            if load_file_image {
-                send(Msg::Internal(
-                    crate::msg::InternalMsg::DiffFileImageLoaded {
-                        repo_id,
-                        target: target.clone(),
-                        result: Err(git_unavailable_error(runtime)),
-                    },
-                ));
-            }
-            if let Some(side) = preview_text_side {
-                send(Msg::Internal(
-                    crate::msg::InternalMsg::DiffPreviewTextFileLoaded {
-                        repo_id,
-                        target: target.clone(),
-                        side,
-                        result: Err(git_unavailable_error(runtime)),
-                    },
-                ));
-            }
-            if load_file_text {
-                send(Msg::Internal(crate::msg::InternalMsg::DiffFileLoaded {
-                    repo_id,
-                    target: target.clone(),
-                    result: Err(git_unavailable_error(runtime)),
-                }));
-            }
-            if load_patch_diff {
-                send(Msg::Internal(crate::msg::InternalMsg::DiffLoaded {
-                    repo_id,
-                    target,
-                    result: Err(git_unavailable_error(runtime)),
-                }));
-            }
-        }
-        Effect::LoadSelectedConflictFile { repo_id, .. } => {
-            let Some(path) = selected_conflict_file_path(thread_state, repo_id) else {
-                return;
-            };
-            send(Msg::Internal(crate::msg::InternalMsg::ConflictFileLoaded {
-                repo_id,
-                path,
-                result: Box::new(Err(git_unavailable_error(runtime))),
-                conflict_session: None,
-            }));
-        }
-        Effect::CheckoutBranch { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::CheckoutBranch, runtime, &send)
-        }
-        Effect::CheckoutRemoteBranch { repo_id, .. } => send_repo_action_unavailable(
-            repo_id,
-            RepoActionKind::CheckoutRemoteBranch,
-            runtime,
-            &send,
-        ),
-        Effect::CheckoutCommit { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::CheckoutCommit, runtime, &send)
-        }
-        Effect::CherryPickCommit {
-            repo_id,
-            commit_id,
-            commit,
-            mainline,
-            summary,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::CherryPick {
-                    commit_id,
-                    commit,
-                    mainline,
-                    summary,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RevertCommit { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::RevertCommit, runtime, &send)
-        }
-        Effect::CreateBranch { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::CreateBranch, runtime, &send)
-        }
-        Effect::CreateBranchAndCheckout { repo_id, .. } => send_repo_action_unavailable(
-            repo_id,
-            RepoActionKind::CreateBranchAndCheckout,
-            runtime,
-            &send,
-        ),
-        Effect::RenameBranch { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::RenameBranch, runtime, &send)
-        }
-        Effect::DeleteBranch { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::DeleteBranch, runtime, &send)
-        }
-        Effect::ForceDeleteBranch { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::ForceDeleteBranch, runtime, &send)
-        }
-        Effect::DeleteBranches { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::DeleteBranches, runtime, &send)
-        }
-        Effect::StagePath { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::StagePath, runtime, &send)
-        }
-        Effect::StagePaths { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::StagePaths, runtime, &send)
-        }
-        Effect::UnstagePath { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::UnstagePath, runtime, &send)
-        }
-        Effect::UnstagePaths { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::UnstagePaths, runtime, &send)
-        }
-        Effect::DiscardWorktreeChangesPath { repo_id, .. } => send_repo_action_unavailable(
-            repo_id,
-            RepoActionKind::DiscardWorktreeChangesPath,
-            runtime,
-            &send,
-        ),
-        Effect::DiscardWorktreeChangesPaths { repo_id, .. } => send_repo_action_unavailable(
-            repo_id,
-            RepoActionKind::DiscardWorktreeChangesPaths,
-            runtime,
-            &send,
-        ),
-        Effect::Stash { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::Stash, runtime, &send)
-        }
-        Effect::ApplyStash { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::ApplyStash, runtime, &send)
-        }
-        Effect::PopStash { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::PopStash, runtime, &send)
-        }
-        Effect::DropStash { repo_id, .. } => {
-            send_repo_action_unavailable(repo_id, RepoActionKind::DropStash, runtime, &send)
-        }
-        Effect::CloneRepo { url, dest, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::CloneRepoFinished {
-                url,
-                dest,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::AbortCloneRepo { dest } => clone::schedule_abort_clone_repo(msg_tx.clone(), dest),
-        Effect::ExportPatch {
-            repo_id,
-            commit_id,
-            dest,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ExportPatch { commit_id, dest },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ApplyPatch { repo_id, patch } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ApplyPatch { patch },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::AddWorktree {
-            repo_id,
-            path,
-            reference,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::AddWorktree { path, reference },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RemoveWorktree { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::RemoveWorktree { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ForceRemoveWorktree { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ForceRemoveWorktree { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::AddSubmodule {
-            repo_id,
-            url,
-            path,
-            branch,
-            name,
-            force,
-            approved_sources,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::AddSubmodule {
-                    url,
-                    path,
-                    branch,
-                    name,
-                    force,
-                    approved_sources,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::UpdateSubmodules {
-            repo_id,
-            approved_sources,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::UpdateSubmodules { approved_sources },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::CheckSubmoduleLoadTrust { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::SubmoduleLoadTrustChecked {
-                repo_id,
-                path,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadSubmodule {
-            repo_id,
-            path,
-            approved_sources,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::LoadSubmodule {
-                    path,
-                    approved_sources,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ChangeSubmodulePointer {
-            repo_id,
-            path,
-            reference,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ChangeSubmodulePointer { path, reference },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RemoveSubmodule { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::RemoveSubmodule { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::StageHunk { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::StageHunk,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::UnstageHunk { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::UnstageHunk,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ApplyWorktreePatch {
-            repo_id, reverse, ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ApplyWorktreePatch { reverse },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::Commit { repo_id, .. } => {
-            send(Msg::Internal(crate::msg::InternalMsg::CommitFinished {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            }))
-        }
-        Effect::CommitAmend { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::CommitAmendFinished {
-                repo_id,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SafePushAfterCommit {
-            repo_id, context, ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::SafePushAfterCommitFinished {
-                repo_id,
-                context,
-                auth: None,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::FetchAll { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::FetchAll,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PruneMergedBranches { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PruneMergedBranches,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PruneLocalTags { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PruneLocalTags,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::Pull { repo_id, mode, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::Pull { mode },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PullBranch {
-            repo_id,
-            remote,
-            branch,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PullBranch { remote, branch },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::MergeRef { repo_id, reference } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::MergeRef { reference },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SquashRef { repo_id, reference } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::SquashRef { reference },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::Push { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::Push,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PushAfterCommit {
-            repo_id,
-            target,
-            set_upstream,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PushAfterCommit {
-                    target,
-                    set_upstream,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ForcePush { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ForcePush,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::ForcePushWithLease { repo_id, lease, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::ForcePushWithLease { lease },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PushSetUpstream {
-            repo_id,
-            remote,
-            branch,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PushSetUpstream { remote, branch },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SetUpstreamBranch {
-            repo_id,
-            branch,
-            upstream,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::SetUpstreamBranch { branch, upstream },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::UnsetUpstreamBranch { repo_id, branch } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::UnsetUpstreamBranch { branch },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::DeleteRemoteBranch {
-            repo_id,
-            remote,
-            branch,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::DeleteRemoteBranch { remote, branch },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::DeleteRemoteBranches {
-            repo_id,
-            remote,
-            branches,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::DeleteRemoteBranches { remote, branches },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::Reset {
-            repo_id,
-            target,
-            mode,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::Reset { mode, target },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SquashCommits {
-            repo_id,
-            oldest,
-            expected_head,
-            message,
-            count,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::SquashCommits {
-                    oldest,
-                    expected_head,
-                    message,
-                    count,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::Rebase { repo_id, onto } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::Rebase { onto },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RebaseContinue { repo_id, .. } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::RebaseContinue,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RebaseAbort { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::RebaseAbort,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadInteractiveRebaseSetup { repo_id, base } => send(Msg::Internal(
-            crate::msg::InternalMsg::InteractiveRebaseSetupLoaded {
-                repo_id,
-                base,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LoadInteractiveCherryPickMessages { repo_id, ids } => send(Msg::Internal(
-            crate::msg::InternalMsg::InteractiveCherryPickMessagesLoaded {
-                repo_id,
-                requested_ids: ids,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::InteractiveRebase {
-            repo_id,
-            base,
-            entries: _,
-            interactive,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::InteractiveRebase { base, interactive },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::InteractiveCherryPick { repo_id, entries } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::InteractiveCherryPick { entries },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::MergeAbort { repo_id } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::MergeAbort,
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::CreateTag {
-            repo_id,
-            name,
-            target,
-            message,
-            annotated,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::CreateTag {
-                    name,
-                    target,
-                    message,
-                    annotated,
-                },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::DeleteTag { repo_id, name } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::DeleteTag { name },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::PushTag {
-            repo_id,
-            remote,
-            name,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::PushTag { remote, name },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::DeleteRemoteTag {
-            repo_id,
-            remote,
-            name,
-            ..
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::DeleteRemoteTag { remote, name },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::AddRemote { repo_id, name, url } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::AddRemote { name, url },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::RemoveRemote { repo_id, name } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::RemoveRemote { name },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::SetRemoteUrl {
-            repo_id,
-            name,
-            url,
-            kind,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::SetRemoteUrl { name, url, kind },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::CheckoutConflictSide {
-            repo_id,
-            path,
-            side,
-        } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::CheckoutConflict { path, side },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::AcceptConflictDeletion { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::AcceptConflictDeletion { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::CheckoutConflictBase { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::CheckoutConflictBase { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-        Effect::LaunchMergetool { repo_id, path } => send(Msg::Internal(
-            crate::msg::InternalMsg::RepoCommandFinished {
-                repo_id,
-                command: RepoCommandKind::LaunchMergetool { path },
-                result: Err(git_unavailable_error(runtime)),
-            },
-        )),
-    }
 }
 
 pub(super) fn schedule_effect(
@@ -1365,11 +167,16 @@ pub(super) fn schedule_effect(
     msg_tx: StoreWorkerSender,
     effect: Effect,
 ) {
+    #[cfg(any(test, feature = "test-support"))]
+    let _test_scope = super::test_support::TestTaskScope::enter(Arc::clone(&msg_tx.test_tasks));
     let EffectExecutors {
         executor,
         repo_load_executor,
+        worktree_scan_executor,
         session_persist_executor,
         metadata_executor,
+        signature_executor,
+        history_find_executor,
     } = executors;
 
     if effect_requires_available_git(&effect) {
@@ -1378,12 +185,66 @@ pub(super) fn schedule_effect(
             state.git_runtime.clone()
         };
         if !runtime.is_available() {
-            send_unavailable_git_effect_result(thread_state, &msg_tx, effect, &runtime);
+            unavailable::send_unavailable_git_effect_result(
+                thread_state,
+                &msg_tx,
+                effect,
+                &runtime,
+            );
             return;
         }
     }
 
     match effect {
+        Effect::Filesystem(request) => {
+            super::executor::filesystem_executor().spawn(move || {
+                // The engine ticks once per item and every dispatch deep-copies
+                // AppState, so an unthrottled thousand-file drop spends longer
+                // cloning state than moving files -- and starves the progress
+                // bar the ticks exist to drive. Only the newest tick is ever
+                // read, so dropping the ones in between loses nothing; the last
+                // one is held back and flushed so the bar ends where it should.
+                let mut last_sent: Option<std::time::Instant> = None;
+                let mut withheld: Option<gitcomet_core::filesystem::Progress> = None;
+                let result = gitcomet_core::filesystem::global()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .execute(request, |progress| {
+                        let now = std::time::Instant::now();
+                        if last_sent
+                            .is_none_or(|sent| now.duration_since(sent) >= FILESYSTEM_PROGRESS_TICK)
+                        {
+                            last_sent = Some(now);
+                            withheld = None;
+                            util::send_or_log(&msg_tx, Msg::FilesystemProgress(progress));
+                        } else {
+                            withheld = Some(progress);
+                        }
+                    });
+                if let Some(progress) = withheld {
+                    util::send_or_log(&msg_tx, Msg::FilesystemProgress(progress));
+                }
+                util::send_or_log(&msg_tx, Msg::FilesystemFinished(result));
+            });
+        }
+        Effect::UpdateRepositoryPreferences {
+            repo_id,
+            key,
+            update,
+        } => {
+            session_persist_executor.spawn(move || {
+                if let Err(error) = msg_tx.preferences.update(key, &update) {
+                    util::send_or_log(
+                        &msg_tx,
+                        Msg::Internal(crate::msg::InternalMsg::SessionPersistFailed {
+                            repo_id: Some(repo_id),
+                            action: "updating repository preferences",
+                            error: error.to_string(),
+                        }),
+                    );
+                }
+            });
+        }
         Effect::PersistSession { repo_id, action } => {
             let Some(session_file_path) = session::default_session_file_path_for_effect() else {
                 return;
@@ -1436,6 +297,21 @@ pub(super) fn schedule_effect(
             mode,
             action,
         } => {
+            // Opening defaults cannot precede shared-identity migration. Real
+            // opened repositories use the shared preference writer instead.
+            if repo_id.is_some_and(|id| {
+                let state = thread_state.read().unwrap_or_else(|e| e.into_inner());
+                state
+                    .repos
+                    .iter()
+                    .find(|repo| repo.id == id)
+                    .is_some_and(|repo| {
+                        repo.shared_preferences.is_some()
+                            || !matches!(repo.open, crate::model::Loadable::Ready(()))
+                    })
+            }) {
+                return;
+            }
             let Some(session_file_path) = session::default_session_file_path_for_effect() else {
                 return;
             };
@@ -1485,6 +361,22 @@ pub(super) fn schedule_effect(
             updates,
             action,
         } => {
+            let updates = {
+                let state = thread_state.read().unwrap_or_else(|e| e.into_inner());
+                updates
+                    .into_iter()
+                    .filter(|(path, _)| {
+                        !state.repos.iter().any(|repo| {
+                            repo.spec.workdir == *path
+                                && (repo.shared_preferences.is_some()
+                                    || !matches!(repo.open, crate::model::Loadable::Ready(())))
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            if updates.is_empty() {
+                return;
+            }
             let Some(session_file_path) = session::default_session_file_path_for_effect() else {
                 return;
             };
@@ -1520,24 +412,7 @@ pub(super) fn schedule_effect(
         Effect::CancelRepoLoads {
             repo_id,
             load_epoch,
-        } => {
-            let matched_token = repo_task_tokens
-                .get(&repo_id)
-                .is_some_and(|token| token.load_epoch == load_epoch);
-            repo_load_trace::trace!(
-                "cancel_repo_loads_effect repo_id={:?} load_epoch={} matched_token={}",
-                repo_id,
-                load_epoch,
-                matched_token
-            );
-            if repo_task_tokens
-                .get(&repo_id)
-                .is_some_and(|token| token.load_epoch == load_epoch)
-                && let Some(token) = repo_task_tokens.remove(&repo_id)
-            {
-                token.cancel();
-            }
-        }
+        } => load_tokens::cancel_repo_loads(repo_task_tokens, repo_id, load_epoch),
         Effect::CancelGitOperation { operation_id, .. } => {
             let _ = gitcomet_core::git_operation::cancel(operation_id);
         }
@@ -1589,6 +464,27 @@ pub(super) fn schedule_effect(
                     repos,
                     msg_tx,
                     repo_id,
+                    cancellation,
+                );
+            }
+        }
+        Effect::LoadUncommittedLineStats {
+            repo_id,
+            generation,
+            status,
+            large_files,
+        } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_uncommitted_line_stats(
+                    repo_load_executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    generation,
+                    status,
+                    large_files,
                     cancellation,
                 );
             }
@@ -1645,6 +541,42 @@ pub(super) fn schedule_effect(
                 );
             }
         }
+        Effect::HistoryAuthors(work) => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, work.repo_id)
+            {
+                history_authors::schedule(repos, msg_tx, work, cancellation);
+            }
+        }
+        Effect::HistoryFind(work) => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, work.repo_id)
+            {
+                history_find::schedule(history_find_executor, repos, msg_tx, work, cancellation);
+            }
+        }
+        Effect::IndexedHistory(work) => {
+            let repo_id = work.repo_id();
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                indexed_history::schedule(repo_load_executor, repos, msg_tx, work, cancellation);
+            }
+        }
+        Effect::DiffSession(work) => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, work.repo_id)
+            {
+                diff_session::schedule(
+                    repo_load_executor,
+                    repos,
+                    Arc::clone(backend),
+                    msg_tx,
+                    work,
+                    cancellation,
+                );
+            }
+        }
         Effect::LoadLog {
             repo_id,
             seq,
@@ -1652,24 +584,19 @@ pub(super) fn schedule_effect(
             author,
             limit,
             cursor,
-        } => {
-            if let Some((msg_tx, cancellation)) =
-                log_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
-            {
-                repo_load::schedule_load_log(
-                    repo_load_executor,
-                    repos,
-                    msg_tx,
-                    repo_id,
-                    seq,
-                    scope,
-                    author,
-                    limit,
-                    cursor,
-                    cancellation,
-                );
-            }
-        }
+        } => load_tokens::load_log(
+            repo_load_executor,
+            thread_state,
+            repos,
+            repo_task_tokens,
+            msg_tx,
+            repo_id,
+            seq,
+            scope,
+            author,
+            limit,
+            cursor,
+        ),
         Effect::LoadTags { repo_id } => {
             if let Some((msg_tx, cancellation)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
@@ -1718,8 +645,9 @@ pub(super) fn schedule_effect(
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
+                let encoding = repo_load::file_encoding_override(thread_state, repo_id, &path);
                 repo_load::schedule_load_conflict_file(
-                    executor, repos, msg_tx, repo_id, path, mode,
+                    executor, repos, msg_tx, repo_id, path, mode, encoding,
                 );
             }
         }
@@ -1734,25 +662,92 @@ pub(super) fn schedule_effect(
             repo_id,
             path,
             contents,
+            expected_contents,
             stage,
+            completion,
         } => repo_commands::schedule_save_worktree_file(
-            executor, repos, msg_tx, repo_id, path, contents, stage,
+            super::executor::filesystem_executor(),
+            repos,
+            msg_tx,
+            repo_id,
+            repo_commands::SaveWorktreeFileRequest {
+                path,
+                contents,
+                expected_contents,
+                stage,
+                completion,
+            },
         ),
         Effect::AppendGitignorePatterns { repo_id, patterns } => {
             repo_commands::schedule_append_gitignore_patterns(
-                executor, repos, msg_tx, repo_id, patterns,
+                super::executor::filesystem_executor(),
+                repos,
+                msg_tx,
+                repo_id,
+                patterns,
+            )
+        }
+        Effect::RunLargeFileCommand {
+            repo_id,
+            command,
+            auth,
+        } => repo_commands::schedule_large_file_command(
+            executor, repos, msg_tx, repo_id, command, auth,
+        ),
+        Effect::LoadLfsLocks { repo_id } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_lfs_locks(executor, repos, msg_tx, repo_id, cancellation);
+            }
+        }
+        Effect::LoadAnnexWhereis { repo_id, key } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_annex_whereis(
+                    metadata_executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    key,
+                    cancellation,
+                );
+            }
+        }
+        Effect::LoadAnnexUnused { repo_id } => {
+            if let Some((msg_tx, cancellation)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_load_annex_unused(
+                    executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    cancellation,
+                );
+            }
+        }
+        Effect::AppendGitattributesRule { repo_id, rule } => {
+            repo_commands::schedule_append_gitattributes_rule(
+                super::executor::filesystem_executor(),
+                repos,
+                msg_tx,
+                repo_id,
+                rule,
             )
         }
         Effect::LoadFileHistory {
             repo_id,
             path,
             limit,
+            cursor,
         } => {
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
                 repo_load::schedule_load_file_history(
-                    executor, repos, msg_tx, repo_id, path, limit,
+                    executor, repos, msg_tx, repo_id, path, limit, cursor,
                 );
             }
         }
@@ -1783,18 +778,20 @@ pub(super) fn schedule_effect(
         Effect::LoadWorktreeDirty {
             repo_id,
             workdir,
+            scope,
             files_for,
         } => {
             if let Some((msg_tx, cancellation)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
                 repo_load::schedule_load_worktree_dirty(
-                    repo_load_executor,
+                    worktree_scan_executor,
                     backend.clone(),
                     repos,
                     msg_tx,
                     repo_id,
                     workdir,
+                    scope,
                     files_for,
                     cancellation,
                 );
@@ -1826,10 +823,35 @@ pub(super) fn schedule_effect(
                 );
             }
         }
-        Effect::LoadFileBrowser { repo_id, source } => {
+        Effect::LoadLargeFileSupport { repo_id } => {
             if let Some((msg_tx, cancellation)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
+                repo_load::schedule_load_large_file_support(
+                    metadata_executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    cancellation,
+                );
+            }
+        }
+        Effect::LoadFileBrowser { repo_id, source } => {
+            if let Some((msg_tx, cancellation)) = load_tokens::file_browser_load_context(
+                thread_state,
+                repo_task_tokens,
+                msg_tx,
+                repo_id,
+            ) {
+                let options = {
+                    let state = thread_state.read().unwrap_or_else(|e| e.into_inner());
+                    state
+                        .repos
+                        .iter()
+                        .find(|r| r.id == repo_id)
+                        .map(|r| repo_load::explorer_listing::Options::from(&r.file_browser))
+                        .unwrap_or_default()
+                };
                 repo_load::schedule_load_file_browser(
                     repo_load_executor,
                     repos,
@@ -1837,6 +859,7 @@ pub(super) fn schedule_effect(
                     repo_id,
                     source,
                     cancellation,
+                    options,
                 );
             }
         }
@@ -1894,13 +917,44 @@ pub(super) fn schedule_effect(
             );
         }
         Effect::LoadCommitDetails { repo_id, commit_id } => {
-            if let Some((msg_tx, _)) =
-                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
-            {
-                repo_load::schedule_load_commit_details(
-                    executor, repos, msg_tx, repo_id, commit_id,
+            if let Some((msg_tx, slot)) = load_tokens::commit_details_load_context(
+                thread_state,
+                repo_task_tokens,
+                msg_tx,
+                repo_id,
+            ) {
+                commit_details::schedule(
+                    executor,
+                    &slot,
+                    repos,
+                    Arc::clone(thread_state),
+                    msg_tx,
+                    repo_id,
+                    commit_id,
                 );
             }
+        }
+        Effect::VerifyCommitSignatures {
+            repo_id,
+            epoch,
+            batch,
+            cancellation,
+            commit_ids,
+            formats,
+        } => {
+            // Signature requests have their own lifetime: staging and tab switches
+            // cancel repo loads, but must not silently lose pending verification.
+            repo_load::schedule_verify_commit_signatures(
+                signature_executor,
+                repos,
+                msg_tx,
+                repo_id,
+                epoch,
+                batch,
+                cancellation,
+                commit_ids,
+                formats,
+            );
         }
         Effect::LoadHoverCommitMessage { repo_id, commit_id } => {
             if let Some((msg_tx, _)) =
@@ -1920,17 +974,32 @@ pub(super) fn schedule_effect(
                 );
             }
         }
+        Effect::ResolveCommitLookup {
+            repo_id,
+            reference,
+            purpose,
+            request,
+        } => {
+            if let Some((msg_tx, _)) =
+                repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
+            {
+                repo_load::schedule_resolve_commit_lookup(
+                    executor, repos, msg_tx, repo_id, reference, purpose, request,
+                );
+            }
+        }
         Effect::LoadRangeFiles {
             repo_id,
             from,
             to,
+            options,
             request,
         } => {
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
                 repo_load::schedule_load_range_files(
-                    executor, repos, msg_tx, repo_id, from, to, request,
+                    executor, repos, msg_tx, repo_id, from, to, options, request,
                 );
             }
         }
@@ -1992,12 +1061,19 @@ pub(super) fn schedule_effect(
             repo_id,
             commit_id,
             path,
+            content_preview,
         } => {
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
                 repo_load::schedule_open_file_at_commit(
-                    executor, repos, msg_tx, repo_id, commit_id, path,
+                    executor,
+                    repos,
+                    msg_tx,
+                    repo_id,
+                    commit_id,
+                    path,
+                    content_preview,
                 );
             }
         }
@@ -2005,14 +1081,22 @@ pub(super) fn schedule_effect(
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
-                repo_load::schedule_load_diff(executor, repos, msg_tx, repo_id, target);
+                let encoding = target.file_path().and_then(|path| {
+                    repo_load::file_encoding_override(thread_state, repo_id, path)
+                });
+                repo_load::schedule_load_diff(executor, repos, msg_tx, repo_id, target, encoding);
             }
         }
         Effect::LoadDiffFile { repo_id, target } => {
             if let Some((msg_tx, _)) =
                 repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
-                repo_load::schedule_load_diff_file(executor, repos, msg_tx, repo_id, target);
+                let encoding = target.file_path().and_then(|path| {
+                    repo_load::file_encoding_override(thread_state, repo_id, path)
+                });
+                repo_load::schedule_load_diff_file(
+                    executor, repos, msg_tx, repo_id, target, encoding,
+                );
             }
         }
         Effect::LoadDiffPreviewTextFile {
@@ -2102,56 +1186,56 @@ pub(super) fn schedule_effect(
             preview_text_side,
             load_submodule_summary,
             load_file_image,
-        } => {
-            if let Some((target, target_rev)) = selected_diff_target(thread_state, repo_id)
-                && let Some((msg_tx, cancellation)) =
-                    repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
-            {
-                repo_load::schedule_load_selected_diff(
-                    executor,
-                    repos,
-                    Arc::clone(thread_state),
-                    msg_tx,
-                    repo_id,
-                    target,
-                    target_rev,
-                    cancellation,
-                    repo_load::SelectedDiffLoadOptions {
-                        load_patch_diff,
-                        load_file_text,
-                        preview_text_side,
-                        load_submodule_summary,
-                        load_file_image,
-                    },
-                );
-            }
-        }
+        } => load_tokens::load_selected_diff(
+            executor,
+            thread_state,
+            repos,
+            repo_task_tokens,
+            msg_tx,
+            repo_id,
+            load_patch_diff,
+            load_file_text,
+            preview_text_side,
+            load_submodule_summary,
+            load_file_image,
+        ),
         Effect::LoadSelectedConflictFile { repo_id, mode } => {
             if let Some(path) = selected_conflict_file_path(thread_state, repo_id)
                 && let Some((msg_tx, _)) =
                     repo_load_context(thread_state, repo_task_tokens, msg_tx, repo_id)
             {
+                let encoding = repo_load::file_encoding_override(thread_state, repo_id, &path);
                 repo_load::schedule_load_conflict_file(
-                    executor, repos, msg_tx, repo_id, path, mode,
+                    executor, repos, msg_tx, repo_id, path, mode, encoding,
                 );
             }
         }
         Effect::CheckoutBranch { repo_id, name } => {
-            repo_actions::schedule_checkout_branch(executor, repos, msg_tx, repo_id, name);
+            repo_actions::schedule_checkout_branch(
+                executor,
+                repos,
+                backend.clone(),
+                msg_tx,
+                repo_id,
+                name,
+            );
         }
         Effect::CheckoutRemoteBranch {
             repo_id,
             remote,
             branch,
             local_branch,
+            mode,
         } => repo_actions::schedule_checkout_remote_branch(
             executor,
             repos,
+            backend.clone(),
             msg_tx,
             repo_id,
             remote,
             branch,
             local_branch,
+            mode,
         ),
         Effect::CheckoutCommit { repo_id, commit_id } => {
             repo_actions::schedule_checkout_commit(executor, repos, msg_tx, repo_id, commit_id);
@@ -2162,13 +1246,41 @@ pub(super) fn schedule_effect(
             commit,
             mainline,
             summary,
+            auth,
         } => {
             repo_commands::schedule_cherry_pick_commit(
-                executor, repos, msg_tx, repo_id, commit_id, commit, mainline, summary,
+                executor, repos, msg_tx, repo_id, commit_id, commit, mainline, summary, auth,
             );
         }
-        Effect::RevertCommit { repo_id, commit_id } => {
-            repo_actions::schedule_revert_commit(executor, repos, msg_tx, repo_id, commit_id);
+        Effect::RevertCommit {
+            repo_id,
+            commit_id,
+            commit,
+            mainline,
+            summary,
+            auth,
+        } => {
+            repo_commands::schedule_revert_commit(
+                executor, repos, msg_tx, repo_id, commit_id, commit, mainline, summary, auth,
+            );
+        }
+        Effect::ApplyFileChange {
+            repo_id,
+            target,
+            commit,
+            commit_retry,
+            auth,
+        } => {
+            repo_commands::schedule_apply_file_change(
+                executor,
+                repos,
+                msg_tx,
+                repo_id,
+                target,
+                commit,
+                commit_retry,
+                auth,
+            );
         }
         Effect::CreateBranch {
             repo_id,
@@ -2181,18 +1293,34 @@ pub(super) fn schedule_effect(
             repo_id,
             name,
             target,
+            force,
         } => {
             repo_actions::schedule_create_branch_and_checkout(
-                executor, repos, msg_tx, repo_id, name, target,
+                executor,
+                repos,
+                backend.clone(),
+                msg_tx,
+                repo_id,
+                name,
+                target,
+                force,
             );
         }
         Effect::RenameBranch {
             repo_id,
             old_name,
             new_name,
+            force,
         } => {
             repo_actions::schedule_rename_branch(
-                executor, repos, msg_tx, repo_id, old_name, new_name,
+                executor,
+                repos,
+                backend.clone(),
+                msg_tx,
+                repo_id,
+                old_name,
+                new_name,
+                force,
             );
         }
         Effect::DeleteBranch { repo_id, name } => {
@@ -2208,9 +1336,12 @@ pub(super) fn schedule_effect(
         } => {
             repo_actions::schedule_delete_branches(executor, repos, msg_tx, repo_id, names, force);
         }
-        Effect::CloneRepo { url, dest, auth } => {
-            clone::schedule_clone_repo(executor, msg_tx, url, dest, auth)
-        }
+        Effect::CloneRepo {
+            url,
+            dest,
+            remote_url_policy,
+            auth,
+        } => clone::schedule_clone_repo(executor, msg_tx, url, dest, remote_url_policy, auth),
         Effect::AbortCloneRepo { dest } => clone::schedule_abort_clone_repo(msg_tx, dest),
         Effect::ExportPatch {
             repo_id,
@@ -2242,17 +1373,47 @@ pub(super) fn schedule_effect(
             branch,
             name,
             force,
+            remote_url_policy,
         } => {
             repo_commands::schedule_check_submodule_add_trust(
-                executor, repos, msg_tx, repo_id, url, path, branch, name, force,
+                executor,
+                repos,
+                msg_tx,
+                repo_id,
+                repo_commands::CheckSubmoduleAddTrustRequest {
+                    url,
+                    path,
+                    branch,
+                    name,
+                    force,
+                    remote_url_policy,
+                },
             );
         }
-        Effect::CheckSubmoduleUpdateTrust { repo_id } => {
-            repo_commands::schedule_check_submodule_update_trust(executor, repos, msg_tx, repo_id);
+        Effect::CheckSubmoduleUpdateTrust {
+            repo_id,
+            remote_url_policy,
+        } => {
+            repo_commands::schedule_check_submodule_update_trust(
+                executor,
+                repos,
+                msg_tx,
+                repo_id,
+                remote_url_policy,
+            );
         }
-        Effect::CheckSubmoduleLoadTrust { repo_id, path } => {
+        Effect::CheckSubmoduleLoadTrust {
+            repo_id,
+            path,
+            remote_url_policy,
+        } => {
             repo_commands::schedule_check_submodule_load_trust(
-                executor, repos, msg_tx, repo_id, path,
+                executor,
+                repos,
+                msg_tx,
+                repo_id,
+                path,
+                remote_url_policy,
             );
         }
         Effect::AddSubmodule {
@@ -2263,6 +1424,7 @@ pub(super) fn schedule_effect(
             name,
             force,
             approved_sources,
+            remote_url_policy,
             auth,
         } => {
             repo_commands::schedule_add_submodule(
@@ -2277,6 +1439,7 @@ pub(super) fn schedule_effect(
                     name,
                     force,
                     approved_sources,
+                    remote_url_policy,
                     auth,
                 },
             );
@@ -2284,6 +1447,7 @@ pub(super) fn schedule_effect(
         Effect::UpdateSubmodules {
             repo_id,
             approved_sources,
+            remote_url_policy,
             auth,
         } => {
             repo_commands::schedule_update_submodules(
@@ -2292,6 +1456,7 @@ pub(super) fn schedule_effect(
                 msg_tx,
                 repo_id,
                 approved_sources,
+                remote_url_policy,
                 auth,
             );
         }
@@ -2299,6 +1464,7 @@ pub(super) fn schedule_effect(
             repo_id,
             path,
             approved_sources,
+            remote_url_policy,
             auth,
         } => {
             repo_commands::schedule_load_submodule(
@@ -2308,6 +1474,7 @@ pub(super) fn schedule_effect(
                 repo_id,
                 path,
                 approved_sources,
+                remote_url_policy,
                 auth,
             );
         }
@@ -2361,16 +1528,22 @@ pub(super) fn schedule_effect(
         Effect::Commit {
             repo_id,
             message,
+            identity,
             auth,
         } => {
-            repo_actions::schedule_commit(executor, repos, msg_tx, repo_id, message, auth);
+            repo_actions::schedule_commit(
+                executor, repos, msg_tx, repo_id, message, identity, auth,
+            );
         }
         Effect::CommitAmend {
             repo_id,
             message,
+            identity,
             auth,
         } => {
-            repo_actions::schedule_commit_amend(executor, repos, msg_tx, repo_id, message, auth);
+            repo_actions::schedule_commit_amend(
+                executor, repos, msg_tx, repo_id, message, identity, auth,
+            );
         }
         Effect::SafePushAfterCommit {
             repo_id,
@@ -2386,15 +1559,44 @@ pub(super) fn schedule_effect(
             prune,
             auth,
         } => repo_commands::schedule_fetch_all(executor, repos, msg_tx, repo_id, prune, auth),
+        Effect::FetchRefspecs {
+            repo_id,
+            remote,
+            refspecs,
+            auth,
+        } => repo_commands::schedule_fetch_refspecs(
+            executor, repos, msg_tx, repo_id, remote, refspecs, auth,
+        ),
         Effect::PruneMergedBranches { repo_id } => {
             repo_commands::schedule_prune_merged_branches(executor, repos, msg_tx, repo_id)
         }
         Effect::PruneLocalTags { repo_id } => {
             repo_commands::schedule_prune_local_tags(executor, repos, msg_tx, repo_id)
         }
+        Effect::CheckRepoMaintenance { repo_id } => {
+            repo_commands::schedule_check_maintenance(repos, msg_tx, repo_id)
+        }
+        Effect::PersistRepoMaintenanceSnooze { common_dir } => {
+            session_persist_executor.spawn(move || {
+                if let Err(error) = session::persist_repo_maintenance_snooze(&common_dir) {
+                    util::send_or_log(
+                        &msg_tx,
+                        Msg::Internal(crate::msg::InternalMsg::SessionPersistFailed {
+                            repo_id: None,
+                            action: "remember the maintenance reminder",
+                            error: error.to_string(),
+                        }),
+                    );
+                }
+            });
+        }
+        Effect::RunMaintenance { repo_id } => {
+            repo_commands::schedule_run_maintenance(repos, Arc::clone(backend), msg_tx, repo_id)
+        }
         Effect::Pull {
             repo_id,
             mode,
+            prune,
             auth,
         } => repo_commands::schedule_pull(
             executor,
@@ -2402,6 +1604,7 @@ pub(super) fn schedule_effect(
             msg_tx,
             repo_id,
             mode,
+            prune,
             tracking_branch_context(thread_state, repo_id),
             auth,
         ),
@@ -2409,6 +1612,7 @@ pub(super) fn schedule_effect(
             repo_id,
             remote,
             branch,
+            prune,
             auth,
         } => repo_commands::schedule_pull_branch(
             executor,
@@ -2417,6 +1621,7 @@ pub(super) fn schedule_effect(
             repo_id,
             remote,
             branch,
+            prune,
             current_branch_context(thread_state, repo_id),
             auth,
         ),
@@ -2425,6 +1630,37 @@ pub(super) fn schedule_effect(
         }
         Effect::SquashRef { repo_id, reference } => {
             repo_commands::schedule_squash_ref(executor, repos, msg_tx, repo_id, reference);
+        }
+        Effect::PushWithTags {
+            repo_id,
+            request,
+            auth,
+        } => {
+            repo_commands::schedule_push_with_tags(executor, repos, msg_tx, repo_id, request, auth)
+        }
+        Effect::PreviewTagPush {
+            repo_id,
+            request,
+            generation,
+            cancellation,
+        } => {
+            util::spawn_with_repo(executor, repos, repo_id, msg_tx, move |repo, tx| {
+                if cancellation.is_cancelled() {
+                    return;
+                }
+                let result = repo.preview_tag_push(&request, &cancellation);
+                if !cancellation.is_cancelled() {
+                    util::send_or_log(
+                        &tx,
+                        Msg::Internal(crate::msg::InternalMsg::TagPushPreviewLoaded {
+                            repo_id,
+                            mode: request.mode,
+                            generation,
+                            result,
+                        }),
+                    );
+                }
+            });
         }
         Effect::Push { repo_id, auth } => repo_commands::schedule_push(
             executor,
@@ -2558,11 +1794,13 @@ pub(super) fn schedule_effect(
             entries,
             interactive,
         ),
-        Effect::InteractiveCherryPick { repo_id, entries } => {
-            repo_commands::schedule_interactive_cherry_pick(
-                executor, repos, msg_tx, repo_id, entries,
-            )
-        }
+        Effect::InteractiveCherryPick {
+            repo_id,
+            entries,
+            commit,
+        } => repo_commands::schedule_interactive_cherry_pick(
+            executor, repos, msg_tx, repo_id, entries, commit,
+        ),
         Effect::MergeAbort { repo_id } => {
             repo_commands::schedule_merge_abort(executor, repos, msg_tx, repo_id)
         }
@@ -2592,8 +1830,21 @@ pub(super) fn schedule_effect(
         } => repo_commands::schedule_delete_remote_tag(
             executor, repos, msg_tx, repo_id, remote, name, auth,
         ),
-        Effect::AddRemote { repo_id, name, url } => {
-            repo_commands::schedule_add_remote(executor, repos, msg_tx, repo_id, name, url);
+        Effect::AddRemote {
+            repo_id,
+            name,
+            url,
+            remote_url_policy,
+        } => {
+            repo_commands::schedule_add_remote(
+                executor,
+                repos,
+                msg_tx,
+                repo_id,
+                name,
+                url,
+                remote_url_policy,
+            );
         }
         Effect::RemoveRemote { repo_id, name } => {
             repo_commands::schedule_remove_remote(executor, repos, msg_tx, repo_id, name);
@@ -2603,8 +1854,16 @@ pub(super) fn schedule_effect(
             name,
             url,
             kind,
+            remote_url_policy,
         } => repo_commands::schedule_set_remote_url(
-            executor, repos, msg_tx, repo_id, name, url, kind,
+            executor,
+            repos,
+            msg_tx,
+            repo_id,
+            name,
+            url,
+            kind,
+            remote_url_policy,
         ),
         Effect::CheckoutConflictSide {
             repo_id,
@@ -2647,23 +1906,4 @@ pub(super) fn schedule_effect(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn abort_clone_repo_does_not_require_available_git() {
-        assert!(!effect_requires_available_git(&Effect::AbortCloneRepo {
-            dest: std::path::PathBuf::from("/tmp/example"),
-        }));
-    }
-
-    #[test]
-    fn cancel_git_operation_does_not_require_available_git() {
-        assert!(!effect_requires_available_git(
-            &Effect::CancelGitOperation {
-                repo_id: RepoId(1),
-                operation_id: gitcomet_core::git_operation::GitOperationId(7),
-            }
-        ));
-    }
-}
+mod tests;

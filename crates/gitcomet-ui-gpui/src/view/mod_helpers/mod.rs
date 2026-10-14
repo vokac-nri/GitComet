@@ -13,26 +13,239 @@ pub(super) fn toast_fade_out_duration() -> Duration {
     Duration::from_millis(TOAST_FADE_OUT_MS)
 }
 
-pub(super) fn toast_total_lifetime(ttl: Duration) -> Duration {
-    toast_fade_in_duration() + ttl + toast_fade_out_duration()
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::view) struct SelectedBranch {
     pub(in crate::view) repo_id: RepoId,
-    pub(in crate::view) section: BranchSection,
-    pub(in crate::view) name: String,
+    pub(in crate::view) target: BranchMenuTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) enum PushRequest {
+    Push,
+    SetUpstream { remote: String },
+    NoRemotes,
+    NotReady,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) enum PullRequest {
+    Pull,
+    NoRemotes,
+    NotReady,
+}
+
+/// What opening the repository's remote in a web browser should do.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::view) enum RemoteWebRequest {
+    NotReady,
+    NoRemotes,
+    NoWebPage,
+    Open(super::permalink::RemoteWebPage),
+    /// Several remotes have a page; `origin`'s comes first.
+    Choose(Vec<super::permalink::RemoteWebPage>),
+}
+
+impl RemoteWebRequest {
+    /// Why nothing can be opened, for a disabled palette or menu row.
+    pub(in crate::view) fn unavailable_reason(&self) -> Option<&'static str> {
+        match self {
+            Self::NotReady => Some("The repository is still loading"),
+            Self::NoRemotes => Some("Add a remote first"),
+            Self::NoWebPage => Some("No remote URL points to a web page"),
+            Self::Open(_) | Self::Choose(_) => None,
+        }
+    }
+
+    /// The same, as the sentence a shortcut press shows in a toast.
+    pub(in crate::view) fn unavailable_message(&self) -> Option<&'static str> {
+        match self {
+            Self::NotReady => Some("This repository's remotes are still loading."),
+            Self::NoRemotes => Some("This repository has no remotes to open in a web browser."),
+            Self::NoWebPage => Some("None of this repository's remote URLs points to a web page."),
+            Self::Open(_) | Self::Choose(_) => None,
+        }
+    }
+}
+
+pub(in crate::view) fn head_is_detached(repo: &RepoState) -> bool {
+    matches!(&repo.head_branch, Loadable::Ready(head) if head.is_empty() || head == "HEAD")
+}
+
+/// Whether the checked-out branch has a confirmed live remote-tracking
+/// upstream. This remains false until the remote-branch list is loaded, and a
+/// detached HEAD carries no branch to hold one.
+pub(in crate::view) fn head_branch_has_live_upstream(repo: &RepoState) -> bool {
+    let (Loadable::Ready(head), Loadable::Ready(branches)) = (&repo.head_branch, &repo.branches)
+    else {
+        return false;
+    };
+    let Some(upstream) = branches
+        .iter()
+        .find(|branch| branch.name == *head)
+        .and_then(|branch| branch.upstream.as_ref())
+    else {
+        return false;
+    };
+    let Some(remote_branches) = repo.remote_branches.ready() else {
+        return false;
+    };
+    remote_branches
+        .iter()
+        .any(|candidate| candidate.remote == upstream.remote && candidate.name == upstream.branch)
+}
+
+/// The toolbar and menu can pull through annex on adjusted branches, or
+/// through Git when the current branch has a live remote-tracking upstream.
+pub(in crate::view) fn pull_enabled(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> bool {
+    repo.annex_takes_over_pull_push(settings) || head_branch_has_live_upstream(repo)
+}
+
+/// Decide whether Pull can run. A configured upstream is actionable only when
+/// its exact remote-tracking ref exists; a future upstream configured by
+/// "Create new" must be pushed before Pull is offered. For a branch with no
+/// configured upstream, the backend can still use the preferred remote, while
+/// detached HEAD falls back to Git's own diagnostics.
+pub(in crate::view) fn pull_request(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> PullRequest {
+    if pull_enabled(repo, settings) {
+        return PullRequest::Pull;
+    }
+    let Loadable::Ready(head) = &repo.head_branch else {
+        return PullRequest::NotReady;
+    };
+    if head.is_empty() || head == "HEAD" {
+        return PullRequest::Pull;
+    }
+    let Loadable::Ready(branches) = &repo.branches else {
+        return PullRequest::NotReady;
+    };
+    if branches
+        .iter()
+        .find(|branch| branch.name == *head)
+        .is_some_and(|branch| branch.upstream.is_some())
+    {
+        return PullRequest::NotReady;
+    }
+
+    let Loadable::Ready(remotes) = &repo.remotes else {
+        return PullRequest::NotReady;
+    };
+    if remotes.is_empty() {
+        return PullRequest::NoRemotes;
+    }
+    PullRequest::Pull
+}
+
+/// Whether the repository is part-way through a merge.
+pub(in crate::view) fn merge_in_progress(repo: &RepoState) -> bool {
+    matches!(&repo.merge_commit_message, Loadable::Ready(Some(_)))
+}
+
+/// The rebase, apply, cherry-pick, or revert the repository is part-way
+/// through, if any. `rebase_in_progress` stands in until the sequencer state loads.
+pub(in crate::view) fn active_sequencer_state(
+    repo: &RepoState,
+) -> gitcomet_core::services::SequencerState {
+    match repo.sequencer_state {
+        Loadable::Ready(state) => state,
+        _ if matches!(&repo.rebase_in_progress, Loadable::Ready(true)) => {
+            gitcomet_core::services::SequencerState::RebaseOrApply
+        }
+        _ => gitcomet_core::services::SequencerState::None,
+    }
+}
+
+/// Decide whether an interactive Push can run immediately or first needs the
+/// existing set-upstream prompt. A configured upstream can name a branch that
+/// has not been pushed yet; that still gives Push an exact destination.
+pub(in crate::view) fn push_request(
+    repo: &RepoState,
+    settings: &gitcomet_state::model::LargeFileSettings,
+) -> PushRequest {
+    let Loadable::Ready(head) = &repo.head_branch else {
+        return PushRequest::NotReady;
+    };
+    // Preserve Git's own detached-HEAD diagnostics; there is no local branch
+    // for which GitComet could offer to set an upstream.
+    if head.is_empty() || head == "HEAD" {
+        return PushRequest::Push;
+    }
+    let Loadable::Ready(branches) = &repo.branches else {
+        return PushRequest::NotReady;
+    };
+    let Some(branch) = branches.iter().find(|branch| branch.name == *head) else {
+        return PushRequest::NotReady;
+    };
+    // When the annex integration handles Push it does not need an upstream
+    // on the adjusted branch. Plain Git still needs the upstream prompt.
+    if branch.upstream.is_some() || repo.annex_takes_over_pull_push(settings) {
+        return PushRequest::Push;
+    }
+
+    let Loadable::Ready(remotes) = &repo.remotes else {
+        return PushRequest::NotReady;
+    };
+    if remotes.is_empty() {
+        return PushRequest::NoRemotes;
+    }
+    let remote = remotes
+        .iter()
+        .find(|remote| remote.name == "origin")
+        .unwrap_or(&remotes[0])
+        .name
+        .clone();
+    PushRequest::SetUpstream { remote }
+}
+
+/// Decide what "Open remote in web browser" does: open the one remote with a
+/// web page, or let the user choose when several have one.
+pub(in crate::view) fn remote_web_request(repo: &RepoState) -> RemoteWebRequest {
+    let Loadable::Ready(remotes) = &repo.remotes else {
+        return RemoteWebRequest::NotReady;
+    };
+    if remotes.is_empty() {
+        return RemoteWebRequest::NoRemotes;
+    }
+    let mut pages = super::permalink::remote_web_pages(remotes);
+    match pages.len() {
+        0 => RemoteWebRequest::NoWebPage,
+        1 => RemoteWebRequest::Open(pages.remove(0)),
+        _ => RemoteWebRequest::Choose(pages),
+    }
+}
+
+pub(in crate::view) fn selected_remote_branch_is_missing(
+    state: &AppState,
+    selected_branch: Option<&SelectedBranch>,
+) -> bool {
+    let Some(selected) = selected_branch else {
+        return false;
+    };
+    let BranchMenuTarget::Remote { remote, branch } = &selected.target else {
+        return false;
+    };
+    let Some(repo) = state.repos.iter().find(|repo| repo.id == selected.repo_id) else {
+        return true;
+    };
+    let Loadable::Ready(branches) = &repo.remote_branches else {
+        return false;
+    };
+    !branches
+        .iter()
+        .any(|candidate| candidate.remote == *remote && candidate.name == *branch)
 }
 
 pub(in crate::view) fn selected_branch_label_color(theme: AppTheme) -> gpui::Rgba {
-    theme.colors.foreground.emphasis
+    theme.colors.interaction.selected_foreground
 }
 
 pub(in crate::view) fn selected_branch_row_bg(theme: AppTheme) -> gpui::Rgba {
-    with_alpha(
-        theme.colors.foreground.primary,
-        if theme.is_dark { 0.16 } else { 0.10 },
-    )
+    theme.colors.interaction.selected_background
 }
 
 /// Which ref a history row should mark as the one the sidebar selected.
@@ -41,8 +254,7 @@ pub(in crate::view) fn selected_branch_row_bg(theme: AppTheme) -> gpui::Rgba {
 /// display text silently missed whichever form the row happened to use.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::view) struct SelectedHistoryBranch {
-    pub(in crate::view) section: BranchSection,
-    pub(in crate::view) name: SharedString,
+    pub(in crate::view) target: BranchMenuTarget,
 }
 
 pub(in crate::view) fn selected_branch_for_history_row(
@@ -60,8 +272,7 @@ pub(in crate::view) fn selected_branch_for_history_row(
     }
 
     Some(SelectedHistoryBranch {
-        section: selected_branch.section,
-        name: SharedString::from(selected_branch.name.clone()),
+        target: selected_branch.target.clone(),
     })
 }
 
@@ -204,19 +415,20 @@ impl DiffViewMode {
 pub(super) enum RenderedPreviewKind {
     Svg,
     Markdown,
+    Diagram,
 }
 
 impl RenderedPreviewKind {
     pub(super) fn rendered_label(self) -> &'static str {
         match self {
             Self::Svg => "Image",
-            Self::Markdown => "Preview",
+            Self::Markdown | Self::Diagram => "Preview",
         }
     }
 
     pub(super) fn source_label(self) -> &'static str {
         match self {
-            Self::Svg => "Code",
+            Self::Svg | Self::Diagram => "Code",
             Self::Markdown => "Text",
         }
     }
@@ -225,6 +437,7 @@ impl RenderedPreviewKind {
         match self {
             Self::Svg => "svg_diff_view_image",
             Self::Markdown => "markdown_diff_view_preview",
+            Self::Diagram => "diagram_diff_view_preview",
         }
     }
 
@@ -232,6 +445,7 @@ impl RenderedPreviewKind {
         match self {
             Self::Svg => "svg_diff_view_toggle",
             Self::Markdown => "markdown_diff_view_toggle",
+            Self::Diagram => "diagram_diff_view_toggle",
         }
     }
 
@@ -239,6 +453,7 @@ impl RenderedPreviewKind {
         match self {
             Self::Svg => "svg_diff_view_code",
             Self::Markdown => "markdown_diff_view_text",
+            Self::Diagram => "diagram_diff_view_code",
         }
     }
 }
@@ -253,6 +468,10 @@ pub(super) enum RenderedPreviewMode {
 pub(super) struct RenderedPreviewModes {
     pub(super) svg: RenderedPreviewMode,
     pub(super) markdown: RenderedPreviewMode,
+    pub(super) diagram: RenderedPreviewMode,
+    /// Markdown shows Source because a file's diff was too big to render, not
+    /// because the reader chose it; the next file gets Rendered back.
+    markdown_budget_fallback: bool,
 }
 
 impl Default for RenderedPreviewModes {
@@ -260,6 +479,8 @@ impl Default for RenderedPreviewModes {
         Self {
             svg: RenderedPreviewMode::Rendered,
             markdown: RenderedPreviewMode::Rendered,
+            diagram: RenderedPreviewMode::Rendered,
+            markdown_budget_fallback: false,
         }
     }
 }
@@ -269,13 +490,34 @@ impl RenderedPreviewModes {
         match kind {
             RenderedPreviewKind::Svg => self.svg,
             RenderedPreviewKind::Markdown => self.markdown,
+            RenderedPreviewKind::Diagram => self.diagram,
         }
     }
 
     pub(super) fn set(&mut self, kind: RenderedPreviewKind, mode: RenderedPreviewMode) {
         match kind {
             RenderedPreviewKind::Svg => self.svg = mode,
-            RenderedPreviewKind::Markdown => self.markdown = mode,
+            RenderedPreviewKind::Diagram => self.diagram = mode,
+            RenderedPreviewKind::Markdown => {
+                self.markdown = mode;
+                self.markdown_budget_fallback = false;
+            }
+        }
+    }
+
+    /// Show this markdown file as source because its diff is too big to
+    /// render, leaving the reader's own choice to come back with the next file.
+    pub(super) fn fall_back_to_markdown_source(&mut self) {
+        if self.markdown == RenderedPreviewMode::Rendered {
+            self.markdown = RenderedPreviewMode::Source;
+            self.markdown_budget_fallback = true;
+        }
+    }
+
+    /// The file that needed the fallback is gone.
+    pub(super) fn end_markdown_budget_fallback(&mut self) {
+        if std::mem::take(&mut self.markdown_budget_fallback) {
+            self.markdown = RenderedPreviewMode::Rendered;
         }
     }
 }
@@ -310,6 +552,8 @@ pub(super) fn preview_path_rendered_kind(path: &std::path::Path) -> Option<Rende
         Some(RenderedPreviewKind::Svg)
     } else if is_markdown_path(path) {
         Some(RenderedPreviewKind::Markdown)
+    } else if gitcomet_diagrams::DiagramKind::for_path(path).is_some() {
+        Some(RenderedPreviewKind::Diagram)
     } else {
         None
     }
@@ -320,7 +564,8 @@ pub(super) fn diff_target_rendered_preview_kind(
 ) -> Option<RenderedPreviewKind> {
     let path = match target? {
         DiffTarget::WorkingTree { path, .. } => path.as_path(),
-        DiffTarget::Commit {
+        DiffTarget::Commit { path, .. } => path.as_path(),
+        DiffTarget::CommitRange {
             path: Some(path), ..
         } => path.as_path(),
         _ => return None,
@@ -341,8 +586,10 @@ pub(super) fn main_diff_rendered_preview_toggle_kind(
         // `is_file_preview` covers the content view an SVG gets when it is
         // opened from the file explorer: the picture is the whole file there
         // too, and Code is how you reach its source (and the editor).
-        RenderedPreviewKind::Svg if wants_file_diff || wants_collapsed_diff || is_file_preview => {
-            Some(RenderedPreviewKind::Svg)
+        kind @ (RenderedPreviewKind::Svg | RenderedPreviewKind::Diagram)
+            if wants_file_diff || wants_collapsed_diff || is_file_preview =>
+        {
+            Some(kind)
         }
         RenderedPreviewKind::Markdown if wants_file_diff || is_file_preview => {
             Some(RenderedPreviewKind::Markdown)
@@ -658,6 +905,8 @@ impl DiffTextPairMatch {
 }
 
 pub(super) struct DiffTextHitbox {
+    /// A picture represents its entire logical text range as one selectable item.
+    pub(super) atomic: bool,
     pub(super) bounds: Bounds<Pixels>,
     pub(super) layout_key: u64,
     pub(super) source_visible_ix: usize,
@@ -677,6 +926,9 @@ pub(super) struct DiffTextHitbox {
     /// several visual lines, so a click resolves through the layout they were
     /// painted with rather than through an x offset along one shaped line.
     pub(super) wrapped: Option<DiffTextWrappedHit>,
+    /// A table row's cells, each painted and hit-tested on its own; the row's
+    /// `bounds` then span them all.
+    pub(super) cells: Vec<DiffTextHitbox>,
 }
 
 /// A selectable document range painted by something other than text.
@@ -707,6 +959,7 @@ pub(super) struct ConflictTextHitbox {
 /// The wrapped layout a row painted, plus what it takes to read offsets back
 /// in row coordinates.
 pub(super) struct DiffTextWrappedHit {
+    pub(super) tab_width: usize,
     pub(super) layout: gpui::TextLayout,
     /// The row's raw text, when tabs were expanded for painting.
     pub(super) untabbed: Option<SharedString>,
@@ -715,8 +968,12 @@ pub(super) struct DiffTextWrappedHit {
 impl DiffTextWrappedHit {
     /// Offset in row coordinates for an offset in the painted text.
     pub(super) fn row_offset(&self, painted_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_row_offset(raw, painted_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_row_offset(tab_width, raw, painted_offset)
+            }
             None => painted_offset,
         }
     }
@@ -724,8 +981,12 @@ impl DiffTextWrappedHit {
     /// Offset in the painted text for an offset in row coordinates — the
     /// inverse of [`Self::row_offset`].
     pub(super) fn painted_offset(&self, row_offset: usize) -> usize {
+        let tab_width = self.tab_width;
+
         match &self.untabbed {
-            Some(raw) => crate::view::rows::markdown_flow_painted_offset(raw, row_offset),
+            Some(raw) => {
+                crate::view::rows::markdown_flow_painted_offset(tab_width, raw, row_offset)
+            }
             None => row_offset,
         }
     }
@@ -769,13 +1030,26 @@ pub struct GitCometView {
     pub(super) _poller: Poller,
     pub(super) _ui_model_subscription: gpui::Subscription,
     pub(super) _activation_subscription: gpui::Subscription,
+    pub(super) _window_bounds_subscription: gpui::Subscription,
     pub(super) _appearance_subscription: gpui::Subscription,
     pub(super) _terminal_keystroke_interceptor: gpui::Subscription,
     pub(super) _auth_prompt_username_input_subscription: gpui::Subscription,
     pub(super) _auth_prompt_secret_input_subscription: gpui::Subscription,
+    pub(super) _toast_errors_subscription: gpui::Subscription,
     pub(super) _open_repo_input_subscription: gpui::Subscription,
+    pub(super) _home_search_input_subscription: gpui::Subscription,
     pub(super) view_mode: GitCometViewMode,
+    pub(super) workspace_id: Option<gitcomet_state::session::WorkspaceId>,
+    pub(super) persisted_workspace_repo_paths: Vec<std::path::PathBuf>,
+    pub(super) persisted_workspace_active_repository: Option<std::path::PathBuf>,
+    pub(super) window_placement: Option<gitcomet_state::session::PortableWindowPlacement>,
+    pub(super) native_window_title: String,
+    /// Always the global preference; the override lives beside it.
     pub(super) theme_mode: ThemeMode,
+    /// The window's workspace theme, winning over `theme_mode` when set.
+    pub(super) workspace_theme_mode: Option<ThemeMode>,
+    /// Cached so the theme can be re-resolved from snapshot paths with no `Window`.
+    pub(super) window_appearance: gpui::WindowAppearance,
     pub(super) theme: AppTheme,
     pub(super) title_bar: Entity<TitleBarView>,
     pub(super) sidebar_pane: Entity<SidebarPaneView>,
@@ -784,6 +1058,23 @@ pub struct GitCometView {
     pub(super) repo_tabs_bar: Entity<RepoTabsBarView>,
     pub(super) action_bar: Entity<ActionBarView>,
     pub(super) bottom_status_bar: Entity<BottomStatusBarView>,
+    /// Present only when an extension is registered.
+    pub(super) window_gates: Option<super::window_gates::WindowGates>,
+    pub(super) window_gated: bool,
+    pub(super) extension_window: Option<super::extension_host::ExtensionWindow>,
+    /// Scopes the active extension view, so the diff keys can find the
+    /// hosted pane inside it (see `diff_shortcut_target`).
+    pub(super) repository_view_focus: FocusHandle,
+    /// Present only when an extension registers a repository view.
+    pub(super) repository_views: Option<super::repository_views::RepositoryViewRouter>,
+    /// Present only when an extension registers a details tab.
+    pub(super) details_tabs:
+        Option<super::repository_views::ViewRouter<gitcomet_extension_api::DetailsTabDescriptor>>,
+    /// Present only when an extension registers a sidebar tab.
+    pub(super) sidebar_tabs:
+        Option<super::repository_views::ViewRouter<gitcomet_extension_api::SidebarTabDescriptor>>,
+    /// Present only when an extension registers a sidebar section.
+    pub(super) sidebar_sections: Option<super::repository_views::SidebarSections>,
     pub(super) tooltip_host: Entity<TooltipHost>,
     pub(super) toast_host: Entity<ToastHost>,
     pub(super) history_refs_hover_host: Entity<HistoryRefsHoverHost>,
@@ -791,25 +1082,46 @@ pub struct GitCometView {
     pub(super) popover_host: Entity<PopoverHost>,
     pub(super) command_palette: Entity<super::command_palette::CommandPaletteView>,
     pub(super) command_palette_open: bool,
+    pub(super) reveal_commit_dialog: Entity<super::reveal_commit::RevealCommitView>,
+    pub(super) reveal_commit_open: bool,
+    /// Focus to hand back when an overlay opened from a background window
+    /// closes. Shared by the command palette and the Reveal Commit dialog.
     pub(super) pre_palette_focus: Option<FocusHandle>,
+    pub(super) focused_diff_pane: Option<gitcomet_extension_api::DiffPane>,
     pub(super) focused_mergetool_bootstrap: Option<FocusedMergetoolBootstrap>,
     pub(super) submodule_diff_bootstrap: Option<SubmoduleDiffBootstrap>,
     pub(super) deferred_repo_bootstrap: Option<DeferredRepoBootstrap>,
+    pub(super) pending_repo_open_reservations: FxHashMap<std::path::PathBuf, PendingRepoOpen>,
+    pub(super) pending_repo_open_active: Option<std::path::PathBuf>,
     pub(super) startup_repo_bootstrap_pending: bool,
     pub(super) splash_backdrop_image: Arc<gpui::Image>,
 
     pub(super) last_window_size: Size<Pixels>,
     pub(super) ui_window_size_last_seen: Size<Pixels>,
+    /// Workdirs last published to the window registry; rebuilt only when the
+    /// repo list changes rather than collected on every store snapshot.
+    pub(super) synced_repo_paths: std::sync::Arc<[std::path::PathBuf]>,
     pub(super) ui_settings_persist_seq: u64,
+    pub(super) workspace_persist_seq: u64,
+    #[cfg(test)]
+    pub(super) ui_settings_persist_requests_for_test: u64,
     pub(super) last_repo_activation_dispatch_at: FxHashMap<RepoId, Instant>,
     /// Set when a deactivation was caused by a move/resize grab we requested, so
     /// the matching re-activation does not trigger a repo refresh.
     pub(super) window_grab_activation_suppressed_at: Option<Instant>,
+    /// Background gpg/ssh-keygen detection. A newer probe supersedes older ones.
+    pub(super) signing_tools_probe_seq: u64,
+    pub(super) signing_tools_probe_in_flight: bool,
+    pub(super) signing_tools_probe_cancellation: gitcomet_core::services::CancellationToken,
+    /// Background `git lfs` / `git annex` detection; rerun after a Git change.
+    pub(super) large_file_tools_probe_in_flight: bool,
 
     pub(super) date_time_format: DateTimeFormat,
     pub(super) timezone: Timezone,
     pub(super) show_timezone: bool,
     pub(super) change_tracking_view: ChangeTrackingView,
+    pub(super) file_list_layout: FileListLayout,
+    pub(super) file_list_sort: crate::view::rows::CommitFileSort,
     pub(super) terminal_preferences: TerminalPreferences,
     pub(super) terminal_sessions: FxHashMap<RepoId, RepoTerminalSession>,
     pub(super) terminal_panel_height: Pixels,
@@ -827,6 +1139,7 @@ pub struct GitCometView {
     /// Which of the bottom panel's contents is currently visible for a repo,
     /// when more than one is open. Absent (and single-panel repos) fall back
     /// to whichever panel is actually open.
+    pub(super) bottom_panel_providers: super::bottom_panel_providers::Providers,
     pub(super) active_bottom_panel: FxHashMap<RepoId, BottomPanelTab>,
     pub(super) commit_push_after_enabled: bool,
     pub(super) diff_scroll_sync: DiffScrollSync,
@@ -836,19 +1149,37 @@ pub struct GitCometView {
     pub(super) annotate_enabled: bool,
     pub(super) diff_reveal_whitespace_chars: bool,
     pub(super) diff_word_wrap: bool,
+    pub(super) diff_tab_size: u8,
     pub(super) diff_show_line_numbers: bool,
     pub(super) auto_save_file_edits: bool,
-    pub(super) markdown_preview_load_remote_images: bool,
+    pub(super) remote_markdown_image_policy: RemoteMarkdownImagePolicy,
+    pub(super) remote_url_policy: RemoteUrlPolicy,
     pub(super) ui_scale_percent: u32,
 
     pub(super) open_repo_panel: bool,
     pub(super) open_repo_input: Entity<components::TextInput>,
+    pub(super) home_search_input: Entity<components::TextInput>,
+    pub(super) home_search_query: String,
+    pub(super) home_rows: super::home::HomeRows,
+    /// Index into `home_rows` in keyboard order (workspaces, then repositories).
+    pub(super) home_selected: Option<usize>,
+    pub(super) home_workspaces_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_repositories_scroll: gpui::UniformListScrollHandle,
+    pub(super) home_pinned_repos: Vec<std::path::PathBuf>,
+    pub(super) home_recent_repos: Vec<std::path::PathBuf>,
     pub(super) external_drag_paths: Option<gpui::ExternalPaths>,
+    pub(super) file_operations: file_operations::FileOperationsUi,
+    pub(super) documents: Entity<documents::DocumentsView>,
+    pub(super) document_picker: Entity<documents::DocumentPicker>,
+    pub(super) documents_active: bool,
+    pub(super) document_routing: documents::Routing,
     pub(super) external_drag_payload: Option<external_drag::ClassifiedExternalPaths>,
     pub(super) external_drag_classification_seq: u64,
     pub(super) external_drag_drop_pending: bool,
 
     pub(super) hover_resize_edge: Option<ResizeEdge>,
+    /// The decorations the last render saw; see `sync_frame_decorations`.
+    pub(super) frame_decorations: Option<gpui::Decorations>,
 
     pub(super) sidebar_collapsed: bool,
     /// Which sidebar section is currently shown in the collapsed-rail popover, if
@@ -876,12 +1207,15 @@ pub struct GitCometView {
 
     pub(super) last_mouse_pos: Point<Pixels>,
     pub(super) pending_terminal_shutdown_prompt: Option<TerminalShutdownPrompt>,
+    pub(super) pending_close_guard_prompt: Option<CloseGuardPrompt>,
     pub(super) pending_unsaved_file_edits_prompt: Option<UnsavedFileEditsPrompt>,
     /// Waits for the dispatched writes to drain before the close/quit it was
     /// asked to retry.
     pub(super) pending_unsaved_file_edits_flush: Option<gpui::Task<()>>,
+    pub(super) pending_file_edits_action: Option<UnsavedFileEditsAction>,
     pub(super) pending_quit_other_views: Vec<gpui::WeakEntity<GitCometView>>,
     pub(super) pending_pull_reconcile_prompt: Option<RepoId>,
+    pub(super) pending_branch_exists_prompt: Option<BranchExistsPromptState>,
     pub(super) pending_force_delete_branch_prompt: Option<(RepoId, String)>,
     pub(super) pending_force_delete_branch_centered: bool,
     pub(super) pending_force_remove_worktree_prompt:
@@ -906,8 +1240,10 @@ pub struct GitCometView {
     pub(super) startup_crash_report: Option<StartupCrashReport>,
     #[cfg(target_os = "macos")]
     pub(super) recent_repos_menu_fingerprint: Vec<std::path::PathBuf>,
+    /// Session file stamp when `recent_repos_menu_fingerprint` was last read.
+    #[cfg(target_os = "macos")]
+    pub(super) recent_repos_session_stamp: Option<gitcomet_state::session::SessionFileStamp>,
 
-    pub(super) error_banner_input: Entity<components::TextInput>,
     pub(super) auth_prompt_username_input: Entity<components::TextInput>,
     pub(super) auth_prompt_secret_input: Entity<components::TextInput>,
     pub(super) auth_prompt_key: Option<String>,
@@ -920,14 +1256,14 @@ pub(super) struct DiffTextLayoutCacheEntry {
 }
 
 mod conflict_resolver_ui_state;
-mod markdown_wrap_cache;
+mod markdown_preview_state;
 mod mode_impls;
 mod status_sections;
 mod three_way;
 mod toasts;
 
 pub(super) use conflict_resolver_ui_state::*;
-pub(super) use markdown_wrap_cache::*;
+pub(super) use markdown_preview_state::*;
 pub use mode_impls::*;
 pub(super) use status_sections::*;
 pub(super) use three_way::*;

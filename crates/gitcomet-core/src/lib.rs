@@ -1,24 +1,49 @@
+pub mod annex;
 pub mod auth;
 pub mod conflict_labels;
 pub mod conflict_output;
 pub mod conflict_session;
 pub mod diff;
 pub mod domain;
+pub mod edit_signature;
+pub mod environment;
 pub mod error;
 pub mod file_diff;
+pub mod filesystem;
+pub mod fs_utils;
 pub mod git_operation;
 pub mod git_ops_trace;
+pub mod git_progress;
+pub mod gitattributes;
 pub mod gitignore;
 pub mod hex;
+pub mod history_find;
+pub mod history_index;
+pub mod identity;
+pub mod large_file_tools;
+pub mod large_files;
+pub mod lfs;
 pub mod merge;
 pub mod merge_extraction;
 pub mod mergetool_trace;
+pub mod op_trace;
 pub mod path_utils;
 pub mod platform;
 pub mod process;
+pub mod remote_url;
 pub mod services;
+pub mod signing_tools;
 pub mod squash;
+pub mod text_format;
+pub mod text_search;
 pub mod text_utils;
+pub mod url_encoding;
 
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_support;
+
+pub mod tag_push;
+
+pub mod history_perf;
+
+pub mod commit_identity;

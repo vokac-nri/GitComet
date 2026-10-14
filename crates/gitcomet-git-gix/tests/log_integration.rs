@@ -1,20 +1,32 @@
 use gitcomet_core::domain::{CommitId, FileStatusKind, HistoryMode, LogCursor};
 use gitcomet_core::error::{ErrorKind, GitFailureId};
 use gitcomet_core::services::GitBackend;
+use gitcomet_core::test_support::git_fixture::{
+    FixtureTimer, LinearCommit, append_config, import_linear_history,
+};
 use gitcomet_git_gix::GixBackend;
 #[path = "support/test_git_env.rs"]
 mod test_git_env;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-#[cfg(windows)]
-use std::sync::OnceLock;
+#[path = "log_integration/authors.rs"]
+mod authors;
+#[path = "log_integration/ref_filter.rs"]
+mod ref_filter;
+#[path = "log_integration/sharing.rs"]
+mod sharing;
+#[path = "log_integration/snapshot_refresh.rs"]
+mod snapshot_refresh;
+#[path = "log_integration/topology.rs"]
+mod topology;
 
 fn run_git(repo: &Path, args: &[&str]) {
     run_git_with_env(repo, args, &[]);
 }
 
 fn run_git_with_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = Command::new("git");
     test_git_env::apply(&mut cmd);
     let cmd = cmd
@@ -28,11 +40,18 @@ fn run_git_with_env(repo: &Path, args: &[&str], envs: &[(&str, &str)]) {
     for (key, value) in envs {
         cmd.env(key, value);
     }
-    let status = cmd.status().expect("git command to run");
-    assert!(status.success(), "git {:?} failed", args);
+    let output = cmd.output().expect("git command to run");
+    assert!(
+        output.status.success(),
+        "git {:?} failed:\nstdout:\n{}\nstderr:\n{}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let _timer = FixtureTimer::new("subprocess", args.first().copied().unwrap_or("git"));
     let mut cmd = Command::new("git");
     test_git_env::apply(&mut cmd);
     let output = cmd
@@ -47,48 +66,6 @@ fn git_stdout(repo: &Path, args: &[&str]) -> String {
         .expect("git command to run");
     assert!(output.status.success(), "git {:?} failed", args);
     String::from_utf8(output.stdout).unwrap().trim().to_string()
-}
-
-#[cfg(windows)]
-fn is_git_shell_startup_failure(text: &str) -> bool {
-    text.contains("sh.exe: *** fatal error -")
-        && (text.contains("couldn't create signal pipe") || text.contains("CreateFileMapping"))
-}
-
-#[cfg(windows)]
-fn git_shell_available_for_integration_tests() -> bool {
-    static AVAILABLE: OnceLock<bool> = OnceLock::new();
-    *AVAILABLE.get_or_init(|| {
-        let output = match Command::new("git")
-            .args(["difftool", "--tool-help"])
-            .output()
-        {
-            Ok(output) => output,
-            Err(_) => return true,
-        };
-        if output.status.success() {
-            return true;
-        }
-        let text = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        !is_git_shell_startup_failure(&text)
-    })
-}
-
-fn require_git_shell_for_remote_tracking_test() -> bool {
-    #[cfg(windows)]
-    {
-        if !git_shell_available_for_integration_tests() {
-            eprintln!(
-                "skipping remote-tracking integration test: Git-for-Windows shell startup failed in this environment"
-            );
-            return false;
-        }
-    }
-    true
 }
 
 fn git_remote_url(path: &Path) -> String {
@@ -135,39 +112,22 @@ fn fast_import_linear_history_with_authors(
     count: usize,
     mut author_at: impl FnMut(usize) -> &'static str,
 ) {
-    let mut stream = String::new();
-    for index in 0..count {
-        let message = format!("c{index}");
-        let timestamp = 1_600_000_000 + index as i64;
-        stream.push_str("commit refs/heads/master\n");
-        stream.push_str(&format!("mark :{}\n", index + 1));
-        stream.push_str(&format!("author {} {timestamp} +0000\n", author_at(index)));
-        stream.push_str(&format!(
-            "committer You <you@example.com> {timestamp} +0000\n"
-        ));
-        stream.push_str(&format!("data {}\n{message}\n", message.len()));
-        if index > 0 {
-            stream.push_str(&format!("from :{}\n", index));
-        }
-        let body = format!("v{index}\n");
-        stream.push_str(&format!(
-            "M 100644 inline file.txt\ndata {}\n{body}",
-            body.len()
-        ));
-    }
-    stream.push_str("done\n");
-
+    let messages: Vec<_> = (0..count).map(|i| format!("c{i}")).collect();
+    let bodies: Vec<_> = (0..count).map(|i| format!("v{i}\n")).collect();
     let mut cmd = Command::new("git");
     test_git_env::apply(&mut cmd);
-    let mut child = cmd
-        .arg("-C")
-        .arg(repo)
-        .args(["fast-import", "--quiet", "--done"])
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .expect("git fast-import to start");
-    std::io::Write::write_all(child.stdin.as_mut().unwrap(), stream.as_bytes()).unwrap();
-    assert!(child.wait().unwrap().success(), "git fast-import failed");
+    cmd.arg("-C").arg(repo);
+    import_linear_history(
+        &mut cmd,
+        "master",
+        (0..count).map(|index| LinearCommit {
+            author: author_at(index),
+            timestamp: 1_600_000_000 + index as i64,
+            message: &messages[index],
+            path: "file.txt",
+            contents: &bodies[index],
+        }),
+    );
     run_git(repo, &["reset", "-q", "--hard", "master"]);
 }
 
@@ -533,7 +493,7 @@ fn every_history_mode_paginates_through_a_resumable_walk() {
                 .log_history_mode_page(mode, 1, cursor.as_ref())
                 .unwrap();
             paged.extend(page.commits.iter().map(|c| c.id.as_ref().to_string()));
-            let Some(next) = page.next_cursor else {
+            let Some(next) = page.next_cursor.clone() else {
                 break;
             };
             assert!(
@@ -572,7 +532,7 @@ fn all_branches_author_filter_resumes_instead_of_re_walking() {
     let first = opened
         .log_history_mode_page_filtered(HistoryMode::AllBranches, Some("You"), 1, None)
         .unwrap();
-    let cursor = first.next_cursor.expect("more to page through");
+    let cursor = first.next_cursor.clone().expect("more to page through");
     assert!(
         cursor.resume_token.is_some(),
         "a filtered all-branches page must resume its walk rather than rebuild it"
@@ -670,9 +630,14 @@ fn merges_only_history_mode_paginates_without_repeating_filtered_merges() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     commit_file_at(repo, "base.txt", "base\n", "base", 1);
 
@@ -748,9 +713,6 @@ fn merges_only_history_mode_paginates_without_repeating_filtered_merges() {
 
 #[test]
 fn log_all_branches_includes_remote_tracking_branches() {
-    if !require_git_shell_for_remote_tracking_test() {
-        return;
-    }
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let origin = dir.path().join("origin.git");
@@ -1176,43 +1138,71 @@ fn a_missing_ancestor_object_still_renders_the_rows_above_it() {
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     run_git(repo, &["init", "-b", "master"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
     fast_import_linear_history(repo, 600);
 
     let root = git_stdout(repo, &["rev-list", "--max-parents=0", "HEAD"]);
-    // fast-import packs; unpack so a single commit object can be removed.
+    // Preserve the 600-commit history without creating 1,800 loose files.
+    // A complete replacement pack omits only the root commit. Disabling delta
+    // reuse prevents a retained object from depending on the omitted object.
+    let _fixture = FixtureTimer::new("setup", "missing-ancestor-pack");
     let pack_dir = repo.join(".git/objects/pack");
-    let packs: Vec<std::path::PathBuf> = std::fs::read_dir(&pack_dir)
+    let packs: Vec<_> = std::fs::read_dir(&pack_dir)
         .unwrap()
-        .filter_map(|entry| {
-            let path = entry.unwrap().path();
-            (path.extension().is_some_and(|ext| ext == "pack")).then_some(path)
-        })
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "pack"))
         .collect();
-    for pack in &packs {
-        // The pack has to leave the object store first: `unpack-objects` skips
-        // anything the repository can already find.
-        let bytes = std::fs::read(pack).unwrap();
-        std::fs::remove_file(pack).unwrap();
-        std::fs::remove_file(pack.with_extension("idx")).ok();
-        let mut cmd = Command::new("git");
-        test_git_env::apply(&mut cmd);
-        let mut child = cmd
-            .arg("-C")
-            .arg(repo)
-            .args(["unpack-objects", "-q"])
-            .stdin(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::io::Write::write_all(child.stdin.as_mut().unwrap(), &bytes).unwrap();
-        assert!(child.wait().unwrap().success(), "git unpack-objects failed");
+    let objects = git_stdout(
+        repo,
+        &[
+            "cat-file",
+            "--batch-all-objects",
+            "--batch-check=%(objectname)",
+        ],
+    );
+    let retained = objects
+        .lines()
+        .filter(|oid| *oid != root)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    let mut cmd = Command::new("git");
+    test_git_env::apply(&mut cmd);
+    let mut child = cmd
+        .arg("-C")
+        .arg(repo)
+        .args(["pack-objects", "--no-reuse-delta", "--no-reuse-object"])
+        .arg(pack_dir.join("pack"))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    std::io::Write::write_all(&mut child.stdin.take().unwrap(), retained.as_bytes()).unwrap();
+    assert!(child.wait().unwrap().success(), "replacement pack failed");
+    for pack in packs {
+        std::fs::remove_file(&pack).unwrap();
+        std::fs::remove_file(pack.with_extension("idx")).unwrap();
     }
-
-    let loose = repo.join(".git/objects").join(&root[..2]).join(&root[2..]);
-    assert!(loose.exists(), "expected a loose root commit at {loose:?}");
-    std::fs::remove_file(&loose).unwrap();
+    let mut cmd = Command::new("git");
+    test_git_env::apply(&mut cmd);
+    assert!(
+        !cmd.arg("-C")
+            .arg(repo)
+            .args(["cat-file", "-e", &root])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    drop(_fixture);
+    let _operation = FixtureTimer::new("backend", "open-and-log-above-missing-ancestor");
 
     let opened = GixBackend.open(repo).unwrap();
     let page = opened
@@ -1236,9 +1226,14 @@ fn log_all_branches_includes_nonstandard_ref_namespaces() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1276,9 +1271,14 @@ fn log_all_branches_does_not_include_tag_only_tips() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1321,9 +1321,14 @@ fn log_all_branches_ignores_non_commit_refs() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1369,9 +1374,14 @@ fn detached_head_reports_head_as_current_branch() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1389,9 +1399,14 @@ fn log_head_page_limit_sets_next_cursor_and_supports_pagination() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1437,9 +1452,14 @@ fn log_head_page_resume_hint_follows_first_parent_after_merge_commit() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "base\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1511,9 +1531,14 @@ fn log_head_page_exact_limit_has_no_next_cursor() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1537,9 +1562,14 @@ fn repeated_log_head_page_reuses_cached_commit_arcs_and_invalidates_on_head_chan
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1585,9 +1615,14 @@ fn zero_limit_log_pages_return_empty_without_cursor() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1615,9 +1650,14 @@ fn log_file_page_follows_renames() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::create_dir_all(repo.join("docs")).unwrap();
     std::fs::write(repo.join("docs/old name.txt"), "line 1\n").unwrap();
@@ -1682,9 +1722,14 @@ fn log_file_page_cursor_paginates_rename_follow_history() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::create_dir_all(repo.join("docs")).unwrap();
     std::fs::write(repo.join("docs/old name.txt"), "line 1\n").unwrap();
@@ -1768,9 +1813,14 @@ fn log_file_page_exact_limit_has_no_next_cursor() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -1794,9 +1844,14 @@ fn commit_details_reports_merge_parents_and_file_changes() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("base.txt"), "base\n").unwrap();
     run_git(repo, &["add", "base.txt"]);
@@ -1980,9 +2035,14 @@ fn commit_details_reports_root_and_rename_file_changes() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
     run_git(repo, &["config", "diff.renames", "true"]);
 
     std::fs::write(repo.join("old name.txt"), "hello\n").unwrap();
@@ -2000,6 +2060,11 @@ fn commit_details_reports_root_and_rename_file_changes() {
     );
     let rename_id = git_stdout(repo, &["rev-parse", "HEAD"]);
 
+    let blob = gitcomet_core::domain::ObjectHash(
+        git_stdout(repo, &["rev-parse", "HEAD:new name.txt"]).into(),
+    );
+    let regular = Some(gitcomet_core::domain::FileMode::Regular);
+
     let backend = GixBackend;
     let opened = backend.open(repo).unwrap();
     let root_details = opened
@@ -2012,15 +2077,22 @@ fn commit_details_reports_root_and_rename_file_changes() {
     assert_eq!(root_details.id, CommitId(root_id.into()));
     assert_eq!(root_details.message, "root commit");
     assert_eq!(root_details.parent_ids, Vec::<CommitId>::new());
+    // The root commit adds the file's one line; the rename changes no line,
+    // so it has no edit.
+    let mut added = gitcomet_core::edit_signature::EditSignatureBuilder::default();
+    added.added_lines(b"hello\n");
     assert_eq!(
         root_details.files,
-        vec![gitcomet_core::domain::CommitFileChange {
-            path: Path::new("old name.txt").to_path_buf(),
-            kind: FileStatusKind::Added,
-            is_submodule: false,
-            additions: Some(1),
-            deletions: Some(0),
-        }]
+        vec![
+            gitcomet_core::domain::CommitFileChange::new(
+                Path::new("old name.txt").to_path_buf(),
+                FileStatusKind::Added
+            )
+            .with_line_counts(Some(1), Some(0))
+            .with_edit(added.finish())
+            .with_ids(None, Some(blob.clone()))
+            .with_modes(None, regular)
+        ]
     );
 
     assert_eq!(rename_details.id, CommitId(rename_id.into()));
@@ -2028,13 +2100,17 @@ fn commit_details_reports_root_and_rename_file_changes() {
     assert_eq!(rename_details.parent_ids.len(), 1);
     assert_eq!(
         rename_details.files,
-        vec![gitcomet_core::domain::CommitFileChange {
-            path: Path::new("new name.txt").to_path_buf(),
-            kind: FileStatusKind::Renamed,
-            is_submodule: false,
-            additions: Some(0),
-            deletions: Some(0),
-        }]
+        vec![
+            gitcomet_core::domain::CommitFileChange::new(
+                Path::new("new name.txt").to_path_buf(),
+                FileStatusKind::Renamed
+            )
+            .with_line_counts(Some(0), Some(0))
+            // A pure rename keeps its content; the source is recorded.
+            .with_old_path(Some(Path::new("old name.txt").to_path_buf()))
+            .with_ids(Some(blob.clone()), Some(blob))
+            .with_modes(regular, regular)
+        ]
     );
 }
 
@@ -2044,9 +2120,14 @@ fn reflog_head_returns_recent_entries_with_indices() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "one\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -2107,9 +2188,14 @@ fn log_all_branches_includes_older_stash_reflog_entries() {
     let repo = dir.path();
 
     run_git(repo, &["init", "-b", "main"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    append_config(
+        repo,
+        &[
+            ("user.email", "you@example.com"),
+            ("user.name", "You"),
+            ("commit.gpgsign", "false"),
+        ],
+    );
 
     std::fs::write(repo.join("a.txt"), "base\n").unwrap();
     run_git(repo, &["add", "a.txt"]);
@@ -2460,4 +2546,118 @@ fn author_filter_full_page_does_not_advertise_more_without_another_match() {
         .unwrap();
     assert_eq!(more.commits.len(), 1);
     assert!(more.next_cursor.is_some());
+}
+
+// gix's rev-parse infers the hash kind of a hexadecimal name from its digit
+// count (up to 40 digits is SHA-1), so a name wider than the repository's own
+// digest used to compare hashes of different widths and panic once objects
+// were packed. Such names must fail cleanly, and ordinary abbreviations must
+// keep resolving.
+#[test]
+fn hex_revision_lookup_is_safe_across_object_widths() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "you@example.com"]);
+    run_git(&repo, &["config", "user.name", "You"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    commit_file_at(&repo, "file.txt", "contents", "init", 1);
+    run_git(&repo, &["gc", "-q"]);
+
+    let opened = GixBackend.open(&repo).unwrap();
+    let head = opened.head_commit_id().unwrap().expect("a head commit");
+    assert_eq!(head.as_ref().len(), 40, "fixture must use SHA-1 ids");
+
+    let short = opened
+        .resolve_commit(&CommitId(head.as_ref()[..12].into()))
+        .expect("abbreviated id resolves");
+    assert_eq!(short.id, head);
+    let suffixed = opened
+        .resolve_commit(&CommitId(format!("{}~0", &head.as_ref()[..12]).into()))
+        .expect("suffixed abbreviated id resolves");
+    assert_eq!(suffixed.id, head);
+
+    let shortened = head.as_ref()[..10].to_owned();
+    let described = opened
+        .resolve_commit(&CommitId(format!("v1.0-3-g{shortened}").into()))
+        .expect("short describe form resolves");
+    assert_eq!(described.id, head);
+
+    // A reference named with an over-wide hex run still resolves, with or
+    // without a navigation suffix.
+    let wide_ref = "b".repeat(41);
+    run_git(&repo, &["branch", &wide_ref]);
+    let wide_target = opened
+        .resolve_commit(&CommitId(wide_ref.clone().into()))
+        .expect("over-wide hex reference resolves");
+    assert_eq!(wide_target.id, head);
+    let navigated = opened
+        .resolve_commit(&CommitId(format!("{wide_ref}~0").into()))
+        .expect("over-wide hex reference with a navigation suffix resolves");
+    assert_eq!(navigated.id, head);
+
+    for spec in [
+        format!("{head}a"),
+        format!("{head}aa"),
+        "a".repeat(64),
+        format!("{head}a^{{commit}}"),
+        // gix also decodes hex candidates out of describe forms; an over-wide
+        // candidate used to compare hashes of different widths and panic.
+        format!("v1.0-g{head}a"),
+        format!("{head}a-x"),
+        format!("foo-g{head}a"),
+        format!("v1.0-3-g{head}a"),
+        format!("{head}a..x"),
+        format!("{head}a@.x"),
+        format!("{wide_ref}..{head}a"),
+        format!("{wide_ref}~0..{head}aa"),
+    ] {
+        assert!(
+            opened
+                .resolve_commit(&CommitId(spec.clone().into()))
+                .is_err(),
+            "over-wide hex spec {spec} must fail cleanly"
+        );
+    }
+}
+
+// Specs whose reference name contains a hex run wider than the repository
+// digest must not reach gix's parser, but their suffixes still resolve like
+// git: a `~`/`^` suffix applies to the resolved reference, and `@{n}` reads
+// its reflog.
+#[test]
+fn over_wide_hex_reference_names_resolve_with_suffixes_and_reflogs() {
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "you@example.com"]);
+    run_git(&repo, &["config", "user.name", "You"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    commit_file_at(&repo, "file.txt", "one\n", "one", 1);
+    commit_file_at(&repo, "file.txt", "two\n", "two", 2);
+
+    let wide = "b".repeat(41);
+    let named = format!("release-{wide}");
+    run_git(&repo, &["branch", &wide]);
+    run_git(&repo, &["branch", &named]);
+    run_git(&repo, &["gc", "-q"]);
+
+    let head = git_stdout(&repo, &["rev-parse", "HEAD"]);
+    let parent = git_stdout(&repo, &["rev-parse", "HEAD~1"]);
+    let opened = GixBackend.open(&repo).unwrap();
+
+    let navigated = opened
+        .resolve_commit(&CommitId(format!("{wide}~1").into()))
+        .expect("over-wide hex reference with ~1 resolves");
+    assert_eq!(navigated.id.as_ref(), parent);
+    let named_navigated = opened
+        .resolve_commit(&CommitId(format!("{named}~1").into()))
+        .expect("named reference containing an over-wide hex run resolves");
+    assert_eq!(named_navigated.id.as_ref(), parent);
+    let reflogged = opened
+        .resolve_commit(&CommitId(format!("{wide}@{{0}}").into()))
+        .expect("over-wide hex reference with a reflog selector resolves");
+    assert_eq!(reflogged.id.as_ref(), head);
 }

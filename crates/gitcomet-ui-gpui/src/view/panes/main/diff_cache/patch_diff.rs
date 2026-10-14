@@ -205,6 +205,14 @@ impl PagedPatchDiffRows {
         Some(page)
     }
 
+    /// A line's text without building (and caching) its page.
+    pub(in crate::view) fn line_text(
+        &self,
+        ix: usize,
+    ) -> Option<gitcomet_core::domain::SharedLineText> {
+        self.diff.lines.get(ix).map(|line| line.text.clone())
+    }
+
     fn row_at(&self, ix: usize) -> Option<AnnotatedDiffLine> {
         if ix >= self.diff.lines.len() {
             return None;
@@ -618,7 +626,7 @@ struct PatchInlineVisibleRun {
 #[derive(Clone, Debug, Default)]
 pub(in crate::view) struct PatchInlineVisibleMap {
     visible_len: usize,
-    visible_runs: Vec<PatchInlineVisibleRun>,
+    visible_runs: Arc<[PatchInlineVisibleRun]>,
 }
 
 impl PatchInlineVisibleMap {
@@ -659,7 +667,7 @@ impl PatchInlineVisibleMap {
 
         Self {
             visible_len,
-            visible_runs,
+            visible_runs: visible_runs.into(),
         }
     }
 
@@ -668,7 +676,7 @@ impl PatchInlineVisibleMap {
     }
 
     pub(in crate::view) fn for_each_visible_src_ix(&self, mut visit: impl FnMut(usize, usize)) {
-        for run in &self.visible_runs {
+        for run in self.visible_runs.iter() {
             for offset in 0..run.len {
                 visit(run.start_visible_ix + offset, run.start_src_ix + offset);
             }
@@ -917,10 +925,7 @@ mod tests {
     #[test]
     fn paged_patch_rows_load_pages_on_demand() {
         let diff = Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\
@@ -949,10 +954,7 @@ index 1111111..2222222 100644\n\
     #[test]
     fn paged_patch_split_rows_materialize_prefix_before_full_scan() {
         let diff = Arc::new(Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\
@@ -1013,10 +1015,7 @@ index 1111111..2222222 100644\n\
         }
 
         let diff = Arc::new(Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             text.as_str(),
         ));
         let rows_provider = Arc::new(PagedPatchDiffRows::new(Arc::clone(&diff), 256));
@@ -1054,10 +1053,7 @@ index 1111111..2222222 100644\n\
         }
 
         let diff = Arc::new(Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             text.as_str(),
         ));
         let rows_provider = Arc::new(PagedPatchDiffRows::new(Arc::clone(&diff), 256));
@@ -1083,10 +1079,7 @@ index 1111111..2222222 100644\n\
     #[test]
     fn patch_inline_visible_map_matches_eager_visible_indices() {
         let diff = Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\
@@ -1130,10 +1123,7 @@ index 1111111..2222222 100644\n\
     #[test]
     fn patch_inline_visible_map_build_does_not_load_paged_rows() {
         let diff = Arc::new(Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\
@@ -1163,10 +1153,7 @@ index 1111111..2222222 100644\n\
     #[test]
     fn split_visible_meta_filters_hidden_unified_headers() {
         let diff = Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\
@@ -1199,10 +1186,7 @@ index 1111111..2222222 100644\n\
     #[test]
     fn split_visible_meta_builds_non_empty_scrollbar_markers() {
         let diff = Diff::from_unified(
-            DiffTarget::WorkingTree {
-                path: PathBuf::from("src/lib.rs"),
-                area: DiffArea::Unstaged,
-            },
+            DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Unstaged),
             "\
 diff --git a/src/lib.rs b/src/lib.rs\n\
 index 1111111..2222222 100644\n\

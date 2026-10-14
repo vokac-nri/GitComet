@@ -9,10 +9,18 @@ use gitcomet_core::domain::{
 };
 use gitcomet_core::error::{Error, ErrorKind};
 use gitcomet_core::services::{CancellationToken, Result};
+use gix::error::ResultExt as _;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::convert::Infallible;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+
+mod cancellation;
+mod worker_limit;
+
+#[cfg(test)]
+#[path = "status/cancellation_tests.rs"]
+mod cancellation_tests;
+
+use cancellation::StatusCancellation;
 
 impl GixRepo {
     fn may_have_gitlink_status_supplement(
@@ -72,7 +80,13 @@ impl GixRepo {
         cancellation: &CancellationToken,
     ) -> Result<RepoStatus> {
         cancellation.check_cancelled()?;
-        let repo = self._repo.to_thread_local();
+        let repo = self.status_repo();
+        // Bare repositories can display history, but have no checkout whose
+        // changes we can report. Do not walk the Git directory or compare HEAD
+        // against a missing index (which would report every file as deleted).
+        if repo.workdir().is_none() {
+            return Ok(RepoStatus::default());
+        }
         let index_stamp = repo_index_stamp(&repo);
         let may_have_gitlinks = self.may_have_gitlink_status_supplement(&repo, &index_stamp);
         cancellation.check_cancelled()?;
@@ -96,83 +110,37 @@ impl GixRepo {
         };
         let used_cached_staged = cached_staged.is_some();
 
-        let mut unstaged = Vec::new();
-        let mut has_conflicted_unstaged = false;
-
-        let (staged, index_stamp_after_write) = if let Some(cached_staged) = cached_staged {
-            // Fast path: HEAD and index unchanged — skip Tree→Index comparison and
-            // collect Index→Worktree changes directly without the generic iterator's
-            // extra thread/channel hop.
-            let direct =
-                collect_index_worktree_status_direct(&repo, &mut unstaged, may_have_gitlinks)?;
-            cancellation.check_cancelled()?;
-            has_conflicted_unstaged = direct.has_conflicted_unstaged;
-            (cached_staged, direct.index_stamp_after_write)
+        let staged = if let Some(cached_staged) = cached_staged {
+            cached_staged
         } else {
-            // Full path: run both Tree→Index and Index→Worktree comparisons.
-            cancellation.check_cancelled()?;
-            let platform = repo
-                .status(gix::progress::Discard)
-                .map_err(|e| Error::new(ErrorKind::Backend(format!("gix status platform: {e}"))))?
-                // GitComet supplements gitlink/submodule status separately to match
-                // `git status` parity, so skip gix's default submodule probing on the
-                // common no-submodule path.
-                .index_worktree_submodules(None)
-                .untracked_files(gix::status::UntrackedFiles::Files);
-            let mut staged = Vec::new();
-            let mut iter = platform
-                .into_iter(std::iter::empty::<gix::bstr::BString>())
-                .map_err(|e| Error::new(ErrorKind::Backend(format!("gix status iter: {e}"))))?;
-
-            for item in iter.by_ref() {
-                cancellation.check_cancelled()?;
-                let item = item
-                    .map_err(|e| Error::new(ErrorKind::Backend(format!("gix status item: {e}"))))?;
-
-                match item {
-                    gix::status::Item::IndexWorktree(item) => {
-                        collect_index_worktree_item(
-                            item,
-                            &mut unstaged,
-                            &mut has_conflicted_unstaged,
-                        )?;
-                    }
-
-                    gix::status::Item::TreeIndex(change) => {
-                        collect_tree_index_change(change, &mut staged)?;
-                    }
-                }
-            }
-            let index_stamp_after_write =
-                maybe_persist_status_outcome_changes(iter.into_outcome(), &repo.index_path());
-
-            (staged, index_stamp_after_write)
+            let tree = crate::refs::head_tree_id_or_empty(&repo)?;
+            collect_staged_status_from_tree_index(&repo, &tree)?
         };
-        let final_index_stamp = index_stamp_after_write
-            .clone()
-            .unwrap_or_else(|| index_stamp.clone());
+        cancellation.check_cancelled()?;
+        // Use the same direct worktree walk on the first scan as on cached
+        // scans. The generic status iterator keeps its stat updates private
+        // and can only persist them to disk; status must remain read-only.
+        // This walk retains clean-file stats in memory immediately instead
+        // of hashing touched-but-unchanged files again on the second scan.
+        let mut unstaged = Vec::new();
+        let direct = collect_index_worktree_status_direct(
+            &repo,
+            &self.stat_refreshed_index,
+            &mut unstaged,
+            may_have_gitlinks,
+            cancellation,
+        )?;
+        cancellation.check_cancelled()?;
 
-        if !used_cached_staged || index_stamp_after_write.is_some() {
-            // Status write-back updates only index stat metadata, not staged content. Refresh the
-            // cache stamp so repeated clean refreshes can keep skipping Tree→Index work.
+        if !used_cached_staged {
             *self
                 .tree_index_cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(TreeIndexCacheEntry {
                 head_oid,
-                index_stamp: final_index_stamp,
+                index_stamp,
                 staged: staged.clone(),
             });
-        }
-
-        if used_cached_staged && let Some(updated_index_stamp) = index_stamp_after_write {
-            let mut cache = self
-                .gitlink_status_capability
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if let Some(cached) = cache.as_mut() {
-                cached.index = updated_index_stamp;
-            }
         }
 
         cancellation.check_cancelled()?;
@@ -182,7 +150,7 @@ impl GixRepo {
             may_have_gitlinks,
             staged,
             unstaged,
-            has_conflicted_unstaged,
+            direct.has_conflicted_unstaged,
         )
     }
 
@@ -195,15 +163,24 @@ impl GixRepo {
         cancellation: &CancellationToken,
     ) -> Result<Vec<FileStatus>> {
         cancellation.check_cancelled()?;
-        let repo = self._repo.to_thread_local();
+        let repo = self.status_repo();
+        if repo.workdir().is_none() {
+            return Ok(Vec::new());
+        }
         let index_stamp = repo_index_stamp(&repo);
         let may_have_gitlinks = self.may_have_gitlink_status_supplement(&repo, &index_stamp);
         let mut unstaged = Vec::new();
-        let direct = collect_index_worktree_status_direct(&repo, &mut unstaged, may_have_gitlinks)?;
+        let direct = collect_index_worktree_status_direct(
+            &repo,
+            &self.stat_refreshed_index,
+            &mut unstaged,
+            may_have_gitlinks,
+            cancellation,
+        )?;
         cancellation.check_cancelled()?;
 
         if should_supplement_unmerged_conflicts(
-            repo.state().is_some(),
+            crate::refs::operation_state(&repo)?.is_some(),
             direct.has_conflicted_unstaged,
         ) {
             apply_unmerged_conflicts(&repo, &mut unstaged)?;
@@ -213,6 +190,7 @@ impl GixRepo {
         if may_have_gitlinks {
             supplement_gitlink_status_from_porcelain(
                 &self.spec.workdir,
+                &repo,
                 &mut Vec::new(),
                 &mut unstaged,
             )?;
@@ -232,7 +210,10 @@ impl GixRepo {
         cancellation: &CancellationToken,
     ) -> Result<Vec<FileStatus>> {
         cancellation.check_cancelled()?;
-        let repo = self._repo.to_thread_local();
+        let repo = self.repo();
+        if repo.workdir().is_none() {
+            return Ok(Vec::new());
+        }
         let head_oid = super::history::gix_head_id_or_none(&repo)?;
         let index_stamp = repo_index_stamp(&repo);
         cancellation.check_cancelled()?;
@@ -244,7 +225,7 @@ impl GixRepo {
         let Some(head_oid) = head_oid else {
             return self
                 .status_cancellable_impl(cancellation)
-                .map(|status| status.staged);
+                .map(|status| std::sync::Arc::unwrap_or_clone(status.staged));
         };
 
         // `tree_index_status()` diffs a tree against the index, so resolve HEAD to HEAD^{tree}
@@ -255,6 +236,7 @@ impl GixRepo {
         if self.may_have_gitlink_status_supplement(&repo, &index_stamp) {
             supplement_gitlink_status_from_porcelain(
                 &self.spec.workdir,
+                &repo,
                 &mut staged,
                 &mut Vec::new(),
             )?;
@@ -279,13 +261,13 @@ impl GixRepo {
     ///
     /// Conflicted paths are excluded, as they are from `staged_status_impl`.
     pub(super) fn staged_index_paths_impl(&self) -> Result<Vec<PathBuf>> {
-        let repo = self._repo.to_thread_local();
+        let repo = self.repo();
         let Some(head_oid) = super::history::gix_head_id_or_none(&repo)? else {
             return Ok(self
                 .status_impl()?
                 .staged
-                .into_iter()
-                .map(|entry| entry.path)
+                .iter()
+                .map(|entry| entry.path.clone())
                 .collect());
         };
 
@@ -310,10 +292,11 @@ impl GixRepo {
         cancellation: &CancellationToken,
     ) -> Result<Option<UpstreamDivergence>> {
         cancellation.check_cancelled()?;
+        // A fresh open so upstream config written since this repo was opened
+        // (`branch.<name>.remote`/`merge`) is honoured; the walk itself is
+        // memoized by tip pair, which is where the time went.
         let repo = self.reopen_repo()?;
-        let divergence = head_upstream_divergence(&repo)?;
-        cancellation.check_cancelled()?;
-        Ok(divergence)
+        head_upstream_divergence(&repo, &self.divergence_cache, Some(cancellation))
     }
 
     fn cached_staged_status(
@@ -367,7 +350,10 @@ fn finalize_status(
     // conflicts) from gix status output. Supplement conflict entries from the index's unmerged
     // stages only when the repository is in an in-progress operation or gix already surfaced
     // conflicts.
-    if should_supplement_unmerged_conflicts(repo.state().is_some(), has_conflicted_unstaged) {
+    if should_supplement_unmerged_conflicts(
+        crate::refs::operation_state(repo)?.is_some(),
+        has_conflicted_unstaged,
+    ) {
         apply_unmerged_conflicts(repo, &mut unstaged)?;
     }
 
@@ -375,7 +361,7 @@ fn finalize_status(
     // or gitlinks. This avoids a full `git status` subprocess on every refresh for the common
     // case.
     if may_have_gitlinks {
-        supplement_gitlink_status_from_porcelain(workdir, &mut staged, &mut unstaged)?;
+        supplement_gitlink_status_from_porcelain(workdir, repo, &mut staged, &mut unstaged)?;
     }
 
     sort_and_dedup_status_entries(&mut staged);
@@ -388,7 +374,10 @@ fn finalize_status(
             .map(|entry| entry.path.clone()),
     );
 
-    Ok(RepoStatus { staged, unstaged })
+    Ok(RepoStatus {
+        staged: std::sync::Arc::new(staged),
+        unstaged: std::sync::Arc::new(unstaged),
+    })
 }
 
 fn apply_unmerged_conflicts(repo: &gix::Repository, unstaged: &mut Vec<FileStatus>) -> Result<()> {
@@ -407,7 +396,10 @@ fn apply_unmerged_conflicts(repo: &gix::Repository, unstaged: &mut Vec<FileStatu
     Ok(())
 }
 
-fn tree_id_for_commit(repo: &gix::Repository, commit_id: &gix::ObjectId) -> Result<gix::ObjectId> {
+pub(super) fn tree_id_for_commit(
+    repo: &gix::Repository,
+    commit_id: &gix::ObjectId,
+) -> Result<gix::ObjectId> {
     repo.find_commit(*commit_id)
         .map_err(|e| Error::new(ErrorKind::Backend(format!("gix commit lookup: {e}"))))?
         .tree_id()
@@ -427,10 +419,16 @@ fn collect_staged_status_from_tree_index(
         head_oid,
         &index,
         None,
-        gix::status::tree_index::TrackRenames::AsConfigured,
+        // Without an on-disk index there can be no staged rename. Avoid
+        // gix's diff-cache fallback to its files-only HEAD reader.
+        if repo.try_index().map_err(crate::refs::failure)?.is_none() {
+            gix::status::tree_index::TrackRenames::Disabled
+        } else {
+            gix::status::tree_index::TrackRenames::AsConfigured
+        },
         |change, _, _| {
-            collect_tree_index_change(change, &mut staged)?;
-            Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
+            collect_tree_index_change(change, &mut staged).or_error()?;
+            Ok(std::ops::ControlFlow::Continue(()))
         },
     )
     .map_err(|e| Error::new(ErrorKind::Backend(format!("gix tree/index status: {e}"))))?;
@@ -449,10 +447,16 @@ fn collect_staged_index_paths_from_tree_index(
         head_tree_id,
         &index,
         None,
-        gix::status::tree_index::TrackRenames::AsConfigured,
+        // Without an on-disk index there can be no staged rename. Avoid
+        // gix's diff-cache fallback to its files-only HEAD reader.
+        if repo.try_index().map_err(crate::refs::failure)?.is_none() {
+            gix::status::tree_index::TrackRenames::Disabled
+        } else {
+            gix::status::tree_index::TrackRenames::AsConfigured
+        },
         |change, _, _| {
-            collect_tree_index_change_paths(change, &mut paths)?;
-            Ok::<_, Error>(std::ops::ControlFlow::Continue(()))
+            collect_tree_index_change_paths(change, &mut paths).or_error()?;
+            Ok(std::ops::ControlFlow::Continue(()))
         },
     )
     .map_err(|e| Error::new(ErrorKind::Backend(format!("gix tree/index status: {e}"))))?;
@@ -540,7 +544,7 @@ fn remove_conflicted_paths_from_staged(
 /// cover `index.skipHash` repositories whose trailer is a useless null hash.
 ///
 /// Opens `.git/index` a single time and derives every field from that one handle.
-fn repo_index_stamp(repo: &gix::Repository) -> RepoFileStamp {
+pub(super) fn repo_index_stamp(repo: &gix::Repository) -> RepoFileStamp {
     index_stamp_for(repo.index_path().as_path(), repo.object_hash())
 }
 
@@ -615,8 +619,7 @@ fn set_index_stat_discriminators(_stamp: &mut RepoFileStamp, _metadata: &std::fs
 pub(super) fn gix_unmerged_conflicts(
     repo: &gix::Repository,
 ) -> Result<Vec<(PathBuf, FileConflictKind)>> {
-    let index = repo
-        .index_or_load_from_head_or_empty()
+    let index = crate::refs::index_or_load_from_head_or_empty(repo)
         .map_err(|e| Error::new(ErrorKind::Backend(format!("gix index: {e}"))))?;
     let path_backing = index.path_backing();
     let mut stage_entries = Vec::new();
@@ -667,95 +670,136 @@ fn collect_unmerged_conflicts(
     conflicts
 }
 
-/// Collect a single IndexWorktree item into the `unstaged` list.  Shared by
-/// both the full status iterator and the index-worktree-only fast path.
-fn collect_index_worktree_item(
-    item: gix::status::index_worktree::Item,
-    unstaged: &mut Vec<FileStatus>,
-    has_conflicted_unstaged: &mut bool,
-) -> Result<()> {
-    match item {
-        gix::status::index_worktree::Item::Modification {
-            rela_path, status, ..
-        } => {
-            let path = path_buf_from_git_bytes(
-                rela_path.as_ref(),
-                "gix status index/worktree modification path",
-            )?;
-            let (kind, conflict) = map_entry_status(status);
-            push_unstaged_status(
-                unstaged,
-                has_conflicted_unstaged,
-                FileStatus {
-                    path,
-                    kind,
-                    conflict,
-                },
-            );
-        }
-        gix::status::index_worktree::Item::DirectoryContents { entry, .. } => {
-            let Some(kind) = map_directory_entry_status(entry.status) else {
-                return Ok(());
-            };
-            let path = path_buf_from_git_bytes(
-                entry.rela_path.as_ref(),
-                "gix status directory entry path",
-            )?;
-            push_unstaged_status(
-                unstaged,
-                has_conflicted_unstaged,
-                FileStatus {
-                    path,
-                    kind,
-                    conflict: None,
-                },
-            );
-        }
-        gix::status::index_worktree::Item::Rewrite {
-            dirwalk_entry,
-            copy,
-            ..
-        } => {
-            let kind = if copy {
-                FileStatusKind::Added
-            } else {
-                FileStatusKind::Renamed
-            };
-            let path = path_buf_from_git_bytes(
-                dirwalk_entry.rela_path.as_ref(),
-                "gix status rewrite path",
-            )?;
-            push_unstaged_status(
-                unstaged,
-                has_conflicted_unstaged,
-                FileStatus {
-                    path,
-                    kind,
-                    conflict: None,
-                },
-            );
-        }
-    }
-    Ok(())
+/// The on-disk index with the stats a worktree walk found stale but
+/// content-clean, as `git status` would write them back. Status never writes
+/// `.git/index`, so without this
+/// every refresh re-hashes each file that was touched without changing, which
+/// is ~20x the walk with `text=auto` filtering.
+pub(super) struct StatRefreshedIndex {
+    /// gix's snapshot of `.git/index` this copy was derived from; any rewrite
+    /// of the file replaces the snapshot and drops the copy.
+    base: gix::worktree::Index,
+    index: gix::index::File,
 }
+
+/// Re-hashing less than this per walk is cheaper than holding a second copy of
+/// the index.
+const STAT_REFRESH_MIN_BYTES: u64 = 256 * 1024;
+const STAT_REFRESH_MIN_ENTRIES: usize = 64;
 
 fn collect_index_worktree_status_direct(
     repo: &gix::Repository,
+    stat_refresh: &std::sync::Mutex<Option<StatRefreshedIndex>>,
     unstaged: &mut Vec<FileStatus>,
     may_have_gitlinks: bool,
+    cancellation: &CancellationToken,
 ) -> Result<DirectIndexWorktreeStatus> {
     let index = repo
         .index_or_empty()
         .map_err(|e| Error::new(ErrorKind::Backend(format!("gix index: {e}"))))?;
-    collect_index_worktree_status_direct_from_index(repo, &index, unstaged, may_have_gitlinks)
+    let refreshed = stat_refresh
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take()
+        .filter(|refreshed| std::sync::Arc::ptr_eq(&refreshed.base, &index));
+    // Every stat the walk records is read after this instant. gix compares
+    // the stamp with mtimes in whole seconds, and a write landing just after
+    // it can carry a coarser mtime from the second before (the file clock
+    // lags the wall clock), so the stamp stays one second back: such a write
+    // still compares racy, as it would against git's own index mtime.
+    let walk_started = filetime::FileTime::now();
+    #[cfg(test)]
+    let walk_started = tests::STAT_REFRESH_CLOCK.with(|clock| clock.get().unwrap_or(walk_started));
+    let stamp = filetime::FileTime::from_unix_time(walk_started.unix_seconds() - 1, 0);
+    let result = collect_index_worktree_status_direct_from_index(
+        repo,
+        refreshed
+            .as_ref()
+            .map_or(&index, |refreshed| &refreshed.index),
+        unstaged,
+        may_have_gitlinks,
+        cancellation,
+    )
+    .and_then(|result| {
+        cancellation.check_cancelled()?;
+        Ok(result)
+    });
+    let (status, changes) = match result {
+        Ok(result) => result,
+        Err(error) => {
+            // An interrupted walk cannot commit partial stat updates. Keep the
+            // previous complete cache unless another walk has already replaced it.
+            let mut cache = stat_refresh.lock().unwrap_or_else(|e| e.into_inner());
+            if cache.is_none() {
+                *cache = refreshed;
+            }
+            return Err(error);
+        }
+    };
+    let refreshed = apply_stat_refresh(refreshed, &index, changes, stamp);
+    *stat_refresh
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = refreshed;
+    Ok(status)
+}
+
+/// Applies a walk's stat updates to the in-memory copy, as git's index write
+/// would: new stats for content-clean entries, size 0 for racily modified ones
+/// (so they keep comparing as changed once the timestamp moves past them).
+fn apply_stat_refresh(
+    refreshed: Option<StatRefreshedIndex>,
+    base: &gix::worktree::Index,
+    changes: Vec<IndexWorktreeApplyChange>,
+    stamp: filetime::FileTime,
+) -> Option<StatRefreshedIndex> {
+    if changes.is_empty() {
+        return refreshed;
+    }
+    let mut refreshed = match refreshed {
+        Some(refreshed) => refreshed,
+        None => {
+            let rehashed_bytes: u64 = changes
+                .iter()
+                .map(|change| match change {
+                    IndexWorktreeApplyChange::NewStat { stat, .. } => u64::from(stat.size),
+                    IndexWorktreeApplyChange::SetSizeToZero { .. } => 0,
+                })
+                .sum();
+            if rehashed_bytes < STAT_REFRESH_MIN_BYTES && changes.len() < STAT_REFRESH_MIN_ENTRIES {
+                return None;
+            }
+            StatRefreshedIndex {
+                base: base.clone(),
+                index: (***base).clone(),
+            }
+        }
+    };
+    let entries = refreshed.index.entries_mut();
+    for change in changes {
+        match change {
+            IndexWorktreeApplyChange::NewStat { entry_index, stat } => {
+                if let Some(entry) = entries.get_mut(entry_index) {
+                    entry.stat = stat;
+                }
+            }
+            IndexWorktreeApplyChange::SetSizeToZero { entry_index } => {
+                if let Some(entry) = entries.get_mut(entry_index) {
+                    entry.stat.size = 0;
+                }
+            }
+        }
+    }
+    refreshed.index.set_timestamp(stamp);
+    Some(refreshed)
 }
 
 fn collect_index_worktree_status_direct_from_index(
     repo: &gix::Repository,
-    index: &gix::worktree::Index,
+    index: &gix::index::File,
     unstaged: &mut Vec<FileStatus>,
     may_have_gitlinks: bool,
-) -> Result<DirectIndexWorktreeStatus> {
+    cancellation: &CancellationToken,
+) -> Result<(DirectIndexWorktreeStatus, Vec<IndexWorktreeApplyChange>)> {
     let dirwalk_options = repo
         .dirwalk_options()
         .map_err(|e| {
@@ -764,7 +808,7 @@ fn collect_index_worktree_status_direct_from_index(
             )))
         })?
         .emit_untracked(gix::dir::walk::EmissionMode::Matching);
-    let collection = if may_have_gitlinks {
+    let collection = if may_have_gitlinks && crate::refs::has_modules(repo)? {
         let submodule = gix::status::index_worktree::BuiltinSubmoduleStatus::new(
             repo.clone().into_sync(),
             gix::status::Submodule::Given {
@@ -779,6 +823,7 @@ fn collect_index_worktree_status_direct_from_index(
             dirwalk_options,
             unstaged,
             submodule,
+            cancellation,
         )?
     } else {
         collect_index_worktree_status_direct_with_submodule(
@@ -787,14 +832,16 @@ fn collect_index_worktree_status_direct_from_index(
             dirwalk_options,
             unstaged,
             NoopSubmoduleStatus,
+            cancellation,
         )?
     };
-    let index_stamp_after_write =
-        maybe_persist_direct_index_changes(repo, index, collection.index_changes);
-    Ok(DirectIndexWorktreeStatus {
-        has_conflicted_unstaged: collection.has_conflicted_unstaged,
-        index_stamp_after_write,
-    })
+    Ok((
+        DirectIndexWorktreeStatus {
+            has_conflicted_unstaged: collection.has_conflicted_unstaged,
+            // Status stays read-only: the stat refresh lives in memory only.
+        },
+        collection.index_changes,
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -802,31 +849,29 @@ struct NoopSubmoduleStatus;
 
 impl gix::status::plumbing::index_as_worktree::traits::SubmoduleStatus for NoopSubmoduleStatus {
     type Output = gix::submodule::Status;
-    type Error = Infallible;
 
     fn status(
         &mut self,
         _entry: &gix::index::Entry,
         _rela_path: &gix::bstr::BStr,
-    ) -> std::result::Result<Option<Self::Output>, Self::Error> {
+    ) -> gix::Result<Option<Self::Output>> {
         Ok(None)
     }
 }
 
-fn collect_index_worktree_status_direct_with_submodule<S, E>(
+fn collect_index_worktree_status_direct_with_submodule<S>(
     repo: &gix::Repository,
-    index: &gix::worktree::Index,
+    index: &gix::index::File,
     dirwalk_options: gix::dirwalk::Options,
     unstaged: &mut Vec<FileStatus>,
     submodule: S,
+    cancellation: &CancellationToken,
 ) -> Result<StatusEntryCollection>
 where
     S: gix::status::plumbing::index_as_worktree::traits::SubmoduleStatus<
             Output = gix::submodule::Status,
-            Error = E,
         > + Send
         + Clone,
-    E: std::error::Error + Send + Sync + 'static,
 {
     let workdir = repo
         .workdir()
@@ -844,10 +889,7 @@ where
         false,
         std::iter::empty::<gix::bstr::BString>(),
         true,
-        || -> std::result::Result<
-            gix::worktree::Stack,
-            Box<dyn std::error::Error + Send + Sync + 'static>,
-        > {
+        || -> gix::Result<gix::worktree::Stack> {
             unreachable!("empty direct-status patterns never require pathspec attributes")
         },
     )
@@ -882,8 +924,8 @@ where
         )))
     })?;
     let mut collector = StatusEntryCollector::new(unstaged);
-    let mut progress = gix::progress::Discard;
-    let should_interrupt = AtomicBool::new(false);
+    let interrupt = StatusCancellation::new(cancellation)?;
+    let mut progress = cancellation::progress(&interrupt.interrupt);
     gix::status::plumbing::index_as_worktree_with_renames(
         index,
         workdir,
@@ -898,7 +940,7 @@ where
         gix::status::plumbing::index_as_worktree_with_renames::Context {
             pathspec,
             resource_cache,
-            should_interrupt: &should_interrupt,
+            should_interrupt: &interrupt.interrupt,
             dirwalk: gix::status::plumbing::index_as_worktree_with_renames::DirwalkContext {
                 git_dir_realpath: git_dir_realpath.as_path(),
                 current_dir: repo.current_dir(),
@@ -907,11 +949,10 @@ where
         },
         gix::status::plumbing::index_as_worktree_with_renames::Options {
             sorting: None,
-            object_hash: repo.object_hash(),
             fscache: false,
             tracked_file_modifications: gix::status::plumbing::index_as_worktree::Options {
                 fs: fs_caps,
-                thread_limit: None,
+                thread_limit: worker_limit::for_index(repo, index, cancellation)?,
                 fscache: false,
                 stat: repo.stat_options().map_err(|e| {
                     Error::new(ErrorKind::Backend(format!("gix status stat options: {e}")))
@@ -922,10 +963,15 @@ where
         },
     )
     .map_err(|e| {
-        Error::new(ErrorKind::Backend(format!(
-            "gix status index/worktree: {e}"
-        )))
+        if cancellation.is_cancelled() {
+            Error::new(ErrorKind::Cancelled)
+        } else {
+            Error::new(ErrorKind::Backend(format!(
+                "gix status index/worktree: {e}"
+            )))
+        }
     })?;
+    cancellation.check_cancelled()?;
 
     collector.finish()
 }
@@ -995,14 +1041,18 @@ fn collect_index_worktree_status_entry<U>(
 ) -> Result<()> {
     match entry {
         gix::status::plumbing::index_as_worktree_with_renames::Entry::Modification {
+            entry_index,
             rela_path,
             status,
             ..
         } => {
-            if let gix::status::plumbing::index_as_worktree::EntryStatus::NeedsUpdate(_stat) =
+            if let gix::status::plumbing::index_as_worktree::EntryStatus::NeedsUpdate(stat) =
                 &status
             {
-                index_changes.push(IndexWorktreeApplyChange::NewStat);
+                index_changes.push(IndexWorktreeApplyChange::NewStat {
+                    entry_index,
+                    stat: *stat,
+                });
                 return Ok(());
             }
             if matches!(
@@ -1014,7 +1064,7 @@ fn collect_index_worktree_status_entry<U>(
                     },
                 )
             ) {
-                index_changes.push(IndexWorktreeApplyChange::SetSizeToZero);
+                index_changes.push(IndexWorktreeApplyChange::SetSizeToZero { entry_index });
             }
             let path = path_buf_from_git_bytes(
                 rela_path.as_ref(),
@@ -1035,6 +1085,9 @@ fn collect_index_worktree_status_entry<U>(
             entry,
             ..
         } => {
+            if is_service_owned_rela_path(entry.rela_path.as_ref()) {
+                return Ok(());
+            }
             let Some(kind) = map_directory_entry_status(entry.status) else {
                 return Ok(());
             };
@@ -1053,10 +1106,19 @@ fn collect_index_worktree_status_entry<U>(
             );
         }
         gix::status::plumbing::index_as_worktree_with_renames::Entry::Rewrite {
+            source,
             dirwalk_entry,
             copy,
             ..
         } => {
+            if is_service_owned_rela_path(dirwalk_entry.rela_path.as_ref()) {
+                return push_rewrite_into_service_area(
+                    source.rela_path(),
+                    copy,
+                    unstaged,
+                    has_conflicted_unstaged,
+                );
+            }
             let kind = if copy {
                 FileStatusKind::Added
             } else {
@@ -1080,6 +1142,36 @@ fn collect_index_worktree_status_entry<U>(
     Ok(())
 }
 
+/// Staging areas the filesystem service may leave in a worktree are never
+/// user changes.
+fn is_service_owned_rela_path(path: &gix::bstr::BStr) -> bool {
+    path.split(|byte| *byte == b'/')
+        .any(gitcomet_core::path_utils::is_service_owned_name)
+}
+
+/// A file parked in a staging area was removed from where it was tracked.
+fn push_rewrite_into_service_area(
+    source: &gix::bstr::BStr,
+    copy: bool,
+    unstaged: &mut Vec<FileStatus>,
+    has_conflicted_unstaged: &mut bool,
+) -> Result<()> {
+    if copy {
+        return Ok(());
+    }
+    let path = path_buf_from_git_bytes(source, "gix status rewrite source path")?;
+    push_unstaged_status(
+        unstaged,
+        has_conflicted_unstaged,
+        FileStatus {
+            path,
+            kind: FileStatusKind::Deleted,
+            conflict: None,
+        },
+    );
+    Ok(())
+}
+
 fn push_unstaged_status(
     unstaged: &mut Vec<FileStatus>,
     has_conflicted_unstaged: &mut bool,
@@ -1091,7 +1183,6 @@ fn push_unstaged_status(
 
 struct DirectIndexWorktreeStatus {
     has_conflicted_unstaged: bool,
-    index_stamp_after_write: Option<RepoFileStamp>,
 }
 
 struct StatusEntryCollection {
@@ -1100,34 +1191,13 @@ struct StatusEntryCollection {
 }
 
 enum IndexWorktreeApplyChange {
-    NewStat,
-    SetSizeToZero,
-}
-
-fn maybe_persist_status_outcome_changes(
-    _outcome: Option<gix::status::Outcome>,
-    _index_path: &Path,
-) -> Option<RepoFileStamp> {
-    // INVARIANT: status reads must not rewrite `.git/index`. The repo monitor maps index updates
-    // to refreshes, so gix's stat write-back would self-trigger a refresh loop even when the
-    // status payload is unchanged.
-    //
-    // The reducer relies on this: `finish_status_lane_replay` (gitcomet-state) now *always*
-    // replays a coalesced refresh, on the assumption that a completed status read produces no
-    // filesystem events. If this ever returns `Some(..)` (persisting a write-back), revisit that
-    // reducer logic first or the loop returns.
-    None
-}
-
-fn maybe_persist_direct_index_changes(
-    _repo: &gix::Repository,
-    _index: &gix::worktree::Index,
-    _index_changes: Vec<IndexWorktreeApplyChange>,
-) -> Option<RepoFileStamp> {
-    // Same invariant as `maybe_persist_status_outcome_changes`: keep status collection read-only
-    // so monitor-driven refreshes do not recursively manufacture new worktree events, which the
-    // reducer's unconditional replay depends on.
-    None
+    NewStat {
+        entry_index: usize,
+        stat: gix::index::entry::Stat,
+    },
+    SetSizeToZero {
+        entry_index: usize,
+    },
 }
 
 /// Collect a single TreeIndex change into the `staged` list.
@@ -1279,16 +1349,24 @@ fn apply_porcelain_v2_gitlink_status_record(
 
 fn supplement_gitlink_status_from_porcelain(
     workdir: &Path,
+    repo: &gix::Repository,
     staged: &mut Vec<FileStatus>,
     unstaged: &mut Vec<FileStatus>,
 ) -> Result<()> {
     let mut command = git_workdir_cmd_for(workdir);
     command
+        .arg("--literal-pathspecs")
         .arg("--no-optional-locks")
         .arg("status")
         .arg("--porcelain=v2")
         .arg("-z")
         .arg("--ignore-submodules=none");
+    if let Some(paths) = gitlink_status_paths(repo, staged) {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        command.arg("--").args(paths);
+    }
     let output = match run_git_raw_output(command, "git status --porcelain=v2") {
         Ok(output) => output,
         // Gitlink supplementation is best-effort parity glue on top of the primary
@@ -1321,14 +1399,58 @@ fn supplement_gitlink_status_from_porcelain(
     Ok(())
 }
 
+// Restrict only the supplemental Git query; gix remains responsible for ordinary
+// paths. None means the selection is uncertain and requires a full Git query,
+// while Some(empty) proves there is nothing left to supplement.
+fn gitlink_status_paths(repo: &gix::Repository, staged: &[FileStatus]) -> Option<Vec<PathBuf>> {
+    let index = repo.index_or_empty().ok()?;
+    // Collapsed sparse directories can hide gitlinks. Let Git expand them for
+    // the existing complete query instead of treating this as an empty list.
+    if index.is_sparse() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for entry in index.entries() {
+        if entry.mode == gix::index::entry::Mode::COMMIT {
+            paths.push(path_buf_from_git_bytes(entry.path(&index), "gitlink status path").ok()?);
+        }
+    }
+    // Deleted/replaced gitlinks are absent from the index. Check only the
+    // staged paths in HEAD so ordinary staged files do not broaden the query
+    // or prevent the empty-selection fast path.
+    if !staged.is_empty()
+        && let Some(head) = super::history::gix_head_id_or_none(repo).ok()?
+    {
+        let tree = repo.find_object(head).ok()?.peel_to_tree().ok()?;
+        for entry in staged {
+            if tree
+                .lookup_entry_by_path(&entry.path)
+                .ok()?
+                .is_some_and(|entry| entry.mode().is_commit())
+            {
+                paths.push(entry.path.clone());
+            }
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    // Leave room for the executable, workdir, options and Windows quoting in
+    // CreateProcess's 32K command line. Large selections keep the full query.
+    let bytes: usize = paths
+        .iter()
+        .map(|path| path.as_os_str().len() * 2 + 3)
+        .sum();
+    (bytes < 16_000).then_some(paths)
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use rustc_hash::FxHashMap;
 
     use super::{
-        apply_porcelain_v2_gitlink_status_record, collect_unmerged_conflicts,
-        conflict_kind_from_stage_mask, map_directory_entry_status, map_entry_status,
-        map_porcelain_v2_status_char, remove_conflicted_paths_from_staged,
+        STAT_REFRESH_MIN_ENTRIES, apply_porcelain_v2_gitlink_status_record,
+        collect_unmerged_conflicts, conflict_kind_from_stage_mask, map_directory_entry_status,
+        map_entry_status, map_porcelain_v2_status_char, remove_conflicted_paths_from_staged,
         should_supplement_unmerged_conflicts, sort_and_dedup_status_entries, tree_id_for_commit,
     };
     use gitcomet_core::domain::{FileConflictKind, FileStatus, FileStatusKind};
@@ -1336,6 +1458,25 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::sync::OnceLock;
+
+    thread_local! {
+        pub(super) static STAT_REFRESH_CLOCK: std::cell::Cell<Option<filetime::FileTime>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    struct StatRefreshClock(Option<filetime::FileTime>);
+
+    impl StatRefreshClock {
+        fn set(now: filetime::FileTime) -> Self {
+            Self(STAT_REFRESH_CLOCK.with(|clock| clock.replace(Some(now))))
+        }
+    }
+
+    impl Drop for StatRefreshClock {
+        fn drop(&mut self) {
+            STAT_REFRESH_CLOCK.with(|clock| clock.set(self.0));
+        }
+    }
 
     #[cfg(unix)]
     use std::{fs::Permissions, os::unix::fs::PermissionsExt as _};
@@ -1406,7 +1547,7 @@ mod tests {
             .expect("spawn git")
     }
 
-    fn git_success(workdir: &Path, args: &[&str]) {
+    pub(crate) fn git_success(workdir: &Path, args: &[&str]) {
         let output = git_output(workdir, args);
         assert!(
             output.status.success(),
@@ -1429,24 +1570,25 @@ mod tests {
         output
     }
 
-    fn init_test_repo(workdir: &Path) {
+    pub(crate) fn init_test_repo(workdir: &Path) {
         let _ = ensure_isolated_git_test_env();
         git_success(workdir, &["init"]);
-        for args in [
-            ["config", "core.autocrlf", "false"].as_slice(),
-            ["config", "core.eol", "lf"].as_slice(),
-            ["config", "credential.helper", ""].as_slice(),
-            ["config", "credential.interactive", "never"].as_slice(),
-            ["config", "protocol.file.allow", "always"].as_slice(),
-            ["config", "commit.gpgsign", "false"].as_slice(),
-            ["config", "user.name", "Test User"].as_slice(),
-            ["config", "user.email", "test@example.com"].as_slice(),
-        ] {
-            git_success(workdir, args);
-        }
+        gitcomet_core::test_support::git_fixture::append_config(
+            workdir,
+            &[
+                ("core.autocrlf", "false"),
+                ("core.eol", "lf"),
+                ("credential.helper", ""),
+                ("credential.interactive", "never"),
+                ("protocol.file.allow", "always"),
+                ("commit.gpgsign", "false"),
+                ("user.name", "Test User"),
+                ("user.email", "test@example.com"),
+            ],
+        );
     }
 
-    fn write_file(workdir: &Path, relative: &str, contents: &str) {
+    pub(crate) fn write_file(workdir: &Path, relative: &str, contents: &str) {
         let path = workdir.join(relative);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("create parent directories");
@@ -1454,7 +1596,7 @@ mod tests {
         fs::write(path, contents).expect("write file");
     }
 
-    fn open_repo(workdir: &Path) -> super::super::GixRepo {
+    pub(crate) fn open_repo(workdir: &Path) -> super::super::GixRepo {
         let thread_safe_repo = gix::open(workdir).expect("open repo").into_sync();
         super::super::GixRepo::new(workdir.to_path_buf(), thread_safe_repo)
     }
@@ -1465,6 +1607,53 @@ mod tests {
             kind,
             conflict: None,
         }
+    }
+
+    #[test]
+    fn gitlink_query_excludes_ordinary_staged_paths_but_keeps_removed_and_replaced_links() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        init_test_repo(root);
+        write_file(root, "ordinary.txt", "base\n");
+        git_success(root, &["add", "ordinary.txt"]);
+        git_success(root, &["commit", "-m", "base"]);
+        let oid = crate::refs::head_oid(&gix::open(root).unwrap())
+            .unwrap()
+            .unwrap()
+            .to_string();
+        for path in ["removed", "replaced", "retained"] {
+            git_success(
+                root,
+                &["update-index", "--add", "--cacheinfo", "160000", &oid, path],
+            );
+        }
+        git_success(root, &["commit", "-m", "gitlinks"]);
+        git_success(root, &["update-index", "--force-remove", "removed"]);
+        git_success(root, &["update-index", "--force-remove", "replaced"]);
+        write_file(root, "replaced", "regular file\n");
+        write_file(root, "ordinary.txt", "changed\n");
+        git_success(root, &["add", "replaced", "ordinary.txt"]);
+        let staged = [
+            file_status("ordinary.txt", FileStatusKind::Modified),
+            file_status("removed", FileStatusKind::Deleted),
+            file_status("replaced", FileStatusKind::Modified),
+        ];
+        assert_eq!(
+            super::gitlink_status_paths(&gix::open(root).unwrap(), &staged),
+            Some(
+                ["removed", "replaced", "retained"]
+                    .map(PathBuf::from)
+                    .to_vec()
+            )
+        );
+        git_success(root, &["update-index", "--force-remove", "retained"]);
+        git_success(root, &["commit", "-m", "remove gitlinks"]);
+        write_file(root, "ordinary.txt", "changed again\n");
+        git_success(root, &["add", "ordinary.txt"]);
+        assert_eq!(
+            super::gitlink_status_paths(&gix::open(root).unwrap(), &staged[..1]),
+            Some(Vec::new())
+        );
     }
 
     fn conflicted_file_status(path: &str, conflict: FileConflictKind) -> FileStatus {
@@ -1945,8 +2134,8 @@ mod tests {
         let staged = gix_repo.staged_status_impl().expect("staged status");
         let unstaged = gix_repo.worktree_status_impl().expect("worktree status");
 
-        assert_eq!(combined.staged, staged);
-        assert_eq!(combined.unstaged, unstaged);
+        assert_eq!(*combined.staged, staged);
+        assert_eq!(*combined.unstaged, unstaged);
         assert_eq!(
             staged,
             vec![file_status("staged.txt", FileStatusKind::Modified)]
@@ -1957,6 +2146,38 @@ mod tests {
                 file_status("unstaged.txt", FileStatusKind::Modified),
                 file_status("untracked.txt", FileStatusKind::Untracked),
             ]
+        );
+    }
+
+    #[test]
+    fn status_hides_filesystem_service_staging_areas() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+        write_file(workdir, "tracked.txt", "base\n");
+        git_success(workdir, &["add", "tracked.txt"]);
+        git_success(workdir, &["commit", "-m", "initial"]);
+        write_file(workdir, ".gitcomet-operation-abc/item", "parked\n");
+        write_file(
+            workdir,
+            "dir/.gitcomet-operation-def/recovery.log",
+            "move\n",
+        );
+        write_file(workdir, "dir/.gitcomet-save-xyz", "staged\n");
+        write_file(workdir, "dir/new.txt", "untracked\n");
+
+        let gix_repo = open_repo(workdir);
+        // The second call takes the cached-staged fast path.
+        for _ in 0..2 {
+            let status = gix_repo.status_impl().expect("status");
+            assert_eq!(
+                *status.unstaged,
+                vec![file_status("dir/new.txt", FileStatusKind::Untracked)]
+            );
+        }
+        assert_eq!(
+            gix_repo.worktree_status_impl().expect("worktree status"),
+            vec![file_status("dir/new.txt", FileStatusKind::Untracked)]
         );
     }
 
@@ -1982,23 +2203,23 @@ mod tests {
         let gix_repo = open_repo(workdir);
         let status = gix_repo.status_impl().expect("combined status");
         assert_eq!(
-            status.staged,
+            *status.staged,
             vec![file_status("foo.txt", FileStatusKind::Modified)],
             "a staged-and-re-edited file must appear in the staged lane"
         );
         assert_eq!(
-            status.unstaged,
+            *status.unstaged,
             vec![file_status("foo.txt", FileStatusKind::Modified)],
             "the further worktree edit must also appear in the unstaged lane"
         );
         // The per-lane entry points must agree with the combined status.
         assert_eq!(
             gix_repo.staged_status_impl().expect("staged lane"),
-            status.staged
+            *status.staged
         );
         assert_eq!(
             gix_repo.worktree_status_impl().expect("worktree lane"),
-            status.unstaged
+            *status.unstaged
         );
     }
 
@@ -2015,7 +2236,7 @@ mod tests {
         let combined = gix_repo.status_impl().expect("combined status");
         let staged = gix_repo.staged_status_impl().expect("staged status");
 
-        assert_eq!(combined.staged, staged);
+        assert_eq!(*combined.staged, staged);
         assert_eq!(staged, vec![file_status("new.txt", FileStatusKind::Added)]);
         assert!(combined.unstaged.is_empty());
     }
@@ -2033,7 +2254,7 @@ mod tests {
 
         assert!(combined.staged.is_empty());
         assert!(staged.is_empty());
-        assert_eq!(combined.unstaged, worktree);
+        assert_eq!(*combined.unstaged, worktree);
         assert_eq!(
             worktree,
             vec![conflicted_file_status(
@@ -2334,7 +2555,7 @@ mod tests {
         write_file(workdir, "foo.txt", "v1\n");
         git_success(workdir, &["add", "foo.txt"]);
         let status = gix_repo.status_impl().expect("status after staging");
-        assert_eq!(status.staged, modified(FileStatusKind::Modified));
+        assert_eq!(*status.staged, modified(FileStatusKind::Modified));
         assert!(status.unstaged.is_empty());
 
         // Edit the worktree again WITHOUT staging: foo is now in BOTH lanes. The index is unchanged,
@@ -2342,12 +2563,12 @@ mod tests {
         write_file(workdir, "foo.txt", "v2\n");
         let status = gix_repo.status_impl().expect("status with worktree edit");
         assert_eq!(
-            status.staged,
+            *status.staged,
             modified(FileStatusKind::Modified),
             "an unstaged worktree edit must not disturb the staged lane (served from cache)"
         );
         assert_eq!(
-            status.unstaged,
+            *status.unstaged,
             modified(FileStatusKind::Modified),
             "the new worktree edit must appear in the unstaged lane"
         );
@@ -2356,7 +2577,7 @@ mod tests {
         // staged. The index changed, so the cached staged result must be invalidated and recomputed.
         git_success(workdir, &["add", "foo.txt"]);
         let status = gix_repo.status_impl().expect("status after restaging");
-        assert_eq!(status.staged, modified(FileStatusKind::Modified));
+        assert_eq!(*status.staged, modified(FileStatusKind::Modified));
         assert!(
             status.unstaged.is_empty(),
             "staging the worktree edit must clear the unstaged lane (cache must invalidate)"
@@ -2371,7 +2592,7 @@ mod tests {
             "unstaging must remove foo from the staged lane (stale cache would keep it)"
         );
         assert_eq!(
-            status.unstaged,
+            *status.unstaged,
             modified(FileStatusKind::Modified),
             "the unstaged file must appear in the unstaged lane"
         );
@@ -2379,11 +2600,416 @@ mod tests {
         // The per-lane entry points must agree with the combined status after all the churn.
         assert_eq!(
             gix_repo.staged_status_impl().expect("staged lane"),
-            status.staged
+            *status.staged
         );
         assert_eq!(
             gix_repo.worktree_status_impl().expect("worktree lane"),
-            status.unstaged
+            *status.unstaged
         );
+    }
+
+    /// The in-process pass has to beat two `git diff --numstat` spawns without
+    /// moving the status walk. Reports timings rather than asserting; run with
+    /// `-- --ignored --nocapture`.
+    #[test]
+    #[ignore = "timing probe"]
+    fn perf_uncommitted_line_stats_baseline() {
+        // ~10 KB per file. The `status_dirty_500_files` fixture writes ~30
+        // bytes, so it measures lstat throughput, not content I/O.
+        fn body(seed: usize, marker: &str) -> String {
+            let mut out = String::with_capacity(10_240);
+            for line in 0..200 {
+                out.push_str(&format!(
+                    "{marker} {seed:05} line {line:03} some representative source text here\n"
+                ));
+            }
+            out
+        }
+
+        for (tracked, dirty, staged) in [(500usize, 25usize, 25usize), (500, 250, 0)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let workdir = tmp.path();
+            init_test_repo(workdir);
+
+            for index in 0..tracked {
+                write_file(
+                    workdir,
+                    &format!("src/mod{:02}/file{index:04}.rs", index % 32),
+                    &body(index, "base"),
+                );
+            }
+            git_success(workdir, &["add", "."]);
+            git_success(workdir, &["commit", "-q", "-m", "seed"]);
+
+            for index in 0..dirty {
+                write_file(
+                    workdir,
+                    &format!("src/mod{:02}/file{index:04}.rs", index % 32),
+                    &body(index, "edit"),
+                );
+            }
+            for index in dirty..dirty + staged {
+                write_file(
+                    workdir,
+                    &format!("src/mod{:02}/file{index:04}.rs", index % 32),
+                    &body(index, "edit"),
+                );
+            }
+            if staged > 0 {
+                git_success(workdir, &["add", "src"]);
+                for index in 0..dirty {
+                    write_file(
+                        workdir,
+                        &format!("src/mod{:02}/file{index:04}.rs", index % 32),
+                        &body(index, "again"),
+                    );
+                }
+            }
+
+            let gix_repo = open_repo(workdir);
+            // Warm the caches so the numbers compare work, not first touch.
+            let _ = gix_repo.status_impl().expect("warmup status");
+            let _ = git_output(workdir, &["diff", "--numstat", "-z"]);
+
+            let _ = gix_repo
+                .uncommitted_line_stats_impl(&gitcomet_core::services::CancellationToken::new())
+                .expect("warmup line stats");
+
+            let mut status_ms = u128::MAX;
+            let mut spawn_ms = u128::MAX;
+            let mut in_process_ms = u128::MAX;
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                let status = gix_repo.status_impl().expect("status");
+                status_ms = status_ms.min(start.elapsed().as_millis());
+                std::hint::black_box(status);
+
+                let start = std::time::Instant::now();
+                let a = git_output(workdir, &["diff", "--numstat", "-z", "--no-renames"]);
+                let b = git_output(
+                    workdir,
+                    &["diff", "--cached", "--numstat", "-z", "--no-renames"],
+                );
+                spawn_ms = spawn_ms.min(start.elapsed().as_millis());
+                std::hint::black_box((a, b));
+
+                let start = std::time::Instant::now();
+                let stats = gix_repo
+                    .uncommitted_line_stats_impl(&gitcomet_core::services::CancellationToken::new())
+                    .expect("line stats");
+                in_process_ms = in_process_ms.min(start.elapsed().as_millis());
+                std::hint::black_box(stats);
+            }
+
+            println!(
+                "tracked={tracked} dirty={dirty} staged={staged}: gix status {status_ms} ms | \
+                 two numstat spawns {spawn_ms} ms | in-process pass {in_process_ms} ms (best of 5)"
+            );
+        }
+    }
+
+    /// The first full scan must warm the same cache that lane-only scans use.
+    #[test]
+    fn cold_status_retains_clean_file_stats_and_invalidates_them_after_staging() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        init_test_repo(workdir);
+        let timestamp = filetime::FileTime::now().unix_seconds() - 30;
+        let touched = STAT_REFRESH_MIN_ENTRIES + 16;
+        for ix in 0..touched {
+            write_file(workdir, &format!("{ix:03}.txt"), "unchanged\n");
+            filetime::set_file_mtime(
+                workdir.join(format!("{ix:03}.txt")),
+                filetime::FileTime::from_unix_time(timestamp, 0),
+            )
+            .unwrap();
+        }
+        git_success(workdir, &["add", "."]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+        let index_before = std::fs::read(workdir.join(".git/index")).unwrap();
+        for ix in 0..touched {
+            filetime::set_file_mtime(
+                workdir.join(format!("{ix:03}.txt")),
+                filetime::FileTime::from_unix_time(timestamp + 1, 0),
+            )
+            .unwrap();
+        }
+        let repo = open_repo(workdir);
+        let status = repo.status_impl().unwrap();
+        assert!(status.staged.is_empty() && status.unstaged.is_empty());
+        {
+            let cache = repo.stat_refreshed_index.lock().unwrap();
+            let cache = cache
+                .as_ref()
+                .expect("the very first status retains clean-file metadata");
+            assert!(
+                cache
+                    .index
+                    .entries()
+                    .iter()
+                    .all(|entry| entry.stat.mtime.secs == (timestamp + 1) as u32)
+            );
+        }
+        assert!(repo.status_impl().unwrap().unstaged.is_empty());
+        assert_eq!(
+            std::fs::read(workdir.join(".git/index")).unwrap(),
+            index_before,
+            "status must not rewrite the disk index"
+        );
+        write_file(workdir, "000.txt", "different\n");
+        assert_eq!(
+            repo.status_impl().unwrap().unstaged.as_ref(),
+            &[file_status("000.txt", FileStatusKind::Modified)]
+        );
+        git_success(workdir, &["add", "000.txt"]);
+        let status = repo.status_impl().unwrap();
+        assert!(status.unstaged.is_empty());
+        assert_eq!(
+            status.staged.as_ref(),
+            &[file_status("000.txt", FileStatusKind::Modified)]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn repeated_status_does_not_run_clean_filters_again_after_the_first_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let workdir = dir.path();
+        init_test_repo(workdir);
+        write_file(workdir, ".gitattributes", "large.txt filter=count\n");
+        write_file(workdir, "large.txt", &"unchanged text\n".repeat(40_000));
+        let counter = workdir.join(".git/hash-count");
+        let clean = format!(
+            "printf x >> '{}'; cat",
+            counter.to_str().unwrap().replace('\'', "'\\''")
+        );
+        git_success(workdir, &["config", "filter.count.clean", &clean]);
+        let timestamp = filetime::FileTime::now().unix_seconds() - 30;
+        filetime::set_file_mtime(
+            workdir.join("large.txt"),
+            filetime::FileTime::from_unix_time(timestamp, 0),
+        )
+        .unwrap();
+        git_success(workdir, &["add", "."]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+        std::fs::remove_file(workdir.join(".git/hash-count")).unwrap();
+        filetime::set_file_mtime(
+            workdir.join("large.txt"),
+            filetime::FileTime::from_unix_time(timestamp + 1, 0),
+        )
+        .unwrap();
+        let repo = open_repo(workdir);
+        assert!(repo.status_impl().unwrap().unstaged.is_empty());
+        let hashes = std::fs::read(workdir.join(".git/hash-count")).unwrap();
+        assert!(
+            !hashes.is_empty(),
+            "the initial scan verified the stale file metadata"
+        );
+        assert!(repo.status_impl().unwrap().unstaged.is_empty());
+        assert_eq!(
+            std::fs::read(workdir.join(".git/hash-count")).unwrap(),
+            hashes,
+            "warm status must skip expensive filtering and hashing of unchanged contents"
+        );
+        write_file(workdir, "large.txt", &"different text\n".repeat(40_000));
+        assert_eq!(
+            repo.status_impl().unwrap().unstaged[0].path,
+            PathBuf::from("large.txt")
+        );
+        assert!(
+            std::fs::read(workdir.join(".git/hash-count"))
+                .unwrap()
+                .len()
+                > hashes.len(),
+            "a subsequent edit is still verified"
+        );
+    }
+
+    /// The in-memory stat refresh moves the index timestamp past every entry it
+    /// verified. A racily clean entry whose content did change must then keep
+    /// comparing as changed, so the refresh zeroes its size as git's index
+    /// write does; with only the new timestamp it would read as clean.
+
+    #[test]
+    fn stat_refresh_keeps_a_racily_modified_file_modified() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+        // Rewriting the file below changes its ctime; the race is about mtime.
+        git_success(workdir, &["config", "core.trustctime", "false"]);
+        // Enough touched-but-unchanged files for the refresh to be kept.
+        let touched = STAT_REFRESH_MIN_ENTRIES + 16;
+        for index in 0..touched {
+            write_file(workdir, &format!("touched/{index:03}.txt"), "same\n");
+        }
+        write_file(workdir, "racy.txt", "foo\n");
+        git_success(workdir, &["add", "."]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+
+        let now = filetime::FileTime::now().unix_seconds();
+        let entry_mtime = filetime::FileTime::from_unix_time(now - 50, 0);
+        filetime::set_file_mtime(workdir.join("racy.txt"), entry_mtime).expect("mtime");
+        git_success(workdir, &["update-index", "-q", "--refresh"]);
+        // Same size and mtime as the index entry, different content.
+        write_file(workdir, "racy.txt", "bar\n");
+        filetime::set_file_mtime(workdir.join("racy.txt"), entry_mtime).expect("mtime");
+        for index in 0..touched {
+            write_file(workdir, &format!("touched/{index:03}.txt"), "same\n");
+            filetime::set_file_mtime(
+                workdir.join(format!("touched/{index:03}.txt")),
+                filetime::FileTime::from_unix_time(now - 10, 0),
+            )
+            .expect("touched mtime");
+        }
+        // An index older than the entry makes it racy.
+        filetime::set_file_mtime(
+            workdir.join(".git/index"),
+            filetime::FileTime::from_unix_time(now - 100, 0),
+        )
+        .expect("index mtime");
+
+        let repo = open_repo(workdir);
+        let expected = vec![file_status("racy.txt", FileStatusKind::Modified)];
+        assert_eq!(repo.worktree_status_impl().expect("status"), expected);
+        assert!(
+            repo.stat_refreshed_index.lock().expect("lock").is_some(),
+            "the touched files should have produced an in-memory refresh"
+        );
+        assert_eq!(repo.worktree_status_impl().expect("status"), expected);
+    }
+
+    /// A write landing right after a walk starts can carry a coarser mtime
+    /// from the second before, below the walk's nanosecond clock. Git's
+    /// index stamp is such an mtime itself; the in-memory stamp must stay
+    /// behind the walk's second so that write still compares racy.
+    #[test]
+    fn stat_refresh_catches_a_write_stamped_just_before_the_walk() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let workdir = tmp.path();
+        init_test_repo(workdir);
+        git_success(workdir, &["config", "core.trustctime", "false"]);
+        let touched = STAT_REFRESH_MIN_ENTRIES + 16;
+        for index in 0..touched {
+            write_file(workdir, &format!("touched/{index:03}.txt"), "same\n");
+        }
+        write_file(workdir, "racy.txt", "foo\n");
+        git_success(workdir, &["add", "."]);
+        git_success(workdir, &["commit", "-q", "-m", "seed"]);
+        // Touched, so the walk produces the in-memory refresh.
+        for index in 0..touched {
+            write_file(workdir, &format!("touched/{index:03}.txt"), "same\n");
+        }
+        let repo = open_repo(workdir);
+        // Freeze only this thread's walk clock. Filesystem timestamps below
+        // are explicit, so a busy runner cannot move the walk into another
+        // second or turn this regression into a scheduler timing assertion.
+        let now = filetime::FileTime::from_unix_time(1_700_000_100, 100_000_000);
+        let _clock = StatRefreshClock::set(now);
+        // The stamp a write a few milliseconds after the walk starts can get
+        // from the file clock: the last instant of the previous second.
+        let just_before = filetime::FileTime::from_unix_time(now.unix_seconds() - 1, 999_000_000);
+        filetime::set_file_mtime(workdir.join("racy.txt"), just_before).expect("mtime");
+        assert_eq!(repo.worktree_status_impl().expect("status"), vec![]);
+        assert_eq!(
+            repo.stat_refreshed_index
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .expect("stat refresh")
+                .index
+                .timestamp(),
+            filetime::FileTime::from_unix_time(now.unix_seconds() - 1, 0),
+        );
+
+        // Same size and stat as the refreshed entry, different content.
+        write_file(workdir, "racy.txt", "bar\n");
+        filetime::set_file_mtime(workdir.join("racy.txt"), just_before).expect("mtime");
+        assert_eq!(
+            repo.worktree_status_impl().expect("status"),
+            vec![file_status("racy.txt", FileStatusKind::Modified)]
+        );
+    }
+
+    /// Worktree status after files were touched without changing content, as
+    /// build tools, formatters and editors saving unchanged buffers do. Status
+    /// never writes the index back, so each refresh re-hashes every such file
+    /// unless the refreshed stats are remembered.
+    #[test]
+    #[ignore = "timing probe"]
+    fn timing_worktree_status_after_touch() {
+        // Process CPU time: the hashing runs on every core, so wall time on a
+        // wide machine hides most of it.
+        fn cpu_ms() -> f64 {
+            let stat = fs::read_to_string("/proc/self/stat").unwrap_or_default();
+            let fields: Vec<&str> = stat
+                .rsplit_once(')')
+                .map(|(_, rest)| rest.split_whitespace().collect())
+                .unwrap_or_default();
+            let ticks: f64 = fields
+                .get(11..13)
+                .map(|t| t.iter().filter_map(|v| v.parse::<f64>().ok()).sum())
+                .unwrap_or(0.0);
+            ticks * 10.0
+        }
+        let body = "some representative source text here\n".repeat(256);
+        for (files, attributes) in [(2_000usize, false), (10_000, false), (10_000, true)] {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let workdir = tmp.path();
+            init_test_repo(workdir);
+            if attributes {
+                write_file(workdir, ".gitattributes", "* text=auto\n");
+            }
+            for index in 0..files {
+                write_file(
+                    workdir,
+                    &format!("src/mod{:02}/file{index:05}.rs", index % 64),
+                    &body,
+                );
+            }
+            git_success(workdir, &["add", "."]);
+            git_success(workdir, &["commit", "-q", "-m", "seed"]);
+            // Rewrite identical bytes: new mtimes (past git's one-second
+            // granularity), same content.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            for index in 0..files {
+                write_file(
+                    workdir,
+                    &format!("src/mod{:02}/file{index:05}.rs", index % 64),
+                    &body,
+                );
+            }
+            let gix_repo = open_repo(workdir);
+            let start = std::time::Instant::now();
+            let first = gix_repo.worktree_status_impl().expect("status");
+            let first_ms = start.elapsed().as_secs_f64() * 1e3;
+            assert!(first.is_empty(), "touched files are unchanged");
+            // Refreshes are debounced (250 ms to 2 s): the next one starts in a
+            // later second, when the touched files are no longer racy.
+            std::thread::sleep(std::time::Duration::from_millis(1100));
+            let mut best = f64::MAX;
+            let cpu_start = cpu_ms();
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                let again = gix_repo.worktree_status_impl().expect("status");
+                best = best.min(start.elapsed().as_secs_f64() * 1e3);
+                assert!(again.is_empty());
+            }
+            let repeat_cpu = (cpu_ms() - cpu_start) / 20.0;
+            // Control: the same tree once git has written the new stats back.
+            git_success(workdir, &["update-index", "-q", "--refresh"]);
+            let fresh = open_repo(workdir);
+            let _ = fresh.worktree_status_impl().expect("status");
+            let mut clean = f64::MAX;
+            let cpu_start = cpu_ms();
+            for _ in 0..20 {
+                let start = std::time::Instant::now();
+                let _ = fresh.worktree_status_impl().expect("status");
+                clean = clean.min(start.elapsed().as_secs_f64() * 1e3);
+            }
+            let clean_cpu = (cpu_ms() - cpu_start) / 20.0;
+            println!(
+                "timing worktree_status_after_touch files={files} text_auto={attributes} first={first_ms:.2}ms repeat_best={best:.2}ms repeat_cpu={repeat_cpu:.1}ms refreshed_index={clean:.2}ms refreshed_cpu={clean_cpu:.1}ms"
+            );
+        }
     }
 }

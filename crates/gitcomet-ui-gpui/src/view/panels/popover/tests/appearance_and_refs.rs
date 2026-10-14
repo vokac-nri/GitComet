@@ -1,0 +1,495 @@
+use super::*;
+use gitcomet_core::domain::{Branch, Remote, RemoteBranch, RepoSpec, Tag};
+use gitcomet_core::tag_push::TagPushMode;
+
+fn ref_repo() -> RepoState {
+    let commit = CommitId("0123456789abcdef0123456789abcdef01234567".into());
+    let mut repo = RepoState::new_opening(
+        RepoId(1),
+        RepoSpec {
+            workdir: "/tmp/combined-refs".into(),
+        },
+    );
+    repo.open = Loadable::Ready(());
+    repo.head_branch = Loadable::Ready("main".into());
+    repo.branches = Loadable::Ready(Arc::new(vec![
+        Branch {
+            name: "main".into(),
+            target: commit.clone(),
+            upstream: None,
+            divergence: None,
+        },
+        Branch {
+            name: "release".into(),
+            target: commit.clone(),
+            upstream: None,
+            divergence: None,
+        },
+    ]));
+    repo.remote_branches = Loadable::Ready(Arc::new(vec![RemoteBranch {
+        remote: "team/alice".into(),
+        name: "release".into(),
+        target: commit.clone(),
+    }]));
+    repo.tags = Loadable::Ready(Arc::new(vec![Tag {
+        name: "release".into(),
+        target: commit.clone(),
+    }]));
+    repo.remote_tags = Loadable::Ready(Arc::new(vec![]));
+    repo.remotes = Loadable::Ready(Arc::new(vec![Remote {
+        name: "origin".into(),
+        url: None,
+    }]));
+    repo
+}
+
+#[gpui::test]
+fn combined_history_ref_groups_keep_exact_targets_and_toggle_with_keyboard(
+    cx: &mut gpui::TestAppContext,
+) {
+    let _guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo = ref_repo();
+    let commit_id = repo.branches.ready().unwrap()[0].target.clone();
+    let state = Arc::new(AppState {
+        active_repo: Some(repo.id),
+        repos: vec![repo],
+        ..AppState::test_default()
+    });
+    cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.state = state.clone();
+            this.ui_model.update(cx, |model, cx| model.set_state(state.clone(), cx));
+            this.popover_host.update(cx, |host, cx| {
+                host.state = state.clone();
+                host.open_popover_at(PopoverKind::CommitMenu { repo_id: RepoId(1), commit_id: commit_id.clone() }, point(px(10.0), px(10.0)), window, cx);
+                let model = host.context_menu_model(host.popover.as_ref().unwrap(), cx).unwrap();
+                let groups = model.items.iter().filter_map(|item| match item {
+                    ContextMenuItem::Entry { label, action, .. } if matches!(action.as_ref(), ContextMenuAction::ToggleHistoryRefGroup { .. }) => Some(label.as_ref()), _ => None,
+                }).collect::<Vec<_>>();
+                assert_eq!(groups, ["Local branch main", "Local branch release", "Remote branch team/alice/release", "Tag release"]);
+                host.context_menu_selected_ix = model.items.iter().position(|item| matches!(item, ContextMenuItem::Entry { label, .. } if label == "Local branch release"));
+            });
+        });
+        let _ = window.draw(app);
+    });
+    simulate_key_press(cx, "right");
+    cx.update(|_, app| {
+        let host = view.read(app).popover_host.read(app);
+        assert_eq!(
+            host.expanded_history_ref,
+            Some(HistoryMenuRef::Branch(BranchMenuTarget::local("release")))
+        );
+    });
+    simulate_key_press(cx, "left");
+    cx.update(|_, app| {
+        assert!(
+            view.read(app)
+                .popover_host
+                .read(app)
+                .expanded_history_ref
+                .is_none()
+        )
+    });
+    simulate_key_press(cx, "space");
+    cx.update(|_, app| {
+        assert!(
+            view.read(app)
+                .popover_host
+                .read(app)
+                .expanded_history_ref
+                .is_some()
+        )
+    });
+    simulate_key_press(cx, "escape");
+    cx.update(|_, app| assert!(view.read(app).popover_host.read(app).popover.is_none()));
+}
+
+#[gpui::test]
+fn history_ref_submenus_share_the_sidebar_header_surface(cx: &mut gpui::TestAppContext) {
+    let _guard = crate::test_support::lock_visual_test();
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo = ref_repo();
+    let commit_id = repo.branches.ready().unwrap()[0].target.clone();
+    let state = Arc::new(AppState {
+        active_repo: Some(repo.id),
+        repos: vec![repo],
+        ..AppState::test_default()
+    });
+    cx.simulate_resize(gpui::size(px(1200.0), px(1400.0)));
+    let (model, theme) = cx.update(|window, app| {
+        view.update(app, |this, cx| {
+            this.state = state.clone();
+            this.ui_model
+                .update(cx, |model, cx| model.set_state(state.clone(), cx));
+            this.popover_host.update(cx, |host, cx| {
+                host.state = state.clone();
+                host.open_popover_at(
+                    PopoverKind::CommitMenu {
+                        repo_id: RepoId(1),
+                        commit_id: commit_id.clone(),
+                    },
+                    point(px(10.0), px(10.0)),
+                    window,
+                    cx,
+                );
+                host.expanded_history_ref =
+                    Some(HistoryMenuRef::Branch(BranchMenuTarget::local("release")));
+                (
+                    host.context_menu_model(host.popover.as_ref().unwrap(), cx)
+                        .unwrap(),
+                    host.theme,
+                )
+            })
+        })
+    });
+    crate::view::test_support::redraw(cx);
+
+    // Every ref is a group; only the open one carries its actions with it.
+    assert_eq!(model.groups.len(), 4);
+    let open = model
+        .groups
+        .iter()
+        .find(|range| range.len() > 1)
+        .unwrap()
+        .clone();
+    assert!(model.groups.iter().filter(|range| range.len() == 1).count() == 3);
+    assert!(matches!(model.items[open.end], ContextMenuItem::Separator));
+    let selector = |ix: usize| -> &'static str {
+        match &model.items[ix] {
+            ContextMenuItem::Entry { label, .. } => model
+                .entry_debug_selectors
+                .get(&ix)
+                .map(|selector| selector.to_string())
+                .unwrap_or_else(|| super::context_menu::context_menu_entry_debug_selector(label))
+                .leak(),
+            _ => panic!("row {ix} is not an entry"),
+        }
+    };
+    for range in &model.groups {
+        let group: &'static str = format!("context_menu_group_{}", range.start).leak();
+        assert!(
+            crate::test_support::painted_control_quads(cx, group)
+                .iter()
+                .any(|(fill, _)| *fill == theme.colors.surface.panel.into()),
+            "{group} is not on the header surface"
+        );
+    }
+    let block = cx
+        .debug_bounds(format!("context_menu_group_{}", open.start).leak())
+        .unwrap();
+    let header = cx.debug_bounds(selector(open.start)).unwrap();
+    let last = (open.clone())
+        .rev()
+        .find(|ix| matches!(model.items[*ix], ContextMenuItem::Entry { .. }))
+        .unwrap();
+    let last = cx.debug_bounds(selector(last)).unwrap();
+    assert_eq!(block.top(), header.top());
+    assert_eq!(block.bottom(), last.bottom());
+    // The commit's own actions stay on the plain menu surface below.
+    let commit_action = (open.end..model.items.len())
+        .rev()
+        .find(|ix| {
+            matches!(model.items[*ix], ContextMenuItem::Entry { .. })
+                && !model.groups.iter().any(|range| range.contains(ix))
+        })
+        .unwrap();
+    let commit_action = cx.debug_bounds(selector(commit_action)).unwrap();
+    for range in &model.groups {
+        let group = cx
+            .debug_bounds(format!("context_menu_group_{}", range.start).leak())
+            .unwrap();
+        assert!(commit_action.top() >= group.bottom());
+    }
+}
+
+/// Force push is the one entry in this menu that rewrites published history, so
+/// it sits last and behind a separator rather than among the ordinary pushes a
+/// cursor is aimed at.
+#[gpui::test]
+fn the_push_menu_keeps_force_push_last_and_fenced_off(cx: &mut gpui::TestAppContext) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let repo = ref_repo();
+    let state = Arc::new(AppState {
+        active_repo: Some(repo.id),
+        repos: vec![repo],
+        ..AppState::test_default()
+    });
+
+    cx.update(|_window, app| {
+        view.update(app, |this, cx| {
+            this.state = state.clone();
+            this.popover_host.update(cx, |host, cx| {
+                host.state = state;
+                let model = host
+                    .context_menu_model(&PopoverKind::PushPicker, cx)
+                    .expect("expected a push menu");
+
+                let force_push = model.items.last().expect("expected a trailing entry");
+                assert!(
+                    matches!(
+                        force_push,
+                        ContextMenuItem::Entry { label, action, .. }
+                            if label.starts_with("Force push")
+                                && matches!(
+                                    action.as_ref(),
+                                    ContextMenuAction::OpenPopover {
+                                        kind: PopoverKind::ForcePushConfirm { .. }
+                                    }
+                                )
+                    ),
+                    "force push must be the last entry in the menu"
+                );
+                assert!(
+                    matches!(
+                        model.items[model.items.len() - 2],
+                        ContextMenuItem::Separator
+                    ),
+                    "force push must be fenced off from the pushes above it"
+                );
+                // The ordinary pushes stay above the fence, in their own group.
+                assert!(
+                    model.items.iter().rev().skip(2).any(|item| matches!(
+                        item,
+                        ContextMenuItem::Entry { action, .. }
+                            if matches!(action.as_ref(), ContextMenuAction::Push { .. })
+                    )),
+                    "the plain push action must stay above the separator"
+                );
+            });
+        });
+    });
+}
+
+#[gpui::test]
+fn lfs_push_menu_preserves_the_structured_upstream_remote(cx: &mut gpui::TestAppContext) {
+    use gitcomet_core::domain::Upstream;
+    use gitcomet_core::large_files::{LargeFileCommand, LargeFileSupport};
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    // The first two upstreams have the same display label but target distinct remotes.
+    for (remote, branch, expected) in [
+        (Some("team/alice"), "main", "team/alice"),
+        (Some("team"), "alice/main", "team"),
+        (None, "", "origin"),
+    ] {
+        let mut repo = ref_repo();
+        repo.branches = Loadable::Ready(Arc::new(vec![Branch {
+            name: "main".into(),
+            target: CommitId("0123456789abcdef0123456789abcdef01234567".into()),
+            upstream: remote.map(|remote| Upstream {
+                remote: remote.into(),
+                branch: branch.into(),
+            }),
+            divergence: None,
+        }]));
+        repo.remotes = Loadable::Ready(Arc::new(
+            ["origin", "team", "team/alice"]
+                .map(|name| Remote {
+                    name: name.into(),
+                    url: None,
+                })
+                .into(),
+        ));
+        let mut support = LargeFileSupport::default();
+        support.lfs.has_local_store = true;
+        repo.large_file_support = Loadable::Ready(Arc::new(support));
+        let state = Arc::new(AppState {
+            active_repo: Some(repo.id),
+            repos: vec![repo],
+            ..AppState::test_default()
+        });
+        cx.update(|_, app| {
+            view.update(app, |this, cx| {
+                this.state = state.clone();
+                this.popover_host.update(cx, |host, cx| {
+                    host.state = state;
+                    let model = host
+                        .context_menu_model(&PopoverKind::PushPicker, cx)
+                        .unwrap();
+                    let (label, remote) = model
+                        .items
+                        .iter()
+                        .find_map(|item| match item {
+                            ContextMenuItem::Entry { label, action, .. } => match action.as_ref() {
+                                ContextMenuAction::RunLargeFileCommand {
+                                    command: LargeFileCommand::LfsPushAll { remote },
+                                    ..
+                                } => Some((label, remote)),
+                                _ => None,
+                            },
+                            _ => None,
+                        })
+                        .expect("LFS push entry");
+                    assert_eq!(remote, expected);
+                    assert!(
+                        label.starts_with(&format!("Push all LFS objects to {expected}")),
+                        "{label}"
+                    );
+                    let header = if expected == "origin" {
+                        "Push"
+                    } else {
+                        "Push team/alice/main"
+                    };
+                    assert!(
+                        matches!(&model.items[0], ContextMenuItem::Header(label) if label.as_ref() == header)
+                    );
+                });
+            });
+        });
+    }
+}
+
+#[gpui::test]
+fn tag_push_menu_keeps_actions_enabled_when_preview_is_unavailable_and_preserves_upstream_mode(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let mut repo = ref_repo();
+    let request =
+        super::super::tag_push::request(&repo, TagPushMode::All, &Default::default()).unwrap();
+    repo.tag_push_previews[1] = Some(gitcomet_state::model::TagPushPreviewState {
+        request,
+        generation: 1,
+        cancellation: gitcomet_core::services::CancellationToken::new(),
+        result: Loadable::Error("authentication required".into()),
+    });
+    let state = Arc::new(AppState {
+        active_repo: Some(repo.id),
+        repos: vec![repo],
+        ..AppState::test_default()
+    });
+    cx.update(|window, app| view.update(app, |this, cx| {
+        this.state = state.clone();
+        this.popover_host.update(cx, |host, cx| {
+            host.state = state;
+            let model = host.context_menu_model(&PopoverKind::PushPicker, cx).unwrap();
+            assert!(model.items.iter().any(|item| matches!(item, ContextMenuItem::Entry { label, disabled: false, action, .. }
+                if label.contains("Preview unavailable") && matches!(action.as_ref(), ContextMenuAction::PushWithTags { mode: TagPushMode::All, .. }))));
+            host.context_menu_activate_action(ContextMenuAction::PushWithTags { repo_id: RepoId(1), mode: TagPushMode::All }, window, cx);
+            assert_eq!(host.push_upstream_tag_mode, Some(TagPushMode::All));
+            assert!(matches!(host.popover, Some(PopoverKind::PushSetUpstreamPrompt { .. })));
+            host.close_popover(cx);
+            assert!(host.push_upstream_tag_mode.is_none(), "tag mode must not stick to later pushes");
+        });
+    }));
+}
+
+#[test]
+fn tag_push_on_adjusted_branch_can_set_upstream_when_annex_takeover_is_disabled() {
+    let mut repo = ref_repo();
+    let head = "adjusted/main(unlocked)";
+    repo.head_branch = Loadable::Ready(head.into());
+    repo.branches = Loadable::Ready(Arc::new(vec![Branch {
+        name: head.into(),
+        target: CommitId("deadbeef".into()),
+        upstream: None,
+        divergence: None,
+    }]));
+    let mut support = gitcomet_core::large_files::LargeFileSupport::default();
+    support.annex.uuid = Some("u".into());
+    repo.large_file_support = Loadable::Ready(Arc::new(support));
+    let settings = gitcomet_state::model::LargeFileSettings {
+        annex_pull_push: false,
+        ..Default::default()
+    };
+    let request = super::super::tag_push::request(&repo, TagPushMode::All, &settings).unwrap();
+    assert!(request.set_upstream);
+    assert_eq!(request.local_branch, head);
+    assert!(
+        super::super::tag_push::request(&repo, TagPushMode::All, &Default::default()).is_none()
+    );
+}
+
+#[gpui::test]
+fn pull_controls_on_adjusted_branches_follow_annex_support_and_settings(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) =
+        cx.add_window_view(|window, cx| GitCometView::new(store, events, None, window, cx));
+    let mut repo = ref_repo();
+    let head = "adjusted/main(unlocked)";
+    repo.head_branch = Loadable::Ready(head.into());
+    repo.branches = Loadable::Ready(Arc::new(vec![Branch {
+        name: head.into(),
+        target: CommitId("deadbeef".into()),
+        upstream: None,
+        divergence: None,
+    }]));
+    let mut annex = gitcomet_core::large_files::LargeFileSupport::default();
+    annex.annex.uuid = Some("u".into());
+    for support in [
+        Loadable::Ready(Arc::new(annex)),
+        Loadable::NotLoaded,
+        Loadable::Loading,
+        Loadable::Error("failed".into()),
+        Loadable::Ready(Arc::default()),
+    ] {
+        repo.large_file_support = support;
+        for takeover in [true, false] {
+            let settings = gitcomet_state::model::LargeFileSettings {
+                annex_pull_push: takeover,
+                ..Default::default()
+            };
+            let enabled = takeover
+                && match &repo.large_file_support {
+                    Loadable::Ready(support) => support.annex.in_use(),
+                    _ => true,
+                };
+            assert_eq!(pull_enabled(&repo, &settings), enabled, "main Pull button");
+            if enabled {
+                assert_eq!(
+                    pull_request(&repo, &settings),
+                    PullRequest::Pull,
+                    "the enabled action must dispatch"
+                );
+                let mut loading = repo.clone();
+                loading.remotes = Loadable::Loading;
+                assert_eq!(
+                    pull_request(&loading, &settings),
+                    PullRequest::Pull,
+                    "annex takeover does not require an upstream or a loaded remote list"
+                );
+            }
+            let state = Arc::new(AppState {
+                active_repo: Some(repo.id),
+                repos: vec![repo.clone()],
+                large_file_settings: settings,
+                ..AppState::test_default()
+            });
+            cx.update(|_, app| {
+                view.update(app, |this, cx| {
+                    this.popover_host.update(cx, |host, cx| {
+                        host.state = state;
+                        let model = host
+                            .context_menu_model(&PopoverKind::PullPicker, cx)
+                            .unwrap();
+                        let modes: Vec<_> = model
+                            .items
+                            .iter()
+                            .filter_map(|item| match item {
+                                ContextMenuItem::Entry {
+                                    disabled, action, ..
+                                } if matches!(action.as_ref(), ContextMenuAction::Pull { .. }) => {
+                                    Some(!disabled)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        assert_eq!(modes, vec![enabled; 4]);
+                    });
+                });
+            });
+        }
+    }
+}

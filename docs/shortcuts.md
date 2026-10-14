@@ -3,11 +3,12 @@
 This file documents the keyboard shortcuts currently wired in the GPUI application.
 
 Source of truth:
-- `crates/gitcomet-ui-gpui/src/app.rs`
-- `crates/gitcomet-ui-gpui/src/focused_diff.rs`
+- `crates/gitcomet-ui-gpui/src/app/bindings.rs`
+- `crates/gitcomet-ui-gpui/src/view/gitcomet_view_render.rs`
 - `crates/gitcomet-ui-gpui/src/view/terminal_panel.rs`
 - `crates/gitcomet-ui-gpui/src/view/panels/main/diff_view.rs`
-- `crates/gitcomet-ui-gpui/src/view/conflict_resolver.rs`
+- `crates/gitcomet-ui-gpui/src/view/panes/history/find.rs`
+- `crates/gitcomet-ui-gpui/src/view/panes/main/conflict_actions/`
 
 Notes:
 - `Cmd` and `Option` are the macOS names. `Ctrl` and `Alt` are the Windows/Linux equivalents.
@@ -23,9 +24,12 @@ These shortcuts apply in the normal GitComet window.
 | Open a new window | `Cmd-N`, `Cmd-Shift-N` | `Ctrl-N`, `Ctrl-Shift-N` | |
 | Open Settings | `Cmd-,` | `Ctrl-,` | |
 | Open a repository | `Cmd-O` | `Ctrl-O` | |
+| Open a workspace | `Cmd-Shift-R` | `Ctrl-Shift-R` | Lists saved workspaces. In an empty window the chosen workspace opens there; otherwise its own window is focused or opened. Also in the command palette and the app menu. |
+| Go to a commit | `Cmd-G` | `Ctrl-G` | Opens the Go to dialog. Accepts a full or short SHA (4+ characters, unique), a branch, a tag, or any revision such as `HEAD~3`; matches are exact. In an embedded terminal the shell keeps `Ctrl-G`. |
 | Toggle open and recently closed repositories | `Ctrl-Shift-A`, `Cmd-Shift-O`, `Option-Cmd-O` | `Ctrl-Shift-A`, `Ctrl-Shift-O` | In an embedded terminal on Windows/Linux, `Ctrl-Shift-A` keeps its terminal “Select All” behavior. |
 | Open active repository in external code editor | `Cmd-Shift-E` | `Ctrl-Shift-E` | Only active when an external code editor is configured. |
 | Show the open file in the file explorer | `Cmd-Shift-L` | `Ctrl-Shift-L` | Switches the sidebar to Files, expands the folders leading to the file, and scrolls it into view. |
+| Open the repository's remote in a web browser | `Cmd-K` | `Ctrl-K` | Opens the remote's page on its host (GitHub, GitLab, Bitbucket, Azure DevOps, Gitea/Codeberg, AWS CodeCommit, or a self-hosted forge). With several such remotes a menu lists them, `origin` first; `1`–`9` pick directly. Also in the command palette, the app menu, and a remote's right-click menu in the sidebar. In an embedded terminal on Windows/Linux the shell keeps `Ctrl-K`. |
 | Close the active repository tab, or close the window if no repo tab can close | `Cmd-W` | `Ctrl-W` | |
 | Close the active window | `Cmd-Shift-W` | `Ctrl-Shift-W` | |
 | Previous repository tab | `Cmd-PageUp`, `Cmd-{`, `Option-Cmd-Left` | `Ctrl-PageUp`, `Ctrl-Shift-Tab` | |
@@ -40,6 +44,10 @@ macOS-only window-management shortcuts:
 
 ## Text input shortcuts
 
+File operation shortcuts are scoped to the Files explorer. See
+[File management and Documents](file-management.md#explorer) for selection,
+clipboard, rename, and filesystem Undo/Redo bindings.
+
 These shortcuts apply when a GitComet text input has focus.
 
 ### Editing
@@ -53,6 +61,7 @@ These shortcuts apply when a GitComet text input has focus.
 | Undo | `Cmd-Z` | `Ctrl-Z` | |
 | Redo | `Cmd-Shift-Z` | `Ctrl-Shift-Z` | |
 | Show the character palette | `Ctrl-Cmd-Space` | None | macOS only. |
+| Delete to line start / end | `Cmd-Backspace`, `Cmd-Delete` | `Ctrl-Shift-Backspace`, `Ctrl-Shift-Delete` | With the caret at the end of a single-line input, such as a search box, deleting to the line start clears it. At the start or end of a line, deletes the line break instead. |
 
 ### Cursor movement and selection
 
@@ -60,6 +69,7 @@ These shortcuts apply when a GitComet text input has focus.
 | --- | --- | --- | --- |
 | Move by character or line | Arrow keys | Arrow keys | `Left`, `Right`, `Up`, `Down` |
 | Select by character or line | `Shift` + arrow keys | `Shift` + arrow keys | |
+| Move to document start / end | `Cmd-Home`, `Cmd-End` | `Ctrl-Home`, `Ctrl-End` | Picker search inputs also select the first / last result. |
 | Move to line start / end | `Cmd-Left`, `Cmd-Right`, `Home`, `End` | `Home`, `End` | |
 | Select to line start / end | `Cmd-Shift-Left`, `Cmd-Shift-Right`, `Shift-Home`, `Shift-End` | `Shift-Home`, `Shift-End` | |
 | Move by page | `PageUp`, `PageDown` | `PageUp`, `PageDown` | |
@@ -82,6 +92,32 @@ Compatibility note:
 | Action | macOS | Windows / Linux | Notes |
 | --- | --- | --- | --- |
 | Commit staged changes | `Cmd-Enter` | `Ctrl-Enter` | Commit message input only, and only when the Commit action is enabled. |
+
+## History view shortcuts
+
+These shortcuts apply while the commit history list is showing.
+
+| Action | macOS | Windows / Linux | Notes |
+| --- | --- | --- | --- |
+| Find a commit | `Cmd-F` | `Ctrl-F` | Opens the find bar over the history. Matches the commit summary or the author (each on its own), or the start of the SHA (4+ hex characters), across the whole history, not only the loaded rows. Typing selects the first match. With the bar already open, refocuses it with the query selected. |
+| Find options | `Aa`, `W`, `.*` buttons | `Aa`, `W`, `.*` buttons | Match Case, Whole Word and Regex toggles, as in diff search; toggling one searches again and selects the first match. Without Match Case, plain text ignores ASCII letter case only (`É` and `é` differ), while a regex ignores Unicode case. The SHA prefix always ignores case and Whole Word, and applies only while Regex is off. An invalid regex reads "Invalid regex" and searches nothing. |
+| Next match | `Enter`, `F3` | `Enter`, `F3` | Selects the next match below the selected commit, wrapping to the top. `Enter` only from the find bar; `F3` also from the list. Also the ↓ button. |
+| Previous match | `Shift-Enter`, `F2` | `Shift-Enter`, `F2` | Selects the previous match above the selected commit, wrapping to the bottom. `Shift-Enter` only from the find bar; `F2` also from the list. Also the ↑ button. |
+| Close the find bar | `Escape` | `Escape` | Also the × button. Focus returns to the history list. |
+
+## Picker shortcuts
+
+These shortcuts apply while a picker's search input has focus, including file history.
+
+| Action | macOS | Windows / Linux | Notes |
+| --- | --- | --- | --- |
+| Previous / next result | `Up`, `Down` | `Up`, `Down` | `Shift-Tab` / `Tab` also navigate. |
+| First / last result | `Cmd-Home`, `Cmd-End` | `Ctrl-Home`, `Ctrl-End` | `Ctrl-Home` / `Ctrl-End` also work on macOS. |
+| Previous / next page | `PageUp`, `PageDown` | `PageUp`, `PageDown` | Moves by one visible page and stops at the first / last result. |
+| Activate selected result | `Enter` | `Enter` | In file history, opens the file at that commit, following renames. |
+| Close menu or picker | `Escape` | `Escape` | Closes a row's context menu first, keeping the picker open. |
+
+File history filters by SHA, summary, and author while preserving history order. Right-click a row to open a revision or its parent, show the file's changes, reveal the commit in history, copy its SHA, or use the standard commit actions. Copying keeps the history picker open.
 
 ## Embedded terminal shortcuts
 
@@ -109,15 +145,16 @@ These shortcuts apply in the main diff panel, including conflict resolution view
 
 | Action | macOS | Windows / Linux | Scope / notes |
 | --- | --- | --- | --- |
+| Open file history | `Ctrl-H` | `Ctrl-H` | Working-tree files and files viewed at a commit; not while a text field has focus. |
 | Search the current diff | `Cmd-F` | `Ctrl-F` | If rendered markdown preview is open, GitComet switches back to source mode before opening search. |
 | Insert a newline in diff search | `Shift-Enter` | `Shift-Enter` | Diff search only. The search box also has Match Case, Whole Word, and Regex toggles. |
-| Previous search match | `F2` | `F2` | While diff search is open. |
-| Next search match | `F3` | `F3` | While diff search is open. |
+| Previous search match | `F2` | `F2` | While diff search is open. The ↑ button in the search box does the same. |
+| Next search match | `F3` | `F3` | While diff search is open. The ↓ button in the search box does the same. |
 | Close search, clear selection, or close the current diff | `Escape` | `Escape` | Exact behavior depends on the current diff state. |
 | Previous file in the status list | `F1` | `F1` | Working tree and conflict-oriented diff flows. |
 | Next file in the status list | `F4` | `F4` | Working tree and conflict-oriented diff flows. |
-| Previous change | `F2`, `Shift-F7`, `Option-Up` | `F2`, `Shift-F7`, `Alt-Up` | Raw diff and conflict diff views. |
-| Next change | `F3`, `F7`, `Option-Down` | `F3`, `F7`, `Alt-Down` | Raw diff and conflict diff views. |
+| Previous change | `F2`, `Shift-F7`, `Option-Up` | `F2`, `Shift-F7`, `Alt-Up` | Moves one change block (a run of consecutive changed lines) at a time, landing on its first line, in Full, Collapsed, and whole-commit diffs alike. The conflict resolver moves by conflict instead. |
+| Next change | `F3`, `F7`, `Option-Down` | `F3`, `F7`, `Alt-Down` | Same unit as Previous change. With nothing selected, goes to the first change block. |
 | Switch to inline diff | `Option-I` | `Alt-I` | Raw file diff only. Conflict resolver keeps split layout. |
 | Enter or leave the file editor | `Option-E` | `Alt-E` | Not while a text field has focus. Escape also leaves the editor. |
 | Save the edited file | `Cmd-S` | `Ctrl-S` | Only while the editor's buffer has focus; outside it the same chord stages the file. |
@@ -133,6 +170,12 @@ These shortcuts apply in the main diff panel, including conflict resolution view
 | Align selected lines manually | `Cmd-Y` | `Ctrl-Y` | Conflict resolver only (kdiff3 manual diff help). |
 | Clear all manual alignments | `Cmd-Shift-Y` | `Ctrl-Shift-Y` | Conflict resolver only. |
 
+In a focused status section, `Space` also stages or unstages its single selected
+file and advances when that file is shown in the diff. Keyboard focus stays in
+the list, so another `Space` acts on the next file and `Ctrl-A` / `Cmd-A` still
+selects the section's files. At the end of the section, advancement selects the
+previous file; when the section is empty, it clears the diff.
+
 Preview-mode note:
 - Rendered markdown preview hides the raw diff navigation controls and ignores the raw-diff-only view toggles, whitespace toggle, and conflict navigation hotkeys until you return to source mode.
 - The diff navigation keys above still work while a GitComet text input has focus, but search activation, `Escape`, view toggles, and staging `Space` remain tied to the active diff surface rather than text inputs.
@@ -143,7 +186,7 @@ Context-menu keyboard behavior is the same on every platform:
 - `Up` / `Down`: move the selection.
 - `Enter`: activate the selected item, or the first enabled item if nothing is selected.
 - `Escape`: close the menu.
-- Single-letter shortcuts shown inline activate the matching entry.
+- Single-letter or digit shortcuts shown inline activate the matching entry.
 
 Additional note:
 - Some menus also show clipboard-style shortcuts such as `Ctrl+C`; those reflect the underlying view shortcut rather than the menu's generic single-letter dispatcher.
@@ -155,3 +198,5 @@ These shortcuts apply in the standalone focused diff window opened for difftool-
 | Action | macOS | Windows / Linux | Notes |
 | --- | --- | --- | --- |
 | Close the window | `Cmd-W`, `Ctrl-W`, `Escape`, `Q` | `Ctrl-W`, `Escape`, `Q` | `Ctrl-W` remains accepted on macOS as an extra alias. |
+| Previous change | `F2`, `Shift-F7`, `Option-Up` | `F2`, `Shift-F7`, `Alt-Up` | One change block at a time, as in the main diff view. |
+| Next change | `F3`, `F7`, `Option-Down` | `F3`, `F7`, `Alt-Down` | One change block at a time, as in the main diff view. |

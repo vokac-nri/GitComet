@@ -1,4 +1,5 @@
 use super::*;
+use gitcomet_core::edit_signature::EditSignature;
 use gpui::Pixels;
 use rustc_hash::FxHasher;
 use std::cell::RefCell;
@@ -14,12 +15,6 @@ const MAX_CACHED_LINE_NUMBER: usize = 16_384;
 ///
 /// Design units, not device pixels: read it through [`conflict_line_no_width`].
 pub(in crate::view) const CONFLICT_DIFF_LINE_NO_WIDTH_PX: f32 = 38.0;
-
-/// Design height of one conflict source/output row. The resolver's text is
-/// shaped from `window.rem_size()`, which UI scale changes, so the row box has
-/// to follow it -- a flat 20px row holds a 41px line box at 200% and the text
-/// spills into the row below. Mirrors `diff_canvas::DIFF_ROW_HEIGHT_PX`.
-pub(in crate::view) const CONFLICT_ROW_HEIGHT_PX: f32 = 20.0;
 
 /// Design width of the accent/marker bar a conflict row paints at its left edge
 /// to flag the active conflict. Mirrors `diff_canvas::DIFF_CHANGE_BAR_WIDTH_PX`.
@@ -37,13 +32,13 @@ pub(in crate::view) fn conflict_scaled_px(value: f32, ui_scale_percent: u32) -> 
 }
 
 #[inline]
-pub(in crate::view) fn conflict_row_height(ui_scale_percent: u32) -> Pixels {
-    conflict_scaled_px(CONFLICT_ROW_HEIGHT_PX, ui_scale_percent)
-}
-
-#[inline]
-pub(in crate::view) fn conflict_line_no_width(ui_scale_percent: u32) -> Pixels {
-    conflict_scaled_px(CONFLICT_DIFF_LINE_NO_WIDTH_PX, ui_scale_percent)
+pub(in crate::view) fn conflict_line_no_width(scale: impl Into<ui_scale::UiScale>) -> Pixels {
+    let scale = scale.into();
+    let ui_scale_percent = scale.percent();
+    conflict_scaled_px(
+        CONFLICT_DIFF_LINE_NO_WIDTH_PX * scale.appearance.editor_font_size_px as f32 / 13.0,
+        ui_scale_percent,
+    )
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -209,33 +204,134 @@ pub(in crate::view) enum CommitFileSort {
     #[default]
     PathAscending,
     PathDescending,
+    FileTypeAscending,
+    FileTypeDescending,
     EditSizeAscending,
     EditSizeDescending,
+    /// Files changed the same way next to each other: the largest set of
+    /// files sharing one edit first, then the files whose edit is their own.
+    Edits,
+}
+
+impl From<CommitFileSort> for gitcomet_state::model::RepositoryFileSort {
+    fn from(sort: CommitFileSort) -> Self {
+        match sort {
+            CommitFileSort::PathAscending => Self::PathAscending,
+            CommitFileSort::PathDescending => Self::PathDescending,
+            CommitFileSort::FileTypeAscending => Self::FileTypeAscending,
+            CommitFileSort::FileTypeDescending => Self::FileTypeDescending,
+            CommitFileSort::EditSizeAscending => Self::EditSizeAscending,
+            CommitFileSort::EditSizeDescending => Self::EditSizeDescending,
+            CommitFileSort::Edits => Self::Edits,
+        }
+    }
+}
+
+impl From<gitcomet_state::model::RepositoryFileSort> for CommitFileSort {
+    fn from(sort: gitcomet_state::model::RepositoryFileSort) -> Self {
+        use gitcomet_state::model::RepositoryFileSort;
+        match sort {
+            RepositoryFileSort::PathAscending => Self::PathAscending,
+            RepositoryFileSort::PathDescending => Self::PathDescending,
+            RepositoryFileSort::FileTypeAscending => Self::FileTypeAscending,
+            RepositoryFileSort::FileTypeDescending => Self::FileTypeDescending,
+            RepositoryFileSort::EditSizeAscending => Self::EditSizeAscending,
+            RepositoryFileSort::EditSizeDescending => Self::EditSizeDescending,
+            RepositoryFileSort::Edits => Self::Edits,
+        }
+    }
 }
 
 impl CommitFileSort {
-    pub(in crate::view) const ALL: [Self; 4] = [
+    pub(in crate::view) const ALL: [Self; 7] = [
         Self::PathAscending,
         Self::PathDescending,
+        Self::FileTypeAscending,
+        Self::FileTypeDescending,
         Self::EditSizeAscending,
         Self::EditSizeDescending,
+        Self::Edits,
     ];
 
-    pub(in crate::view) const fn label(self) -> &'static str {
+    /// The name the setting is stored under.
+    pub(in crate::view) const fn key(self) -> &'static str {
         match self {
-            Self::PathAscending => "Path A–Z",
-            Self::PathDescending => "Path Z–A",
-            Self::EditSizeAscending => "Edit size: Smallest",
-            Self::EditSizeDescending => "Edit size: Largest",
+            Self::PathAscending => "path_ascending",
+            Self::PathDescending => "path_descending",
+            Self::FileTypeAscending => "file_type_ascending",
+            Self::FileTypeDescending => "file_type_descending",
+            Self::EditSizeAscending => "edit_size_smallest",
+            Self::EditSizeDescending => "edit_size_largest",
+            Self::Edits => "edits",
         }
     }
 
-    pub(in crate::view) const fn control_label(self) -> &'static str {
+    pub(in crate::view) fn from_key(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sort| sort.key() == raw)
+    }
+
+    /// Whether the sort reads the line diff, which an untracked file lacks.
+    pub(in crate::view) const fn needs_line_stats(self) -> bool {
+        matches!(
+            self,
+            Self::EditSizeAscending | Self::EditSizeDescending | Self::Edits
+        )
+    }
+
+    /// Each option reads "Ascending"/"Descending" its own way -- path A→Z, file
+    /// type by extension A→Z -- so the direction word is the same everywhere and
+    /// the noun in front says what is being ordered. Edit size keeps
+    /// Smallest/Largest, which names the ends of that scale better than a
+    /// direction word does.
+    pub(in crate::view) const fn label(self) -> &'static str {
         match self {
-            Self::PathAscending => "Path A–Z",
-            Self::PathDescending => "Path Z–A",
-            Self::EditSizeAscending => "Edit size ↑",
-            Self::EditSizeDescending => "Edit size ↓",
+            Self::PathAscending => "Path: Ascending",
+            Self::PathDescending => "Path: Descending",
+            Self::FileTypeAscending => "File type: Ascending",
+            Self::FileTypeDescending => "File type: Descending",
+            Self::EditSizeAscending => "Edit size: Smallest",
+            Self::EditSizeDescending => "Edit size: Largest",
+            Self::Edits => "Edits: Repeated first",
+        }
+    }
+}
+
+/// The Edits sort's order over one list: files sharing an edit form a
+/// cluster, clusters come largest first (ties by their first path), then the
+/// files whose edit no other file shares, then those with no edit known.
+/// Path order applies inside each of those, so the result is stable.
+struct EditClusters {
+    by_edit: rustc_hash::FxHashMap<EditSignature, (usize, String)>,
+}
+
+impl EditClusters {
+    fn new<'a>(items: impl Iterator<Item = (Option<EditSignature>, &'a str)>) -> Self {
+        let mut by_edit = rustc_hash::FxHashMap::<EditSignature, (usize, String)>::default();
+        for (edit, path_key) in items {
+            let Some(edit) = edit else { continue };
+            let entry = by_edit
+                .entry(edit)
+                .or_insert_with(|| (0, path_key.to_owned()));
+            entry.0 += 1;
+            if path_key < entry.1.as_str() {
+                path_key.clone_into(&mut entry.1);
+            }
+        }
+        Self { by_edit }
+    }
+
+    /// Compared before the path. The edit itself is last, so two clusters
+    /// whose first paths compare equal still do not interleave.
+    fn rank(
+        &self,
+        edit: Option<EditSignature>,
+    ) -> (u8, std::cmp::Reverse<usize>, &str, Option<EditSignature>) {
+        match edit.and_then(|edit| Some((edit, self.by_edit.get(&edit)?))) {
+            Some((edit, (count, first))) if *count > 1 => {
+                (0, std::cmp::Reverse(*count), first.as_str(), Some(edit))
+            }
+            Some(_) => (1, std::cmp::Reverse(0), "", None),
+            None => (2, std::cmp::Reverse(0), "", None),
         }
     }
 }
@@ -279,13 +375,15 @@ impl CommitFileFilter {
         }
     }
 
-    pub(in crate::view) fn tooltip(self, count: usize) -> String {
+    /// `scope` names what the counts belong to — "this commit", "this worktree",
+    /// "this comparison" — so the same tabs read correctly above every list.
+    pub(in crate::view) fn tooltip_in(self, scope: &str, count: usize) -> String {
         match self {
-            Self::All => format!("Show every file changed by this commit ({count})"),
-            Self::Modified => format!("Show files modified by this commit ({count})"),
-            Self::Removed => format!("Show files deleted by this commit ({count})"),
-            Self::Added => format!("Show files added by this commit ({count})"),
-            Self::Renamed => format!("Show files renamed by this commit ({count})"),
+            Self::All => format!("Show every file changed by {scope} ({count})"),
+            Self::Modified => format!("Show files modified by {scope} ({count})"),
+            Self::Removed => format!("Show files deleted by {scope} ({count})"),
+            Self::Added => format!("Show files added by {scope} ({count})"),
+            Self::Renamed => format!("Show files renamed by {scope} ({count})"),
         }
     }
 
@@ -354,9 +452,20 @@ fn commit_file_path_sort_key(path: &std::path::Path) -> String {
     super::path_display::path_display_string(path).to_lowercase()
 }
 
+/// Groups a file with others of its kind. The extension alone, lowercased, so
+/// `.RS` and `.rs` land together; a file without one (Makefile, LICENSE) gets
+/// the empty key and they collect at the top. Path order breaks the ties inside
+/// a group, which is what keeps a group readable once you are in it.
+fn commit_file_type_sort_key(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_default()
+}
+
 fn compare_commit_file_paths(
-    left: &(usize, String),
-    right: &(usize, String),
+    left: &(usize, String, String),
+    right: &(usize, String, String),
     files: &[gitcomet_core::domain::CommitFileChange],
 ) -> std::cmp::Ordering {
     left.1
@@ -368,6 +477,101 @@ fn compare_commit_file_paths(
                 .cmp(files[right.0].path.as_os_str())
         })
         .then_with(|| left.0.cmp(&right.0))
+}
+
+/// Display order for one status section. Edit-size sorts use the lane's stats,
+/// placing unknown counts last and breaking ties by path.
+pub(in crate::view) fn status_section_sorted_indexes(
+    entries: &[gitcomet_core::domain::FileStatus],
+    indexes: &[usize],
+    sort: CommitFileSort,
+    stats: Option<&rustc_hash::FxHashMap<std::path::PathBuf, gitcomet_core::domain::LineStats>>,
+) -> std::sync::Arc<[usize]> {
+    let mut sortable: Vec<(usize, String, String)> = indexes
+        .iter()
+        .filter_map(|ix| {
+            entries.get(*ix).map(|entry| {
+                (
+                    *ix,
+                    commit_file_path_sort_key(&entry.path),
+                    matches!(
+                        sort,
+                        CommitFileSort::FileTypeAscending | CommitFileSort::FileTypeDescending
+                    )
+                    .then(|| commit_file_type_sort_key(&entry.path))
+                    .unwrap_or_default(),
+                )
+            })
+        })
+        .collect();
+
+    // Same shape as `build_commit_file_projection`: files with unknown sizes
+    // sort last, and path order breaks every tie so the result is stable.
+    let edit_size = |ix: usize| -> Option<u64> {
+        let entry = entries.get(ix)?;
+        let stats = stats?.get(&entry.path)?;
+        Some(u64::from(stats.additions?) + u64::from(stats.deletions?))
+    };
+    let edit = |ix: usize| -> Option<EditSignature> { stats?.get(&entries.get(ix)?.path)?.edit };
+    let clusters = (sort == CommitFileSort::Edits)
+        .then(|| EditClusters::new(sortable.iter().map(|item| (edit(item.0), item.1.as_str()))));
+    let by_path = |left: &(usize, String, String), right: &(usize, String, String)| {
+        left.1
+            .cmp(&right.1)
+            .then_with(|| {
+                entries[left.0]
+                    .path
+                    .as_os_str()
+                    .cmp(entries[right.0].path.as_os_str())
+            })
+            .then_with(|| left.0.cmp(&right.0))
+    };
+
+    sortable.sort_by(|left, right| match sort {
+        CommitFileSort::PathAscending => by_path(left, right),
+        CommitFileSort::PathDescending => by_path(left, right).reverse(),
+        CommitFileSort::FileTypeAscending | CommitFileSort::FileTypeDescending => {
+            let left_type = &left.2;
+            let right_type = &right.2;
+            // Only the group order flips; inside a group the path stays A→Z, the
+            // same way a descending edit-size sort still falls back to path order.
+            let type_order = if sort == CommitFileSort::FileTypeAscending {
+                left_type.cmp(right_type)
+            } else {
+                right_type.cmp(left_type)
+            };
+            type_order.then_with(|| by_path(left, right))
+        }
+        CommitFileSort::EditSizeAscending | CommitFileSort::EditSizeDescending => {
+            match (edit_size(left.0), edit_size(right.0)) {
+                (Some(left_size), Some(right_size)) => {
+                    let order = if sort == CommitFileSort::EditSizeAscending {
+                        left_size.cmp(&right_size)
+                    } else {
+                        right_size.cmp(&left_size)
+                    };
+                    order.then_with(|| by_path(left, right))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => by_path(left, right),
+            }
+        }
+        CommitFileSort::Edits => clusters
+            .as_ref()
+            .map(|clusters| {
+                clusters
+                    .rank(edit(left.0))
+                    .cmp(&clusters.rank(edit(right.0)))
+            })
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| by_path(left, right)),
+    });
+    sortable
+        .into_iter()
+        .map(|(ix, _, _)| ix)
+        .collect::<Vec<_>>()
+        .into()
 }
 
 fn build_commit_file_projection(
@@ -388,16 +592,46 @@ fn build_commit_file_projection(
         }
     }
 
-    let mut sortable: Vec<(usize, String)> = files
+    let mut sortable: Vec<(usize, String, String)> = files
         .iter()
         .enumerate()
         .filter(|(_, file)| filter.matches(file.kind))
-        .map(|(source_ix, file)| (source_ix, commit_file_path_sort_key(&file.path)))
+        .map(|(source_ix, file)| {
+            (
+                source_ix,
+                commit_file_path_sort_key(&file.path),
+                matches!(
+                    sort,
+                    CommitFileSort::FileTypeAscending | CommitFileSort::FileTypeDescending
+                )
+                .then(|| commit_file_type_sort_key(&file.path))
+                .unwrap_or_default(),
+            )
+        })
         .collect();
 
+    let clusters = (sort == CommitFileSort::Edits).then(|| {
+        EditClusters::new(
+            sortable
+                .iter()
+                .map(|item| (files[item.0].edit, item.1.as_str())),
+        )
+    });
     sortable.sort_by(|left, right| match sort {
         CommitFileSort::PathAscending => compare_commit_file_paths(left, right, files),
         CommitFileSort::PathDescending => compare_commit_file_paths(left, right, files).reverse(),
+        CommitFileSort::FileTypeAscending | CommitFileSort::FileTypeDescending => {
+            let left_type = &left.2;
+            let right_type = &right.2;
+            // Only the group order flips; inside a group the path stays A→Z, the
+            // same way a descending edit-size sort still falls back to path order.
+            let type_order = if sort == CommitFileSort::FileTypeAscending {
+                left_type.cmp(right_type)
+            } else {
+                right_type.cmp(left_type)
+            };
+            type_order.then_with(|| compare_commit_file_paths(left, right, files))
+        }
         CommitFileSort::EditSizeAscending | CommitFileSort::EditSizeDescending => {
             let left_size = commit_file_edit_size(&files[left.0]);
             let right_size = commit_file_edit_size(&files[right.0]);
@@ -415,12 +649,21 @@ fn build_commit_file_projection(
                 (None, None) => compare_commit_file_paths(left, right, files),
             }
         }
+        CommitFileSort::Edits => clusters
+            .as_ref()
+            .map(|clusters| {
+                clusters
+                    .rank(files[left.0].edit)
+                    .cmp(&clusters.rank(files[right.0].edit))
+            })
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| compare_commit_file_paths(left, right, files)),
     });
 
     CommitFileProjection {
         source_indices: sortable
             .into_iter()
-            .map(|(source_ix, _)| source_ix)
+            .map(|(source_ix, _, _)| source_ix)
             .collect::<Vec<_>>()
             .into(),
         counts,
@@ -480,6 +723,8 @@ fn commit_file_row_presentation_signature(
         ix.hash(&mut primary);
         kind_key.hash(&mut primary);
         path_bytes.hash(&mut primary);
+        // The chip is part of the row's presentation.
+        file.large_file.hash(&mut primary);
 
         kind_key.hash(&mut secondary);
         ix.hash(&mut secondary);
@@ -545,9 +790,14 @@ impl<K: Eq + Clone> CommitFileRowPresentationCache<K> {
         key: &K,
         files: &[gitcomet_core::domain::CommitFileChange],
     ) -> Arc<[CommitFileRowPresentation]> {
+        if let Some(entry) = &self.cached
+            && entry.key == *key
+        {
+            return Arc::clone(&entry.rows);
+        }
         let signature = commit_file_row_presentation_signature(files);
         if let Some(reused_rows) = self.cached.as_ref().and_then(|entry| {
-            if entry.key == *key || entry.signature == signature {
+            if entry.signature == signature {
                 Some(entry.rows.clone())
             } else {
                 None
@@ -656,6 +906,289 @@ pub(in crate::view) const fn commit_file_kind_visuals(
     COMMIT_FILE_KIND_VISUALS[kind as usize]
 }
 
+/// Row wash strength. Dark surfaces need a touch more of it than light ones to
+/// read at all. These four are the only knobs the tint has -- turn them here.
+const ROW_TINT_ALPHA_DARK: f32 = 0.13;
+const ROW_TINT_ALPHA_LIGHT: f32 = 0.11;
+const CONFLICT_ROW_TINT_ALPHA_DARK: f32 = 0.20;
+const CONFLICT_ROW_TINT_ALPHA_LIGHT: f32 = 0.16;
+
+/// Background wash marking a file row's change kind, or `None` for a kind that
+/// keeps the plain surface. Modified is that untinted default: in an unstaged
+/// list nearly every row is one, so tinting it would drown the add/delete
+/// signal the wash exists for.
+///
+/// Always translucent, and that is load-bearing -- [`tinted_row_bg`] folds this
+/// into the hover, selection and pressed fills too, and an opaque tint would
+/// flatten all three into one colour.
+pub(in crate::view) fn file_kind_row_tint(
+    kind: FileStatusKind,
+    theme: &AppTheme,
+) -> Option<gpui::Rgba> {
+    let (color, alpha) = match kind {
+        FileStatusKind::Modified => return None,
+        FileStatusKind::Untracked | FileStatusKind::Added => (
+            theme.colors.status.success.foreground,
+            row_tint_alpha(theme.is_dark),
+        ),
+        FileStatusKind::Deleted => (
+            theme.colors.status.danger.foreground,
+            row_tint_alpha(theme.is_dark),
+        ),
+        FileStatusKind::Renamed => (
+            theme.colors.accent.foreground,
+            row_tint_alpha(theme.is_dark),
+        ),
+        // Louder than the rest: a conflict is the one kind that blocks you.
+        FileStatusKind::Conflicted => (
+            theme.colors.status.danger.foreground,
+            if theme.is_dark {
+                CONFLICT_ROW_TINT_ALPHA_DARK
+            } else {
+                CONFLICT_ROW_TINT_ALPHA_LIGHT
+            },
+        ),
+    };
+    Some(with_alpha(color, alpha))
+}
+
+/// Background wash for an explorer row that is normally out of sight; ignored
+/// wins over hidden. Hidden rows lean toward the canvas, away from the hover
+/// overlay, so they never read as hovered. Translucent like the kind tints.
+pub(in crate::view) fn explorer_row_tint(
+    theme: &AppTheme,
+    hidden: bool,
+    ignored: bool,
+) -> Option<gpui::Rgba> {
+    if ignored {
+        Some(with_alpha(theme.colors.status.warning.foreground, 0.10))
+    } else if hidden {
+        Some(with_alpha(theme.colors.surface.canvas, 0.45))
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn row_tint_alpha(is_dark: bool) -> f32 {
+    if is_dark {
+        ROW_TINT_ALPHA_DARK
+    } else {
+        ROW_TINT_ALPHA_LIGHT
+    }
+}
+
+/// Fold a row tint into whatever background the row would otherwise wear, so a
+/// tinted row still answers hover, selection and press.
+#[inline]
+pub(in crate::view) fn tinted_row_bg(base: gpui::Rgba, tint: Option<gpui::Rgba>) -> gpui::Rgba {
+    tint.map_or(base, |tint| composite_over(base, tint))
+}
+
+/// Leading glyph for a file row: the file-type icon in its brand tint. A
+/// conflict keeps its warning glyph instead -- the row wash cannot say "this
+/// one needs your hands", and the file type is the least useful thing to know
+/// about a row you have to go fix.
+pub(in crate::view) fn file_row_icon(
+    path: &std::path::Path,
+    kind: FileStatusKind,
+    theme: &AppTheme,
+) -> (&'static str, gpui::Rgba) {
+    if kind == FileStatusKind::Conflicted {
+        return ("icons/warning.svg", theme.colors.status.danger.foreground);
+    }
+    let icon = crate::view::file_icons::file_icon_for_path(path);
+    let color = crate::view::file_icons::file_icon_color(icon, theme.is_dark)
+        .unwrap_or(theme.colors.foreground.secondary);
+    (icon, color)
+}
+
+/// Design size of the kind badge riding on a file row's type icon, and of the
+/// disc it sits on. The glyphs are drawn for a 16px box, so below ~10 the
+/// pencil turns to mush and the minus reads as nothing at all; the disc is what
+/// buys back the contrast the shrink costs.
+const FILE_ROW_BADGE_PX: f32 = 10.0;
+const FILE_ROW_BADGE_DISC_PX: f32 = 12.0;
+
+/// The change-kind glyph a file row wears on the corner of its type icon, or
+/// `None` for the two kinds that go bare.
+///
+/// Modified is the untouched default throughout -- no wash, and no badge
+/// either: the pencil is the badge you would see most and the one that reads
+/// worst at this size, and a list where almost every row wears it says nothing.
+/// A conflict's own glyph is already the warning triangle, so a second badge on
+/// top of it adds nothing.
+pub(in crate::view) fn file_row_kind_badge(
+    kind: FileStatusKind,
+    theme: &AppTheme,
+) -> Option<(&'static str, gpui::Rgba)> {
+    let visuals = commit_file_kind_visuals(kind);
+    match kind {
+        FileStatusKind::Modified | FileStatusKind::Conflicted => None,
+        _ => Some((visuals.icon, visuals.color(theme))),
+    }
+}
+
+/// A file row's leading icon slot: the file-type glyph, with the change kind
+/// badged on its top-right corner.
+pub(in crate::view) fn file_row_icon_slot(
+    icon: &'static str,
+    color: gpui::Rgba,
+    badge: Option<(&'static str, gpui::Rgba)>,
+    disc: FileRowBadgeDisc,
+    icon_px: f32,
+    slot_px: f32,
+    ui_scale_percent: u32,
+) -> gpui::Div {
+    let scaled = |value: f32| crate::ui_scale::design_px_from_percent(value, ui_scale_percent);
+    div()
+        .w(scaled(slot_px))
+        .h(scaled(slot_px))
+        .flex_none()
+        // Anchors the badge; the row is `items_center`, so without it the badge
+        // would hang off the row box rather than the icon.
+        .relative()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(svg_icon(icon, color, scaled(icon_px)))
+        .when_some(badge, |slot, (badge_icon, badge_color)| {
+            slot.child(
+                div()
+                    .id("file_row_kind_badge")
+                    .absolute()
+                    // Out past the slot's corner: the type glyphs fill their
+                    // box, so a badge tucked inside would sit on top of one.
+                    .top(scaled(-3.0))
+                    .right(scaled(-4.0))
+                    .size(scaled(FILE_ROW_BADGE_DISC_PX))
+                    .rounded_full()
+                    .bg(disc.resting)
+                    .when_some(disc.hover, |badge, (group, hovered)| {
+                        badge.group_hover(group, |badge| badge.bg(hovered))
+                    })
+                    .when_some(disc.pressed, |badge, (group, pressed)| {
+                        badge.group_active(group, |badge| badge.bg(pressed))
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(svg_icon(badge_icon, badge_color, scaled(FILE_ROW_BADGE_PX))),
+            )
+        })
+}
+
+/// The fills the badge disc wears. It borrows the row's own background so the
+/// glyph reads against the type icon underneath -- which means it has to track
+/// the row through hover too, or a lit row shows a stale circle under the
+/// pointer.
+#[derive(Clone)]
+pub(in crate::view) struct FileRowBadgeDisc {
+    pub(in crate::view) resting: gpui::Rgba,
+    /// The row's hover group and the fill it takes inside it. `None` on lists
+    /// whose rows carry no group.
+    pub(in crate::view) hover: Option<(SharedString, gpui::Rgba)>,
+    pressed: Option<(SharedString, gpui::Rgba)>,
+}
+
+impl FileRowBadgeDisc {
+    /// A disc on a surface that does not react to the pointer, such as the
+    /// diff's header.
+    pub(in crate::view) fn still(background: gpui::Rgba) -> Self {
+        Self {
+            resting: background,
+            hover: None,
+            pressed: None,
+        }
+    }
+}
+
+/// One state/color calculation for file rows and the opaque discs laid over
+/// their icons. Change-kind tints remain visible in every interaction state.
+pub(in crate::view) struct FileRowInteraction {
+    style: crate::kit::interaction::InteractionStyle,
+    state: crate::kit::interaction::InteractionState,
+    surface: gpui::Rgba,
+}
+
+impl FileRowInteraction {
+    pub(in crate::view) fn new(
+        theme: AppTheme,
+        tint: Option<gpui::Rgba>,
+        selected: bool,
+        open: bool,
+    ) -> Self {
+        let mut canvas = theme.colors.surface.canvas;
+        if canvas.alpha < 1.0 {
+            // Custom themes may have translucent canvases. The row and its icon
+            // mask need a shared opaque backing to flatten interaction fills.
+            let appearance = if theme.is_dark {
+                gpui::WindowAppearance::Dark
+            } else {
+                gpui::WindowAppearance::Light
+            };
+            let backing = AppTheme::default_for_window_appearance(appearance);
+            canvas = composite_over(backing.colors.surface.canvas, canvas);
+        }
+        let surface = tinted_row_bg(canvas, tint);
+        Self {
+            style: crate::kit::interaction::InteractionStyle::new(theme).on_surface(surface),
+            state: crate::kit::interaction::InteractionState::default()
+                .selected(
+                    selected,
+                    crate::theme::composite_over(
+                        surface,
+                        crate::theme::with_alpha(
+                            theme.colors.accent.foreground,
+                            if theme.is_dark { 0.16 } else { 0.10 },
+                        ),
+                    ),
+                )
+                .open(open),
+            surface,
+        }
+    }
+
+    pub(in crate::view) fn disabled(mut self, disabled: bool) -> Self {
+        self.state = self.state.disabled(disabled);
+        self
+    }
+
+    pub(in crate::view) fn badge_disc(&self, group: SharedString) -> FileRowBadgeDisc {
+        use crate::kit::interaction::InteractionFeedback;
+        FileRowBadgeDisc {
+            pressed: Some((
+                group.clone(),
+                self.style.resolved_background(
+                    self.surface,
+                    self.state,
+                    InteractionFeedback::Pressed,
+                ),
+            )),
+            resting: self.style.resolved_background(
+                self.surface,
+                self.state,
+                InteractionFeedback::Resting,
+            ),
+            hover: Some((
+                group.clone(),
+                self.style.resolved_background(
+                    self.surface,
+                    self.state,
+                    InteractionFeedback::Hovered,
+                ),
+            )),
+        }
+    }
+
+    pub(in crate::view) fn apply(
+        self,
+        row: gpui::Stateful<gpui::Div>,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.style.apply(row, self.state)
+    }
+}
+
 #[inline]
 fn commit_file_visuals(file: &gitcomet_core::domain::CommitFileChange) -> CommitFileKindVisuals {
     let base = commit_file_kind_visuals(file.kind);
@@ -704,15 +1237,73 @@ mod canvas_text;
 mod conflict_canvas;
 mod conflict_resolver;
 mod diff;
+pub(in crate::view) use diff::BlameLabelCache;
+
+/// A comparison/multi-selection card's per-commit strings, prepared once.
+pub(in crate::view) struct CommitCard {
+    pub(in crate::view) short_sha: gpui::SharedString,
+    pub(in crate::view) summary: gpui::SharedString,
+    pub(in crate::view) author: gpui::SharedString,
+    pub(in crate::view) unix_secs: Option<i64>,
+}
+
+impl CommitCard {
+    pub(in crate::view) fn new(commit: gitcomet_core::domain::Commit) -> Self {
+        let short_sha: gpui::SharedString = commit
+            .id
+            .as_ref()
+            .get(0..8)
+            .unwrap_or(commit.id.as_ref())
+            .to_string()
+            .into();
+        let unix_secs = commit
+            .time
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        Self {
+            short_sha,
+            summary: gpui::SharedString::from(std::sync::Arc::clone(&commit.summary)),
+            author: gpui::SharedString::from(std::sync::Arc::clone(&commit.author)),
+            unix_secs: Some(unix_secs),
+        }
+    }
+
+    pub(in crate::view) fn unloaded(id: &gitcomet_core::domain::CommitId) -> Self {
+        Self {
+            short_sha: id
+                .as_ref()
+                .get(..8)
+                .unwrap_or(id.as_ref())
+                .to_owned()
+                .into(),
+            summary: "Commit details not loaded".into(),
+            author: "".into(),
+            unix_secs: None,
+        }
+    }
+}
+
 mod diff_canvas;
+mod file_list;
+pub(in crate::view) use file_list::{
+    ChangedFileRow, CollapsedDirs, DirectoryRowDetail, DirectoryRowProps, DirectoryToggle,
+    FileListId, FileListMultiSelection, FileListPlan, FileListPlanCache, FileListRow, FileOrdinal,
+    FileTree, FileTreeItem, GroupHeaderProps, PlanShape, RowIx, StickyGroupHeaders,
+    changed_file_directory_row, changed_file_row, directory_row, directory_row_detail_for_width,
+    file_list_folder_menu_invoker, file_list_projection_key, file_list_projection_key_scoped,
+    file_row_indent_px, group_header_row,
+};
 mod diff_text;
 mod history;
+pub(in crate::view) use history::history_row_height;
 mod history_canvas;
 pub(in crate::view) mod history_graph_paint;
 mod markdown_document;
 mod markdown_flow_text;
 pub(in crate::view) mod sidebar;
 mod status;
+pub(in crate::view) use status::apply_file_list_selection_click;
 
 #[cfg(feature = "benchmarks")]
 pub(crate) mod benchmarks;
@@ -722,29 +1313,39 @@ pub(in crate::view) use self::conflict_resolver::{
 };
 pub(in crate::view) use self::diff::{BlameRenderCtx, build_row_blame_paint};
 pub(in crate::view) use self::diff_canvas::blame_gutter_row_canvas;
+#[cfg(test)]
+pub(in crate::view) use self::history::take_markdown_image_stats_for_tests;
 pub(in crate::view) use self::history::{
-    MarkdownPreviewImagePolicy, MarkdownPreviewImageSource, MarkdownPreviewPictureSizes,
-    MarkdownPreviewQuery, MarkdownPreviewRevealRequest, markdown_preview_alert_bar_color,
-    markdown_preview_alert_label, markdown_preview_flow_image, markdown_preview_highlighted_text,
-    markdown_preview_image_source, markdown_preview_inline_image, markdown_preview_marker_label,
-    markdown_preview_reveal_offset_y, markdown_preview_row_background, markdown_preview_row_extent,
-    markdown_preview_styled_row_with_query, worktree_markdown_preview_bar_color,
+    MarkdownDrawnPictures, MarkdownImageRoot, MarkdownPictureContext, MarkdownPreviewHoveredLink,
+    MarkdownPreviewImageSource, MarkdownPreviewPictureSizes, MarkdownPreviewQuery,
+    MarkdownPreviewRevealRequest, MarkdownRemoteImageAccess, markdown_preview_alert_bar_color,
+    markdown_preview_alert_label, markdown_preview_document_path, markdown_preview_flow_image,
+    markdown_preview_highlighted_text, markdown_preview_image_source,
+    markdown_preview_inline_image, markdown_preview_justify, markdown_preview_local_link_missing,
+    markdown_preview_local_link_target, markdown_preview_marker_label,
+    markdown_preview_remote_image_url, markdown_preview_reveal_offset_y,
+    markdown_preview_row_background, markdown_preview_row_extent,
+    markdown_preview_styled_row_with_query, markdown_preview_task_checkbox,
+    percent_decode_link_path, worktree_markdown_preview_bar_color,
 };
 pub(in crate::view) use self::markdown_document::{
-    MarkdownDocumentBlockCache, MarkdownDocumentBlockScrolls, MarkdownDocumentContext,
-    render_markdown_document,
+    MarkdownChangeExtents, MarkdownDocumentBlockCache, MarkdownDocumentBlockScrolls,
+    MarkdownDocumentContext, MarkdownDocumentLayoutCache, MarkdownRowBoxes,
+    render_markdown_diff_split, render_markdown_document, render_markdown_document_with_blocks,
 };
 #[cfg(test)]
 pub(in crate::view) use self::markdown_flow_text::{
-    MarkdownFlowPaintPhase, begin_markdown_flow_paint_phase_capture_for_tests,
-    clear_markdown_selection_paint_log_for_tests, markdown_flow_paint_phases_for_tests,
-    markdown_selection_paint_log_for_tests,
+    MarkdownFlowPaintPhase, begin_markdown_flow_font_capture_for_tests,
+    begin_markdown_flow_paint_phase_capture_for_tests,
+    clear_markdown_selection_paint_log_for_tests, markdown_flow_fonts_for_tests,
+    markdown_flow_paint_phases_for_tests, markdown_selection_paint_log_for_tests,
+    take_markdown_flow_texts_built_for_tests,
 };
 pub(in crate::view) use self::markdown_flow_text::{
-    markdown_flow_painted_offset, markdown_flow_row_offset,
+    markdown_flow_painted_offset, markdown_flow_range_rects, markdown_flow_row_offset,
 };
-pub(in crate::view) use self::sidebar::active_workspace_paths_by_branch;
-pub(in crate::view) use self::sidebar::listed_workspace_paths_by_branch;
+pub(in crate::view) use self::sidebar::active_worktree_paths_by_branch;
+pub(in crate::view) use self::sidebar::listed_worktree_paths_by_branch;
 
 #[cfg(any(test, feature = "benchmarks"))]
 pub(in crate::view) use diff_text::has_pending_prepared_diff_syntax_chunk_builds_for_document;
@@ -767,7 +1368,7 @@ pub(in crate::view) use diff_text::{
     prepared_diff_syntax_line_for_one_based_line,
     prepared_diff_syntax_occurrences_at_display_offset,
     prepared_diff_syntax_pair_at_display_offset, prepared_diff_syntax_reparse_seed,
-    query_highlight_colors, request_syntax_highlights_for_prepared_document_byte_range,
+    query_highlight_style, request_syntax_highlights_for_prepared_document_byte_range,
     resolved_output_line_text, shared_byte_affix_bounds, syntax_highlights_for_line,
     whitespace_visible_line_text,
 };
@@ -786,7 +1387,9 @@ pub(in crate::view) use self::diff_canvas::{
 };
 #[cfg(test)]
 pub(in crate::view) use self::diff_canvas::{
-    DiffPaintRecord, clear_diff_paint_log_for_tests, diff_paint_log_for_tests,
+    DiffPaintRecord, FocusedChangeBlockPaint, clear_diff_paint_log_for_tests,
+    clear_focused_change_block_paint_log_for_tests, diff_paint_log_for_tests,
+    focused_change_block_paint_log_for_tests,
 };
 
 #[cfg(test)]
@@ -799,8 +1402,261 @@ pub(in crate::view) use diff_text::{
 mod tests {
     use super::*;
     use gitcomet_core::domain::{CommitFileChange, FileStatusKind};
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
+
+    /// Every bundled theme, so a tint invariant is proved against every
+    /// palette that ships rather than the default dark one alone.
+    fn bundled_themes() -> Vec<AppTheme> {
+        crate::theme::bundled_theme_keys()
+            .into_iter()
+            .map(|(key, _)| {
+                AppTheme::from_key(&key).unwrap_or_else(|| panic!("bundled theme `{key}`"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn file_row_icon_names_the_file_type() {
+        let theme = AppTheme::from_key("gitcomet_dark").expect("bundled theme");
+
+        let (icon, color) =
+            file_row_icon(Path::new("src/main.rs"), FileStatusKind::Modified, &theme);
+        assert_eq!(icon, "icons/file_icons/rust.svg");
+        assert_ne!(
+            color, theme.colors.foreground.secondary,
+            "a known type should carry its brand tint, not the neutral fallback",
+        );
+
+        // Same file, every non-conflict kind: the glyph is the type, not the change.
+        for kind in [
+            FileStatusKind::Untracked,
+            FileStatusKind::Added,
+            FileStatusKind::Deleted,
+            FileStatusKind::Renamed,
+        ] {
+            assert_eq!(
+                file_row_icon(Path::new("src/main.rs"), kind, &theme).0,
+                "icons/file_icons/rust.svg",
+            );
+        }
+
+        let (icon, _) = file_row_icon(Path::new("nope.wat-is-this"), FileStatusKind::Added, &theme);
+        assert_eq!(icon, "icons/file_icons/file.svg", "unknown types fall back");
+    }
+
+    #[test]
+    fn conflicts_keep_their_warning_glyph() {
+        let theme = AppTheme::from_key("gitcomet_dark").expect("bundled theme");
+        let (icon, color) =
+            file_row_icon(Path::new("src/main.rs"), FileStatusKind::Conflicted, &theme);
+
+        assert_eq!(icon, "icons/warning.svg");
+        assert_eq!(color, theme.colors.status.danger.foreground);
+    }
+
+    #[test]
+    fn only_added_deleted_and_renamed_wear_a_badge() {
+        let theme = AppTheme::from_key("gitcomet_dark").expect("bundled theme");
+
+        for bare in [FileStatusKind::Modified, FileStatusKind::Conflicted] {
+            assert_eq!(
+                file_row_kind_badge(bare, &theme),
+                None,
+                "{bare:?} goes bare: the pencil reads worst at badge size and a \
+                 conflict already shows a warning triangle",
+            );
+        }
+        for kind in [
+            FileStatusKind::Untracked,
+            FileStatusKind::Added,
+            FileStatusKind::Deleted,
+            FileStatusKind::Renamed,
+        ] {
+            let (icon, color) = file_row_kind_badge(kind, &theme).expect("badged kind");
+            let visuals = commit_file_kind_visuals(kind);
+            assert_eq!(icon, visuals.icon, "{kind:?} badge reuses the kind glyph");
+            assert_eq!(color, visuals.color(&theme));
+        }
+    }
+
+    /// The badge disc is punched out of the row, so its resting fill has to be
+    /// the row's resting fill and its hover fill the row's hover fill -- a disc
+    /// that does not move leaves a stale circle under the pointer.
+    #[test]
+    fn badge_disc_tracks_the_row_it_sits_on() {
+        for theme in bundled_themes() {
+            for kind in [FileStatusKind::Modified, FileStatusKind::Deleted] {
+                let tint = file_kind_row_tint(kind, &theme);
+                let resting = tinted_row_bg(theme.colors.surface.canvas, tint);
+                let hovered = tinted_row_bg(theme.colors.interaction.hover_background, tint);
+                assert_ne!(
+                    resting, hovered,
+                    "{kind:?} disc must have somewhere to move to",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explorer_rows_tint_ignored_over_hidden_and_never_like_hover() {
+        for theme in bundled_themes() {
+            assert_eq!(explorer_row_tint(&theme, false, false), None);
+            let ignored = explorer_row_tint(&theme, false, true).expect("ignored tint");
+            assert_eq!(explorer_row_tint(&theme, true, true), Some(ignored));
+            let hidden = explorer_row_tint(&theme, true, false).expect("hidden tint");
+            assert_ne!(hidden, ignored);
+
+            // Hover moves the chrome toward the text colour; a hidden row must
+            // move it the other way.
+            let chrome = theme.colors.surface.chrome;
+            let lightness = |c: gpui::Rgba| c.red + c.green + c.blue;
+            let hovered = composite_over(chrome, theme.hover_overlay());
+            let washed = composite_over(chrome, hidden);
+            assert!(
+                (lightness(hovered) - lightness(chrome)) * (lightness(washed) - lightness(chrome))
+                    < 0.0,
+                "{chrome:?}: hover {hovered:?}, hidden {washed:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_modified_rows_go_untinted() {
+        for theme in bundled_themes() {
+            assert_eq!(
+                file_kind_row_tint(FileStatusKind::Modified, &theme),
+                None,
+                "modified is the untinted default",
+            );
+            for kind in [
+                FileStatusKind::Untracked,
+                FileStatusKind::Added,
+                FileStatusKind::Deleted,
+                FileStatusKind::Renamed,
+                FileStatusKind::Conflicted,
+            ] {
+                assert!(
+                    file_kind_row_tint(kind, &theme).is_some(),
+                    "{kind:?} should be tinted",
+                );
+            }
+        }
+    }
+
+    /// The invariant the whole treatment rests on: `.bg()` replaces rather than
+    /// layers, so an opaque tint would flatten resting, hover and press into one
+    /// colour and the row would stop answering the mouse.
+    #[test]
+    fn every_tint_is_translucent_and_leaves_hover_visible() {
+        for theme in bundled_themes() {
+            for kind in [
+                FileStatusKind::Untracked,
+                FileStatusKind::Added,
+                FileStatusKind::Deleted,
+                FileStatusKind::Renamed,
+                FileStatusKind::Conflicted,
+            ] {
+                let tint = file_kind_row_tint(kind, &theme).expect("tinted kind");
+                assert!(tint.alpha < 1.0, "{kind:?} tint must stay translucent");
+
+                let resting = tinted_row_bg(theme.colors.surface.canvas, Some(tint));
+                let hovered = tinted_row_bg(theme.colors.interaction.hover_background, Some(tint));
+                let pressed =
+                    tinted_row_bg(theme.colors.interaction.pressed_background, Some(tint));
+
+                assert_ne!(resting, hovered, "{kind:?} row must still answer hover");
+                assert_ne!(hovered, pressed, "{kind:?} row must still answer press");
+                assert_ne!(
+                    resting, theme.colors.surface.canvas,
+                    "{kind:?} tint must actually shift the surface",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn file_row_interactions_support_translucent_canvases() {
+        use crate::kit::interaction::InteractionFeedback;
+
+        for base_theme in [AppTheme::gitcomet_dark(), AppTheme::gitcomet_light()] {
+            for alpha in [0.0, 0.5, 1.0] {
+                let mut theme = base_theme;
+                theme.colors.surface.canvas = gpui::Rgba::new(0.2, 0.4, 0.6, alpha);
+                let canvas = composite_over(
+                    base_theme.colors.surface.canvas,
+                    theme.colors.surface.canvas,
+                );
+                for kind in [FileStatusKind::Modified, FileStatusKind::Deleted] {
+                    let tint = file_kind_row_tint(kind, &theme);
+                    let surface = tinted_row_bg(canvas, tint);
+                    for (selected, open) in
+                        [(false, false), (true, false), (false, true), (true, true)]
+                    {
+                        let interaction = FileRowInteraction::new(theme, tint, selected, open);
+                        let disc = interaction.badge_disc("row".into());
+                        for (feedback, actual) in [
+                            (InteractionFeedback::Resting, disc.resting),
+                            (InteractionFeedback::Hovered, disc.hover.unwrap().1),
+                            (InteractionFeedback::Pressed, disc.pressed.unwrap().1),
+                        ] {
+                            let overlay = if open {
+                                Some(theme.active_overlay())
+                            } else if selected {
+                                Some(with_alpha(
+                                    theme.colors.accent.foreground,
+                                    if theme.is_dark { 0.16 } else { 0.10 },
+                                ))
+                            } else {
+                                match feedback {
+                                    InteractionFeedback::Resting => None,
+                                    InteractionFeedback::Hovered => Some(theme.hover_overlay()),
+                                    InteractionFeedback::Pressed => Some(theme.active_overlay()),
+                                }
+                            };
+                            let expected =
+                                overlay.map_or(surface, |color| composite_over(surface, color));
+                            assert_eq!(actual.alpha, 1.0);
+                            for (actual, expected) in [
+                                (actual.red, expected.red),
+                                (actual.green, expected.green),
+                                (actual.blue, expected.blue),
+                            ] {
+                                assert!(
+                                    (actual - expected).abs() < 1e-6,
+                                    "alpha={alpha}, kind={kind:?}, selected={selected}, open={open}, feedback={feedback:?}"
+                                );
+                            }
+                        }
+                        // Both status and commit-file rows apply this same style.
+                        interaction.apply(div().id("translucent_file_row"));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn file_row_badges_preserve_selection_and_tint_through_hover_and_press() {
+        for theme in [AppTheme::gitcomet_dark(), AppTheme::gitcomet_light()] {
+            let tint = file_kind_row_tint(FileStatusKind::Deleted, &theme).expect("tinted kind");
+            let selected =
+                FileRowInteraction::new(theme, Some(tint), true, false).badge_disc("row".into());
+            let plain = FileRowInteraction::new(theme, None, true, false).badge_disc("row".into());
+            assert_eq!(selected.resting.alpha, 1.0);
+            assert_ne!(
+                selected.resting, plain.resting,
+                "change-kind tint survives selection"
+            );
+            assert_eq!(selected.resting, selected.hover.unwrap().1);
+            assert_eq!(selected.resting, selected.pressed.unwrap().1);
+            let open =
+                FileRowInteraction::new(theme, Some(tint), true, true).badge_disc("row".into());
+            assert_ne!(open.resting, selected.resting);
+            assert_eq!(open.resting, open.hover.unwrap().1);
+            assert_eq!(open.resting, open.pressed.unwrap().1);
+        }
+    }
 
     fn reset_line_number_string_cache() {
         LINE_NUMBER_STRINGS.with(|cache| {
@@ -941,32 +1797,17 @@ mod tests {
         let mut cache: CommitFileRowPresentationCache<u64> =
             CommitFileRowPresentationCache::default();
         let files = vec![
-            CommitFileChange {
-                path: PathBuf::from("src/lib.rs"),
-                kind: FileStatusKind::Modified,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            },
-            CommitFileChange {
-                path: PathBuf::from("README.md"),
-                kind: FileStatusKind::Added,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            },
+            CommitFileChange::new(PathBuf::from("src/lib.rs"), FileStatusKind::Modified),
+            CommitFileChange::new(PathBuf::from("README.md"), FileStatusKind::Added),
         ];
 
         let first = cache.rows_for(&7, &files);
         let reused = cache.rows_for(
             &7,
-            &[CommitFileChange {
-                path: PathBuf::from("should/not/appear.rs"),
-                kind: FileStatusKind::Deleted,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            }],
+            &[CommitFileChange::new(
+                PathBuf::from("should/not/appear.rs"),
+                FileStatusKind::Deleted,
+            )],
         );
 
         assert!(Arc::ptr_eq(&first, &reused));
@@ -988,13 +1829,10 @@ mod tests {
 
         let replacement = cache.rows_for(
             &8,
-            &[CommitFileChange {
-                path: PathBuf::from("docs/guide.md"),
-                kind: FileStatusKind::Renamed,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            }],
+            &[CommitFileChange::new(
+                PathBuf::from("docs/guide.md"),
+                FileStatusKind::Renamed,
+            )],
         );
 
         assert!(!Arc::ptr_eq(&first, &replacement));
@@ -1011,19 +1849,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn commit_file_signature_changes_with_large_file_state() {
+        let plain = vec![commit_file("a.bin", FileStatusKind::Modified, None, None)];
+        let mut managed = plain.clone();
+        managed[0].large_file = Some(gitcomet_core::large_files::LargeFileState {
+            pointer: gitcomet_core::large_files::LargeFilePointer::Lfs(
+                gitcomet_core::lfs::LfsPointer {
+                    oid: gitcomet_core::lfs::LfsOid([1; 32]),
+                    size: 5,
+                },
+            ),
+            in_local_store: Some(true),
+            worktree: None,
+            lockable: false,
+        });
+        assert_ne!(
+            commit_file_row_presentation_signature(&plain),
+            commit_file_row_presentation_signature(&managed),
+            "a chip appearing must invalidate cached rows"
+        );
+    }
+
     fn commit_file(
         path: &str,
         kind: FileStatusKind,
         additions: Option<u32>,
         deletions: Option<u32>,
     ) -> CommitFileChange {
-        CommitFileChange {
-            path: PathBuf::from(path),
-            kind,
-            is_submodule: false,
-            additions,
-            deletions,
-        }
+        CommitFileChange::new(PathBuf::from(path), kind).with_line_counts(additions, deletions)
     }
 
     #[test]
@@ -1063,8 +1917,12 @@ mod tests {
             ["All", "Modified", "Deleted", "Added", "Renamed"]
         );
         assert_eq!(
-            CommitFileFilter::Removed.tooltip(1),
+            CommitFileFilter::Removed.tooltip_in("this commit", 1),
             "Show files deleted by this commit (1)"
+        );
+        assert_eq!(
+            CommitFileFilter::Removed.tooltip_in("this worktree", 2),
+            "Show files deleted by this worktree (2)"
         );
     }
 
@@ -1114,6 +1972,127 @@ mod tests {
 
         assert_eq!(ascending.source_indices.as_ref(), &[3, 1, 0, 2]);
         assert_eq!(descending.source_indices.as_ref(), &[0, 3, 1, 2]);
+    }
+
+    #[test]
+    fn file_type_sort_groups_by_extension_then_path() {
+        let files = vec![
+            commit_file("src/ui/view.ts", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("Makefile", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("src/main.rs", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("Cargo.toml", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("src/ui/app.ts", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file(
+                "src/core/lib.RS",
+                FileStatusKind::Modified,
+                Some(1),
+                Some(1),
+            ),
+        ];
+
+        let ascending = build_commit_file_projection(
+            &files,
+            CommitFileSort::FileTypeAscending,
+            CommitFileFilter::All,
+        );
+
+        // "" (Makefile) < rs < toml < ts, and `.RS` groups with `.rs`.
+        assert_eq!(ascending.source_indices.as_ref(), &[1, 5, 2, 3, 4, 0]);
+    }
+
+    #[test]
+    fn file_type_descending_flips_the_groups_but_not_the_paths_inside_them() {
+        let files = vec![
+            commit_file("b.rs", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("a.ts", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("a.rs", FileStatusKind::Modified, Some(1), Some(1)),
+            commit_file("b.ts", FileStatusKind::Modified, Some(1), Some(1)),
+        ];
+
+        let descending = build_commit_file_projection(
+            &files,
+            CommitFileSort::FileTypeDescending,
+            CommitFileFilter::All,
+        );
+
+        // ts before rs, but a.* before b.* within each -- reading a group is
+        // still alphabetical, only the group order reverses.
+        assert_eq!(descending.source_indices.as_ref(), &[1, 3, 2, 0]);
+    }
+
+    pub(in crate::view) fn edit(text: &str) -> Option<EditSignature> {
+        let mut edit = gitcomet_core::edit_signature::EditSignatureBuilder::default();
+        edit.added(text.as_bytes());
+        edit.finish()
+    }
+
+    #[test]
+    fn edits_put_the_largest_shared_edit_first_then_singles_then_unknown() {
+        let file = |path: &str, text: Option<&str>| {
+            commit_file(path, FileStatusKind::Modified, Some(1), Some(1))
+                .with_edit(text.and_then(edit))
+        };
+        let files = vec![
+            file("z/one.rs", Some("a")),
+            file("b.rs", Some("b")),
+            file("a.rs", Some("a")),
+            file("c.rs", Some("b")),
+            file("d.rs", Some("b")),
+            file("solo2.rs", Some("c")),
+            file("solo1.rs", Some("d")),
+            file("bin.png", None),
+            file("aaa.rs", None),
+            file("0.rs", Some("e")),
+            file("y.rs", Some("e")),
+        ];
+
+        let projection =
+            build_commit_file_projection(&files, CommitFileSort::Edits, CommitFileFilter::All);
+
+        // Three share "b"; "e" and "a" share by two each, "e" first by its
+        // first path; then the singles and the unknown, each by path.
+        assert_eq!(
+            projection.source_indices.as_ref(),
+            &[1, 3, 4, 9, 10, 2, 0, 6, 5, 8, 7]
+        );
+    }
+
+    #[test]
+    fn edits_cluster_only_the_files_a_filter_shows() {
+        let files = vec![
+            commit_file("a.rs", FileStatusKind::Added, Some(1), Some(0)).with_edit(edit("x")),
+            commit_file("b.rs", FileStatusKind::Modified, Some(1), Some(0)).with_edit(edit("x")),
+            commit_file("c.rs", FileStatusKind::Modified, Some(1), Some(0)).with_edit(edit("y")),
+            commit_file("d.rs", FileStatusKind::Modified, Some(1), Some(0)).with_edit(edit("y")),
+        ];
+
+        let modified =
+            build_commit_file_projection(&files, CommitFileSort::Edits, CommitFileFilter::Modified);
+
+        // With `a.rs` filtered out, "x" is one file's edit and sorts as a single.
+        assert_eq!(modified.source_indices.as_ref(), &[2, 3, 1]);
+    }
+
+    /// The direction word is the same across options; only the noun changes.
+    #[test]
+    fn sort_labels_name_what_is_ordered_and_which_way() {
+        assert_eq!(CommitFileSort::PathAscending.label(), "Path: Ascending");
+        assert_eq!(CommitFileSort::PathDescending.label(), "Path: Descending");
+        assert_eq!(
+            CommitFileSort::FileTypeAscending.label(),
+            "File type: Ascending"
+        );
+        assert_eq!(
+            CommitFileSort::FileTypeDescending.label(),
+            "File type: Descending"
+        );
+
+        for sort in CommitFileSort::ALL {
+            assert!(
+                !sort.label().contains('–'),
+                "{sort:?} still reads as an A–Z range",
+            );
+        }
     }
 
     #[test]
@@ -1202,13 +2181,10 @@ mod tests {
 
         let first = cache.rows_for(
             &(1, PathBuf::from("/wt/a")),
-            &[CommitFileChange {
-                path: PathBuf::from("a.rs"),
-                kind: FileStatusKind::Modified,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            }],
+            &[CommitFileChange::new(
+                PathBuf::from("a.rs"),
+                FileStatusKind::Modified,
+            )],
         );
         assert_eq!(first[0].label.as_ref(), "a.rs");
 
@@ -1216,13 +2192,10 @@ mod tests {
         // these apart.
         let second = cache.rows_for(
             &(1, PathBuf::from("/wt/b")),
-            &[CommitFileChange {
-                path: PathBuf::from("b.rs"),
-                kind: FileStatusKind::Modified,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            }],
+            &[CommitFileChange::new(
+                PathBuf::from("b.rs"),
+                FileStatusKind::Modified,
+            )],
         );
         assert_eq!(
             second[0].label.as_ref(),
@@ -1236,20 +2209,8 @@ mod tests {
         let mut cache: CommitFileRowPresentationCache<u64> =
             CommitFileRowPresentationCache::default();
         let files = vec![
-            CommitFileChange {
-                path: PathBuf::from("src/lib.rs"),
-                kind: FileStatusKind::Modified,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            },
-            CommitFileChange {
-                path: PathBuf::from("README.md"),
-                kind: FileStatusKind::Added,
-                is_submodule: false,
-                additions: None,
-                deletions: None,
-            },
+            CommitFileChange::new(PathBuf::from("src/lib.rs"), FileStatusKind::Modified),
+            CommitFileChange::new(PathBuf::from("README.md"), FileStatusKind::Added),
         ];
 
         let first = cache.rows_for(&7, &files);
@@ -1284,17 +2245,20 @@ mod tests {
     fn conflict_row_geometry_scales_with_ui_scale() {
         for percent in [80, 100, 150, 200] {
             let factor = percent as f32 / 100.0;
-            let height: f32 = conflict_row_height(percent).into();
+            let height: f32 = AppTheme::gitcomet_dark().editor_row_height(percent).into();
             let line_no: f32 = conflict_line_no_width(percent).into();
+            let base = crate::appearance::Appearance::default().editor_line_height();
             assert!(
-                (height - CONFLICT_ROW_HEIGHT_PX * factor).abs() < 0.01,
+                (height - base * factor).abs() < 0.01,
                 "row height at {percent}% should be {}, got {height}",
-                CONFLICT_ROW_HEIGHT_PX * factor,
+                base * factor,
             );
+            // Also measured at the editor font, so anchor it at 100%.
+            let line_no_base: f32 = conflict_line_no_width(100).into();
             assert!(
-                (line_no - CONFLICT_DIFF_LINE_NO_WIDTH_PX * factor).abs() < 0.01,
+                (line_no - line_no_base * factor).abs() < 0.01,
                 "line-number width at {percent}% should be {}, got {line_no}",
-                CONFLICT_DIFF_LINE_NO_WIDTH_PX * factor,
+                line_no_base * factor,
             );
         }
 
@@ -1302,7 +2266,7 @@ mod tests {
         // onto the same geometry.
         let heights = crate::ui_scale::UI_SCALE_PRESETS
             .iter()
-            .map(|percent| f32::from(conflict_row_height(*percent)))
+            .map(|percent| f32::from(AppTheme::gitcomet_dark().editor_row_height(*percent)))
             .collect::<Vec<_>>();
         assert!(
             heights.windows(2).all(|pair| pair[0] < pair[1]),
@@ -1317,8 +2281,8 @@ mod tests {
     fn conflict_row_height_matches_the_diff_row_height() {
         for percent in crate::ui_scale::UI_SCALE_PRESETS.iter().copied() {
             assert_eq!(
-                conflict_row_height(percent),
-                crate::view::panes::main::diff_row_height_for_ui_scale(percent),
+                AppTheme::gitcomet_dark().editor_row_height(percent),
+                AppTheme::gitcomet_dark().editor_row_height(percent),
                 "conflict and diff rows disagree at {percent}%"
             );
         }

@@ -71,7 +71,11 @@ pub(super) fn record(args: std::fmt::Arguments<'_>) {
 
 macro_rules! trace {
     ($($arg:tt)*) => {
-        $crate::store::repo_load_trace::record(format_args!($($arg)*))
+        // Gate before the arguments are evaluated: call sites format paths
+        // per filesystem event, which must cost nothing while tracing is off.
+        if $crate::store::repo_load_trace::enabled() {
+            $crate::store::repo_load_trace::record(format_args!($($arg)*))
+        }
     };
 }
 
@@ -79,24 +83,15 @@ pub(super) use trace;
 
 pub(super) fn msg_name(msg: &Msg) -> &'static str {
     match msg {
-        Msg::OpenRepo(_) => "OpenRepo",
-        Msg::OpenRepoFromExternalDrop(_) => "OpenRepoFromExternalDrop",
-        Msg::RestoreSession { .. } => "RestoreSession",
-        Msg::CloseRepo { .. } => "CloseRepo",
-        Msg::CloseRepos { .. } => "CloseRepos",
-        Msg::SetActiveRepo { .. } => "SetActiveRepo",
-        Msg::ReorderRepoTabs { .. } => "ReorderRepoTabs",
-        Msg::ReloadRepo { .. } => "ReloadRepo",
-        Msg::RepoActivated { .. } => "RepoActivated",
-        Msg::RepoExternallyChanged { .. } => "RepoExternallyChanged",
         Msg::Internal(message) => internal_msg_name(message),
-        _ => "Msg",
+        msg => msg.into(),
     }
 }
 
 pub(super) fn msg_repo_id(msg: &Msg) -> Option<RepoId> {
     match msg {
         Msg::CloseRepo { repo_id }
+        | Msg::MoveRepoOut { repo_id }
         | Msg::SetActiveRepo { repo_id }
         | Msg::ReorderRepoTabs { repo_id, .. }
         | Msg::ReloadRepo { repo_id }
@@ -108,69 +103,30 @@ pub(super) fn msg_repo_id(msg: &Msg) -> Option<RepoId> {
 
 pub(super) fn msg_external_change(msg: &Msg) -> Option<crate::msg::RepoExternalChange> {
     match msg {
-        Msg::RepoExternallyChanged { change, .. } => Some(*change),
+        Msg::RepoExternallyChanged { change, .. } => Some(change.clone()),
         _ => None,
     }
 }
 
 pub(super) fn internal_msg_name(msg: &InternalMsg) -> &'static str {
-    match msg {
-        InternalMsg::GitOperationStarted { .. } => "GitOperationStarted",
-        InternalMsg::GitOperationEvent { .. } => "GitOperationEvent",
-        InternalMsg::GitOperationFinished { .. } => "GitOperationFinished",
-        InternalMsg::RepoLoadFinished { .. } => "RepoLoadFinished",
-        InternalMsg::RepoOpenedOk { .. } => "RepoOpenedOk",
-        InternalMsg::RepoOpenedErr { .. } => "RepoOpenedErr",
-        InternalMsg::BranchesLoaded { .. } => "BranchesLoaded",
-        InternalMsg::RemotesLoaded { .. } => "RemotesLoaded",
-        InternalMsg::RemoteBranchesLoaded { .. } => "RemoteBranchesLoaded",
-        InternalMsg::WorktreeStatusLoaded { .. } => "WorktreeStatusLoaded",
-        InternalMsg::StagedStatusLoaded { .. } => "StagedStatusLoaded",
-        InternalMsg::StatusLoaded { .. } => "StatusLoaded",
-        InternalMsg::HeadBranchLoaded { .. } => "HeadBranchLoaded",
-        InternalMsg::UpstreamDivergenceLoaded { .. } => "UpstreamDivergenceLoaded",
-        InternalMsg::LogLoaded { .. } => "LogLoaded",
-        InternalMsg::TagsLoaded { .. } => "TagsLoaded",
-        InternalMsg::RemoteTagsLoaded { .. } => "RemoteTagsLoaded",
-        InternalMsg::StashesLoaded { .. } => "StashesLoaded",
-        InternalMsg::WorktreesLoaded { .. } => "WorktreesLoaded",
-        InternalMsg::WorktreeDirtyLoaded { .. } => "WorktreeDirtyLoaded",
-        InternalMsg::RefMetadataLoaded { .. } => "RefMetadataLoaded",
-        InternalMsg::SubmodulesLoaded { .. } => "SubmodulesLoaded",
-        InternalMsg::RebaseStateLoaded { .. } => "RebaseStateLoaded",
-        InternalMsg::MergeCommitMessageLoaded { .. } => "MergeCommitMessageLoaded",
-        _ => "InternalMsg",
+    msg.into()
+}
+
+/// Operation-trace label: names the result a repository load delivered
+/// rather than the `RepoLoadFinished` envelope every load arrives in.
+pub(super) fn stage_label(msg: &Msg) -> &'static str {
+    let mut message = match msg {
+        Msg::Internal(message) => message,
+        msg => return msg.into(),
+    };
+    while let InternalMsg::RepoLoadFinished { message: inner, .. } = message {
+        message = inner;
     }
+    message.into()
 }
 
 pub(super) fn effect_name(effect: &Effect) -> &'static str {
-    match effect {
-        Effect::OpenRepo { .. } => "OpenRepo",
-        Effect::CancelRepoLoads { .. } => "CancelRepoLoads",
-        Effect::CancelGitOperation { .. } => "CancelGitOperation",
-        Effect::LoadBranches { .. } => "LoadBranches",
-        Effect::LoadRemotes { .. } => "LoadRemotes",
-        Effect::LoadRemoteBranches { .. } => "LoadRemoteBranches",
-        Effect::LoadWorktreeStatus { .. } => "LoadWorktreeStatus",
-        Effect::LoadStagedStatus { .. } => "LoadStagedStatus",
-        Effect::LoadStatus { .. } => "LoadStatus",
-        Effect::LoadHeadBranch { .. } => "LoadHeadBranch",
-        Effect::LoadUpstreamDivergence { .. } => "LoadUpstreamDivergence",
-        Effect::LoadLog { .. } => "LoadLog",
-        Effect::LoadTags { .. } => "LoadTags",
-        Effect::LoadRemoteTags { .. } => "LoadRemoteTags",
-        Effect::LoadStashes { .. } => "LoadStashes",
-        Effect::LoadWorktrees { .. } => "LoadWorktrees",
-        Effect::LoadWorktreeDirty { .. } => "LoadWorktreeDirty",
-        Effect::LoadRefMetadata { .. } => "LoadRefMetadata",
-        Effect::LoadSubmodules { .. } => "LoadSubmodules",
-        Effect::LoadRebaseAndMergeState { .. } => "LoadRebaseAndMergeState",
-        Effect::LoadRebaseState { .. } => "LoadRebaseState",
-        Effect::LoadMergeCommitMessage { .. } => "LoadMergeCommitMessage",
-        Effect::PersistSession { .. } => "PersistSession",
-        Effect::PersistRecentRepo { .. } => "PersistRecentRepo",
-        _ => "Effect",
-    }
+    effect.into()
 }
 
 pub(super) fn effect_repo_id(effect: &Effect) -> Option<RepoId> {
@@ -183,6 +139,7 @@ pub(super) fn effect_repo_id(effect: &Effect) -> Option<RepoId> {
         | Effect::LoadRemoteBranches { repo_id }
         | Effect::LoadWorktreeStatus { repo_id }
         | Effect::LoadStagedStatus { repo_id }
+        | Effect::LoadUncommittedLineStats { repo_id, .. }
         | Effect::LoadStatus { repo_id }
         | Effect::LoadHeadBranch { repo_id }
         | Effect::LoadUpstreamDivergence { repo_id }
@@ -194,6 +151,10 @@ pub(super) fn effect_repo_id(effect: &Effect) -> Option<RepoId> {
         | Effect::LoadWorktreeDirty { repo_id, .. }
         | Effect::LoadRefMetadata { repo_id }
         | Effect::LoadSubmodules { repo_id }
+        | Effect::LoadLargeFileSupport { repo_id }
+        | Effect::LoadLfsLocks { repo_id }
+        | Effect::LoadAnnexWhereis { repo_id, .. }
+        | Effect::LoadAnnexUnused { repo_id }
         | Effect::LoadRebaseAndMergeState { repo_id }
         | Effect::LoadRebaseState { repo_id }
         | Effect::LoadMergeCommitMessage { repo_id } => Some(*repo_id),
@@ -219,6 +180,7 @@ mod tests {
     fn the_worktree_dirty_scan_is_traced_against_its_repo() {
         let effect = Effect::LoadWorktreeDirty {
             repo_id: RepoId(7),
+            scope: crate::model::WorktreeDirtyScope::All,
             workdir: PathBuf::from("/tmp/repo"),
             files_for: None,
         };
@@ -234,6 +196,7 @@ mod tests {
         assert_eq!(
             internal_msg_name(&InternalMsg::WorktreeDirtyLoaded {
                 repo_id: RepoId(7),
+                scope: crate::model::WorktreeDirtyScope::All,
                 result: Ok(Vec::new()),
             }),
             "WorktreeDirtyLoaded"

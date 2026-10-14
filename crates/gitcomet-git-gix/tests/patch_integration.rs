@@ -141,7 +141,7 @@ fn apply_unified_patch_to_worktree_applies_and_reverses() {
     let opened = backend.open(repo).expect("open repository");
 
     let apply_output = opened
-        .apply_unified_patch_to_worktree_with_output(&patch, false)
+        .apply_unified_patch_to_worktree_with_output(patch.as_bytes(), false)
         .expect("apply worktree patch");
     assert_eq!(apply_output.exit_code, Some(0));
     assert!(
@@ -155,7 +155,7 @@ fn apply_unified_patch_to_worktree_applies_and_reverses() {
     );
 
     let reverse_output = opened
-        .apply_unified_patch_to_worktree_with_output(&patch, true)
+        .apply_unified_patch_to_worktree_with_output(patch.as_bytes(), true)
         .expect("reverse worktree patch");
     assert_eq!(reverse_output.exit_code, Some(0));
     assert!(
@@ -166,5 +166,46 @@ fn apply_unified_patch_to_worktree_applies_and_reverses() {
     assert_eq!(
         fs::read_to_string(&file).expect("read reversed file"),
         "base\n"
+    );
+}
+
+#[test]
+fn a_paused_patch_apply_is_continued_after_resolving() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let repo = dir.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo dir");
+    run_git(&repo, &["init", "-b", "main"]);
+    run_git(&repo, &["config", "user.email", "you@example.com"]);
+    run_git(&repo, &["config", "user.name", "You"]);
+    run_git(&repo, &["config", "commit.gpgsign", "false"]);
+    fs::write(repo.join("f.txt"), "a\n").expect("write");
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-m", "base"]);
+    fs::write(repo.join("f.txt"), "b\n").expect("write");
+    run_git(&repo, &["commit", "-am", "patched"]);
+    let patch = run_git_capture(&repo, &["format-patch", "-1", "--stdout"]);
+    let patch_path = dir.path().join("0001.patch");
+    fs::write(&patch_path, patch).expect("write patch");
+    run_git(&repo, &["reset", "--hard", "HEAD~1"]);
+    fs::write(repo.join("f.txt"), "c\n").expect("write conflicting content");
+    run_git(&repo, &["commit", "-am", "diverged"]);
+
+    let backend = GixBackend.open(&repo).expect("open repository");
+    backend
+        .apply_patch_with_output(&patch_path)
+        .expect_err("the patch conflicts");
+    assert!(repo.join(".git/rebase-apply").exists(), "am is paused");
+
+    fs::write(repo.join("f.txt"), "b\n").expect("resolve");
+    run_git(&repo, &["add", "f.txt"]);
+    let output = backend
+        .rebase_continue_with_output()
+        .expect("a paused patch apply must be continuable");
+
+    assert_eq!(output.command, "git am --continue");
+    assert!(!repo.join(".git/rebase-apply").exists(), "am finished");
+    assert_eq!(
+        run_git_capture(&repo, &["log", "-1", "--format=%s"]).trim(),
+        "patched"
     );
 }

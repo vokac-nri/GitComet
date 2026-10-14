@@ -9,8 +9,11 @@ use rustc_hash::FxHasher;
 mod file_diff;
 mod image_cache;
 mod patch_diff;
+mod shared_file;
 mod word_highlight;
+pub(in crate::view) use shared_file::SharedFileDiffCache;
 
+pub(in crate::view) use self::file_diff::FileDiffCacheError;
 #[cfg(any(test, feature = "benchmarks"))]
 #[allow(unused_imports)]
 pub(in crate::view) use self::file_diff::build_file_diff_cache_rebuild;
@@ -316,10 +319,14 @@ impl MainPaneView {
         };
 
         let diff_target_for_task = diff_target.clone();
+        let patch_signature = patch_diff
+            .as_ref()
+            .filter(|_| file.is_some())
+            .map(|patch_diff| self.patch_diff_signature(patch_diff));
         let file_content_signature = file.as_ref().map(|file| {
             let mut signature = file_diff_text_signature(file.as_ref());
-            if let Some(patch_diff) = patch_diff.as_ref() {
-                signature ^= patch_diff_content_signature(patch_diff.as_ref()).rotate_left(1);
+            if let Some(patch_signature) = patch_signature {
+                signature ^= patch_signature.rotate_left(1);
             }
             signature ^= (self.diff_whitespace_mode.key().len() as u64).rotate_left(7);
             signature
@@ -424,10 +431,21 @@ impl MainPaneView {
         let seq = self.file_diff_cache_seq;
         self.file_diff_cache_inflight = Some(seq);
         let whitespace_mode = self.diff_whitespace_mode;
+        let shared_file = self
+            .hosted_decor
+            .as_ref()
+            .and_then(|decor| decor.file_cache.clone())
+            .filter(|cache| {
+                whitespace_mode == DiffWhitespaceMode::Show
+                    && cache.matches(&file, patch_diff.as_ref(), &workdir)
+            });
 
         cx.spawn(
             async move |view: WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| {
                 let rebuild_cache = move || {
+                    if let Some(cache) = shared_file {
+                        return cache.build().cloned().map_err(Clone::clone);
+                    }
                     build_file_diff_cache_rebuild_with_patch(
                         file.as_ref(),
                         &workdir,
@@ -501,6 +519,14 @@ impl MainPaneView {
                     this.file_diff_inline_row_provider = Some(rebuild.inline_row_provider);
                     this.file_diff_inline_text = rebuild.inline_text;
                     this.file_diff_cache_content_signature = Some(content_signature);
+                    // Rows swapped in place keep every key the visible-rows pass
+                    // checks when a line changed without adding one (a modify
+                    // row), so its scrollbar markers would keep marking the old
+                    // rows. Recompute them against the new ones.
+                    if this.diff_visible_is_file_view && !this.is_collapsed_diff_projection_active()
+                    {
+                        this.diff_scrollbar_markers_cache = this.compute_diff_scrollbar_markers();
+                    }
                     this.clear_diff_text_projected_highlights();
                     // The rows just changed under their own indices. On the
                     // clearing path `reset_file_diff_cache_data` already did
@@ -510,8 +536,8 @@ impl MainPaneView {
                     this.reset_file_diff_word_highlight_caches();
                     #[cfg(test)]
                     {
-                        this.file_diff_cache_rows = rebuild.rows;
-                        this.file_diff_inline_cache = rebuild.inline_rows;
+                        this.file_diff_cache_rows = rebuild.rows.into();
+                        this.file_diff_inline_cache = rebuild.inline_rows.into();
                     }
                     let split_left_edit_hint = previous_old_text.as_ref().and_then(|previous| {
                         diff_syntax_edit_from_text_change(
@@ -535,6 +561,13 @@ impl MainPaneView {
 
                     // Reset the segment cache to avoid mixing patch/file indices.
                     this.clear_diff_text_style_caches();
+                    // A same-length replacement does not rebuild the visible
+                    // row mapping. Its search document can still hold the old
+                    // rows under the incoming revision, so replace it too.
+                    this.diff_search_document = None;
+                    if this.diff_search_has_query() {
+                        this.diff_search_schedule_preserving_current(cx);
+                    }
                     cx.notify();
                 });
             },
@@ -546,15 +579,6 @@ impl MainPaneView {
         &mut self,
         cx: &mut gpui::Context<Self>,
     ) {
-        let clear_cache = |this: &mut Self| {
-            this.file_markdown_preview_cache_repo_id = None;
-            this.file_markdown_preview_cache_target = None;
-            this.file_markdown_preview_cache_rev = 0;
-            this.file_markdown_preview_cache_content_signature = None;
-            this.file_markdown_preview = Loadable::NotLoaded;
-            this.file_markdown_preview_inflight = None;
-        };
-
         let Some((repo_id, diff_file_rev, diff_target, expected_abs_path, file)) = (|| {
             let (repo_id, diff_file_rev, diff_target, _workdir, expected_abs_path) =
                 self.rendered_file_diff_identity()?;
@@ -566,7 +590,7 @@ impl MainPaneView {
 
             Some((repo_id, diff_file_rev, diff_target, expected_abs_path, file))
         })() else {
-            clear_cache(self);
+            self.diff_markdown.clear_cache();
             return;
         };
 
@@ -574,30 +598,30 @@ impl MainPaneView {
         let file_content_signature = file
             .as_ref()
             .map(|file| file_diff_text_signature(file.as_ref()));
-        let same_repo_and_target = self.file_markdown_preview_cache_repo_id == Some(repo_id)
-            && self.file_markdown_preview_cache_target == Some(diff_target.clone())
+        let same_repo_and_target = self.diff_markdown.cache_repo_id == Some(repo_id)
+            && self.diff_markdown.cache_target == Some(diff_target.clone())
             && self.file_diff_cache_path.as_ref() == Some(&expected_abs_path);
 
-        if same_repo_and_target && self.file_markdown_preview_cache_rev == diff_file_rev {
+        if same_repo_and_target && self.diff_markdown.cache_rev == diff_file_rev {
             return;
         }
 
         if same_repo_and_target
             && let Some(signature) = file_content_signature
-            && self.file_markdown_preview_cache_content_signature == Some(signature)
+            && self.diff_markdown.cache_content_signature == Some(signature)
         {
-            if self.file_markdown_preview_inflight.is_none() {
-                self.file_markdown_preview_cache_rev = diff_file_rev;
+            if self.diff_markdown.inflight.is_none() {
+                self.diff_markdown.cache_rev = diff_file_rev;
             }
             return;
         }
 
-        self.file_markdown_preview_cache_repo_id = Some(repo_id);
-        self.file_markdown_preview_cache_rev = diff_file_rev;
-        self.file_markdown_preview_cache_content_signature = None;
-        self.file_markdown_preview_cache_target = Some(diff_target);
-        self.file_markdown_preview = Loadable::NotLoaded;
-        self.file_markdown_preview_inflight = None;
+        self.diff_markdown.cache_repo_id = Some(repo_id);
+        self.diff_markdown.cache_rev = diff_file_rev;
+        self.diff_markdown.cache_content_signature = None;
+        self.diff_markdown.cache_target = Some(diff_target);
+        self.diff_markdown.preview = Loadable::NotLoaded;
+        self.diff_markdown.inflight = None;
 
         let Some(file) = file else {
             return;
@@ -613,22 +637,26 @@ impl MainPaneView {
             file_diff_markdown_source_len(old_source.as_ref(), old_legacy_text.as_ref())
                 + file_diff_markdown_source_len(new_source.as_ref(), new_legacy_text.as_ref());
         if combined_len > markdown_preview::MAX_DIFF_PREVIEW_SOURCE_BYTES {
-            self.file_markdown_preview = Loadable::Error(
+            self.diff_markdown.preview = Loadable::Error(
                 markdown_preview::diff_preview_unavailable_reason(combined_len).to_string(),
             );
-            self.file_markdown_preview_cache_content_signature = Some(content_signature);
+            self.diff_markdown.cache_content_signature = Some(content_signature);
             return;
         }
 
-        self.file_markdown_preview = Loadable::Loading;
-        self.file_markdown_preview_seq = self.file_markdown_preview_seq.wrapping_add(1);
-        let seq = self.file_markdown_preview_seq;
-        self.file_markdown_preview_inflight = Some(seq);
+        self.diff_markdown.preview = Loadable::Loading;
+        self.diff_markdown.seq = self.diff_markdown.seq.wrapping_add(1);
+        let seq = self.diff_markdown.seq;
+        self.diff_markdown.inflight = Some(seq);
 
         cx.spawn(
             async move |view: WeakEntity<MainPaneView>, cx: &mut gpui::AsyncApp| {
                 let build_preview = move || {
+                    use markdown_preview::MarkdownPreviewRefusal;
                     let _perf_scope = perf::span(ViewPerfSpan::MarkdownPreviewParse);
+                    // Neither a path nor text: the file is not on that side.
+                    let old_missing = old_source.is_none() && old_legacy_text.is_none();
+                    let new_missing = new_source.is_none() && new_legacy_text.is_none();
                     let old_source = read_file_diff_markdown_source(
                         old_source.as_ref(),
                         old_legacy_text.as_ref(),
@@ -637,17 +665,25 @@ impl MainPaneView {
                         new_source.as_ref(),
                         new_legacy_text.as_ref(),
                     )?;
-                    markdown_preview::build_markdown_diff_preview(
-                        old_source.as_ref(),
-                        new_source.as_ref(),
+                    let preview = markdown_preview::build_markdown_diff_preview_of(
+                        (!old_missing).then_some(old_source.as_str()),
+                        (!new_missing).then_some(new_source.as_str()),
                     )
-                    .map(Arc::new)
                     .ok_or_else(|| {
-                        markdown_preview::diff_preview_unavailable_reason(
-                            old_source.len() + new_source.len(),
+                        MarkdownPreviewRefusal::Unavailable(
+                            markdown_preview::diff_preview_unavailable_reason(
+                                old_source.len() + new_source.len(),
+                            )
+                            .to_string(),
                         )
-                        .to_string()
-                    })
+                    })?;
+                    // Each side is within the parser's cap, but the inline form
+                    // carries both sides' changed rows and can outgrow it; the
+                    // text diff still reads fine then.
+                    if preview.inline.rows.len() > markdown_preview::MAX_PREVIEW_ROWS {
+                        return Err(MarkdownPreviewRefusal::TooManyRowsToRender);
+                    }
+                    Ok(Arc::new(preview))
                 };
                 let result = if crate::ui_runtime::current().uses_background_compute() {
                     smol::unblock(build_preview).await
@@ -656,22 +692,30 @@ impl MainPaneView {
                 };
 
                 let _ = view.update(cx, |this, cx| {
-                    if this.file_markdown_preview_inflight != Some(seq) {
+                    if this.diff_markdown.inflight != Some(seq) {
                         return;
                     }
-                    if this.file_markdown_preview_cache_repo_id != Some(repo_id)
-                        || this.file_markdown_preview_cache_rev != diff_file_rev
-                        || this.file_markdown_preview_cache_target
-                            != Some(diff_target_for_task.clone())
+                    if this.diff_markdown.cache_repo_id != Some(repo_id)
+                        || this.diff_markdown.cache_rev != diff_file_rev
+                        || this.diff_markdown.cache_target != Some(diff_target_for_task.clone())
                     {
                         return;
                     }
 
-                    this.file_markdown_preview_inflight = None;
-                    this.file_markdown_preview_cache_content_signature = Some(content_signature);
+                    this.diff_markdown.inflight = None;
+                    this.diff_markdown.cache_content_signature = Some(content_signature);
                     match result {
-                        Ok(preview) => this.file_markdown_preview = Loadable::Ready(preview),
-                        Err(error) => this.file_markdown_preview = Loadable::Error(error),
+                        Ok(preview) => this.diff_markdown.preview = Loadable::Ready(preview),
+                        Err(refusal) => {
+                            // Too big to lay out, but readable: show the diff.
+                            if refusal.prefers_source() {
+                                this.rendered_preview_modes.fall_back_to_markdown_source();
+                            }
+                            this.diff_markdown.preview = Loadable::Error(refusal.into_message());
+                        }
+                    }
+                    for scrolls in &this.diff_markdown.block_scrolls {
+                        scrolls.clear();
                     }
                     // See the single-document preview: a search opened while
                     // this was parsing found nothing and needs to rescan.
@@ -681,6 +725,21 @@ impl MainPaneView {
             },
         )
         .detach();
+    }
+
+    /// `patch_diff_content_signature`, reused while the store hands back the
+    /// same diff. Every state application checks both diff caches against it,
+    /// and hashing a large patch's whole text each time showed on the UI
+    /// thread after every save.
+    fn patch_diff_signature(&mut self, diff: &Arc<gitcomet_core::domain::Diff>) -> u64 {
+        if let Some((hashed, signature)) = &self.patch_signature_memo
+            && Arc::ptr_eq(hashed, diff)
+        {
+            return *signature;
+        }
+        let signature = patch_diff_content_signature(diff.as_ref());
+        self.patch_signature_memo = Some((Arc::clone(diff), signature));
+        signature
     }
 
     pub(in crate::view) fn ensure_rendered_patch_diff_cache(
@@ -696,9 +755,10 @@ impl MainPaneView {
             && self.diff_cache_target == self.rendered_diff_target().cloned();
         let ready_content_changed = metadata_current
             && ready_diff.as_ref().is_some_and(|diff| {
-                self.patch_diff_row_len() != diff.lines.len()
-                    || self.diff_cache_content_signature
-                        != Some(patch_diff_content_signature(diff.as_ref()))
+                self.patch_diff_row_len() != diff.lines.len() || {
+                    let signature = self.patch_diff_signature(diff);
+                    self.diff_cache_content_signature != Some(signature)
+                }
             });
         let should_rebuild = !metadata_current || ready_content_changed;
         if should_rebuild {
@@ -725,8 +785,8 @@ impl MainPaneView {
         });
         let next_content_signature = next_cache_state
             .as_ref()
-            .and_then(|(_, _, _, _, diff)| diff.as_ref())
-            .map(|diff| patch_diff_content_signature(diff.as_ref()));
+            .and_then(|(_, _, _, _, diff)| diff.clone())
+            .map(|diff| self.patch_diff_signature(&diff));
         if let Some((repo_id, diff_rev, diff_target, _, diff)) = next_cache_state.as_ref() {
             let same_repo_and_target = self.diff_cache_repo_id == Some(*repo_id)
                 && self.diff_cache_target.as_ref() == diff_target.as_ref();
@@ -759,7 +819,7 @@ impl MainPaneView {
         };
 
         self.reset_collapsed_diff_projection(clear_reveals);
-        self.diff_cache.clear();
+        self.diff_cache = Arc::from([]);
         self.diff_row_provider = None;
         self.diff_split_row_provider = None;
         self.diff_cache_repo_id = None;
@@ -774,9 +834,9 @@ impl MainPaneView {
         self.diff_visual_line_kind_for_src_ix.clear();
         self.diff_hide_unified_header_for_src_ix.clear();
         self.diff_header_display_cache.clear();
-        self.diff_split_cache.clear();
+        self.diff_split_cache = Arc::from([]);
         self.diff_split_cache_len = 0;
-        self.diff_visible_indices.clear();
+        self.diff_visible_indices = Arc::from([]);
         self.diff_visible_inline_map = None;
         self.diff_visible_cache_len = 0;
         self.diff_visible_is_file_view = false;
@@ -948,6 +1008,7 @@ impl MainPaneView {
     }
 }
 
+mod change_blocks;
 mod collapsed_projection;
 use markdown_preview_docs::*;
 use patch_visual::*;

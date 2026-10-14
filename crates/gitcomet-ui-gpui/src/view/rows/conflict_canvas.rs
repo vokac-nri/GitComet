@@ -8,8 +8,8 @@ use super::canvas_text::{
 use super::diff_text::{whitespace_visible_line_styled_text_for_raw, whitespace_visible_line_text};
 use super::*;
 use gpui::{
-    App, Bounds, ContentMask, DispatchPhase, Pixels, Styled, TextStyle, Window, fill, point, px,
-    size,
+    App, Bounds, ContentMask, DispatchPhase, Hitbox, HitboxBehavior, Pixels, Styled, TextStyle,
+    Window, fill, point, px, size,
 };
 use palette::IntoColor;
 use rustc_hash::FxHasher;
@@ -34,6 +34,62 @@ pub(super) struct ConflictChunkContext {
     pub(super) selected_choices: Vec<conflict_resolver::ConflictChoice>,
 }
 
+fn conflict_canvas_click_target(
+    view: &Entity<MainPaneView>,
+    action: impl std::hash::Hash,
+    cx: &App,
+) -> gpui::ElementId {
+    let state = &view.read(cx).conflict_resolver;
+    crate::kit::click::canvas_target(
+        "conflict-click",
+        (
+            view.entity_id(),
+            state.repo_id,
+            &state.path,
+            state.source_hash,
+            action,
+        ),
+    )
+}
+
+impl ConflictChunkContext {
+    fn install_menu(
+        &self,
+        view: &Entity<MainPaneView>,
+        target: gpui::ElementId,
+        hitbox: &Hitbox,
+        invoker: SharedString,
+        is_three_way: bool,
+        window: &mut Window,
+    ) {
+        let view = view.clone();
+        let chunk = self.clone();
+        crate::kit::click::on_canvas_click(
+            window,
+            crate::kit::click::canvas_target("conflict-menu", &target),
+            hitbox,
+            gpui::MouseButton::Right,
+            true,
+            move |event, window, cx| {
+                view.update(cx, |this, cx| {
+                    this.open_conflict_resolver_chunk_context_menu(
+                        invoker.clone(),
+                        chunk.conflict_ix,
+                        chunk.has_base,
+                        is_three_way,
+                        chunk.selected_choices.clone(),
+                        None,
+                        event.position(),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                });
+            },
+        );
+    }
+}
+
 /// KDiff3 manual diff help: what one source-column row offers to a manual
 /// alignment. Alt+click marks the line; Alt+Shift+click extends the mark.
 ///
@@ -51,6 +107,7 @@ pub(super) struct AlignmentMarkContext {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn split_conflict_row_canvas(
+    tab_width: usize,
     theme: AppTheme,
     view: Entity<MainPaneView>,
     visible_row_ix: usize,
@@ -73,14 +130,22 @@ pub(super) fn split_conflict_row_canvas(
     chunk_context: Option<ConflictChunkContext>,
     ui_scale_percent: u32,
 ) -> AnyElement {
-    let left_prepared =
-        prepare_conflict_text_for_canvas(left_text, left_styled, reveal_whitespace_chars);
-    let right_prepared =
-        prepare_conflict_text_for_canvas(right_text, right_styled, reveal_whitespace_chars);
+    let left_prepared = prepare_conflict_text_for_canvas(
+        tab_width,
+        left_text,
+        left_styled,
+        reveal_whitespace_chars,
+    );
+    let right_prepared = prepare_conflict_text_for_canvas(
+        tab_width,
+        right_text,
+        right_styled,
+        reveal_whitespace_chars,
+    );
 
     keyed_canvas(
         ("conflict_resolver_split_row_canvas", visible_row_ix),
-        move |bounds, _window, _cx| {
+        move |bounds, window, _cx| {
             let handle_width = conflict_scaled_px(PANE_RESIZE_HANDLE_PX, ui_scale_percent);
             let (left_col, handle_bounds, right_col) = split_columns_with_widths(
                 bounds,
@@ -92,14 +157,19 @@ pub(super) fn split_conflict_row_canvas(
                 left_col,
                 handle_bounds,
                 right_col,
+                left_hitbox: window.insert_hitbox(left_col, HitboxBehavior::Normal),
+                right_hitbox: window.insert_hitbox(right_col, HitboxBehavior::Normal),
             }
         },
         move |bounds, prepaint, window, cx| {
-            let line_metrics = line_metrics(window);
+            let gutter_style = canvas_text::diff_text_style(window);
+            let line_metrics = line_metrics(window, theme);
             let y = center_text_y(bounds, line_metrics.line_height);
             let pad = px_2(window);
             let gap = pad;
-            let line_no_w = conflict_line_no_width(ui_scale_percent);
+            let line_no_w = conflict_line_no_width(
+                ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
+            );
             let clip_bounds = window.content_mask().bounds;
             let left_gutter =
                 sticky_gutter_bounds(prepaint.left_col, clip_bounds, pad, gap, line_no_w);
@@ -123,6 +193,7 @@ pub(super) fn split_conflict_row_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: left_gutter,
+                        ..Default::default()
                     }),
                     |window| {
                         paint_gutter_text(
@@ -131,6 +202,7 @@ pub(super) fn split_conflict_row_canvas(
                             y,
                             theme.colors.foreground.secondary,
                             line_metrics,
+                            &gutter_style,
                             window,
                             cx,
                         );
@@ -139,6 +211,7 @@ pub(super) fn split_conflict_row_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: right_gutter,
+                        ..Default::default()
                     }),
                     |window| {
                         paint_gutter_text(
@@ -147,6 +220,7 @@ pub(super) fn split_conflict_row_canvas(
                             y,
                             theme.colors.foreground.secondary,
                             line_metrics,
+                            &gutter_style,
                             window,
                             cx,
                         );
@@ -191,6 +265,7 @@ pub(super) fn split_conflict_row_canvas(
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: left_text_clip,
+                    ..Default::default()
                 }),
                 |window| {
                     paint_conflict_text(
@@ -207,6 +282,7 @@ pub(super) fn split_conflict_row_canvas(
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: right_text_clip,
+                    ..Default::default()
                 }),
                 |window| {
                     paint_conflict_text(
@@ -222,81 +298,48 @@ pub(super) fn split_conflict_row_canvas(
             );
 
             if let Some(chunk_context) = chunk_context.clone() {
-                let visible_left = prepaint.left_col.intersect(&clip_bounds);
-                let visible_right = prepaint.right_col.intersect(&clip_bounds);
-                window.on_mouse_event({
-                    let view = view.clone();
-                    move |event: &gpui::MouseDownEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Bubble {
-                            return;
-                        }
-                        if event.button == gpui::MouseButton::Left {
-                            if visible_left.contains(&event.position)
-                                || visible_right.contains(&event.position)
-                            {
-                                // section 30: clicking a conflict block body selects it.
-                                let conflict_ix = chunk_context.conflict_ix;
-                                view.update(cx, |this, cx| {
-                                    this.conflict_resolver_select_conflict(conflict_ix, cx);
-                                });
-                            }
-                            return;
-                        }
-                        if event.button != gpui::MouseButton::Right {
-                            return;
-                        }
-
-                        let invoker = if visible_left.contains(&event.position) {
-                            Some::<SharedString>(
-                                format!(
-                                    "resolver_two_way_split_ours_chunk_menu_{}_{}",
-                                    chunk_context.conflict_ix, row_ix
-                                )
-                                .into(),
-                            )
-                        } else if visible_right.contains(&event.position) {
-                            Some::<SharedString>(
-                                format!(
-                                    "resolver_two_way_split_theirs_chunk_menu_{}_{}",
-                                    chunk_context.conflict_ix, row_ix
-                                )
-                                .into(),
-                            )
-                        } else {
-                            None
-                        };
-
-                        let Some(invoker) = invoker else {
-                            return;
-                        };
-
-                        let conflict_ix = chunk_context.conflict_ix;
-                        let has_base = chunk_context.has_base;
-                        let selected_choices = chunk_context.selected_choices.clone();
-                        let anchor = event.position;
-                        view.update(cx, |this, cx| {
-                            this.open_conflict_resolver_chunk_context_menu(
-                                invoker,
-                                conflict_ix,
-                                has_base,
-                                false,
-                                selected_choices,
-                                None,
-                                anchor,
-                                window,
-                                cx,
-                            );
-                            cx.notify();
-                        });
-                    }
-                });
+                for (side, hitbox) in [
+                    ("ours", &prepaint.left_hitbox),
+                    ("theirs", &prepaint.right_hitbox),
+                ] {
+                    let invoker: SharedString = format!(
+                        "resolver_two_way_split_{side}_chunk_menu_{}_{}",
+                        chunk_context.conflict_ix, row_ix
+                    )
+                    .into();
+                    let target = conflict_canvas_click_target(
+                        &view,
+                        (
+                            "two-way-split-chunk",
+                            side,
+                            chunk_context.conflict_ix,
+                            row_ix,
+                        ),
+                        cx,
+                    );
+                    let select_view = view.clone();
+                    let conflict_ix = chunk_context.conflict_ix;
+                    crate::kit::click::on_canvas_click(
+                        window,
+                        target.clone(),
+                        hitbox,
+                        gpui::MouseButton::Left,
+                        true,
+                        move |_, _, cx| {
+                            select_view.update(cx, |this, cx| {
+                                this.conflict_resolver_select_conflict(conflict_ix, cx);
+                            });
+                        },
+                    );
+                    chunk_context.install_menu(&view, target, hitbox, invoker, false, window);
+                }
             }
         },
     )
-    .h(conflict_row_height(ui_scale_percent))
+    .h(theme.editor_row_height(ui_scale_percent))
     .min_w(min_width)
     .w_full()
-    .text_xs()
+    .text_size(theme.editor_font_size(ui_scale_percent))
     .whitespace_nowrap()
     .into_any_element()
 }
@@ -304,6 +347,7 @@ pub(super) fn split_conflict_row_canvas(
 /// Canvas renderer for a single conflict column (used when per-column lists are active).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn single_column_conflict_canvas(
+    tab_width: usize,
     theme: AppTheme,
     view: Entity<MainPaneView>,
     id_prefix: &'static str,
@@ -333,19 +377,23 @@ pub(super) fn single_column_conflict_canvas(
     hitbox_column: Option<ThreeWayColumn>,
     ui_scale_percent: u32,
 ) -> AnyElement {
-    let prepared = prepare_conflict_text_for_canvas(text, styled, reveal_whitespace_chars);
+    let prepared =
+        prepare_conflict_text_for_canvas(tab_width, text, styled, reveal_whitespace_chars);
     let row_selected = row_selection == Some(true);
     let alignment_marked = alignment_mark.is_some_and(|mark| mark.marked);
 
     keyed_canvas(
         (id_prefix, visible_row_ix),
-        move |bounds, _window, _cx| bounds,
-        move |bounds, _prepaint, window, cx| {
-            let line_metrics = line_metrics(window);
+        move |bounds, window, _cx| window.insert_hitbox(bounds, HitboxBehavior::Normal),
+        move |bounds, hitbox, window, cx| {
+            let gutter_style = canvas_text::diff_text_style(window);
+            let line_metrics = line_metrics(window, theme);
             let y = center_text_y(bounds, line_metrics.line_height);
             let pad = px_2(window);
             let gap = pad;
-            let line_no_w = conflict_line_no_width(ui_scale_percent);
+            let line_no_w = conflict_line_no_width(
+                ui_scale::UiScale::from_percent(ui_scale_percent).with_appearance(theme.metrics),
+            );
             let clip_bounds = window.content_mask().bounds;
             let gutter_bounds = sticky_gutter_bounds(bounds, clip_bounds, pad, gap, line_no_w);
 
@@ -399,6 +447,7 @@ pub(super) fn single_column_conflict_canvas(
                 window.with_content_mask(
                     Some(ContentMask {
                         bounds: gutter_bounds,
+                        ..Default::default()
                     }),
                     |window| {
                         paint_gutter_text(
@@ -407,6 +456,7 @@ pub(super) fn single_column_conflict_canvas(
                             y,
                             theme.colors.foreground.secondary,
                             line_metrics,
+                            &gutter_style,
                             window,
                             cx,
                         );
@@ -431,6 +481,7 @@ pub(super) fn single_column_conflict_canvas(
             window.with_content_mask(
                 Some(ContentMask {
                     bounds: text_clip_bounds,
+                    ..Default::default()
                 }),
                 |window| {
                     if let Some(layout) =
@@ -451,150 +502,109 @@ pub(super) fn single_column_conflict_canvas(
                 },
             );
 
-            // kdiff3 manual diff help: Alt+click marks this line for the next
-            // Ctrl+Y. Registered outside the conflict-block handler below so
-            // context rows can be marked too.
-            if let Some(mark) = alignment_mark
-                && let Some(side_line) = mark.side_line
+            let target = conflict_canvas_click_target(
+                &view,
+                (id_prefix, visible_row_ix, row_ix, prepared.text_hash),
+                cx,
+            );
+            let conflict_ix = chunk_context.as_ref().map(|chunk| chunk.conflict_ix);
+            if alignment_mark.is_some_and(|mark| mark.side_line.is_some())
+                || (conflict_ix.is_none() && semantic_nav_target.is_some())
+                || (conflict_ix.is_some() && row_selection.is_none())
             {
-                let visible = bounds.intersect(&clip_bounds);
                 let view = view.clone();
-                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _window, cx| {
-                    if phase != DispatchPhase::Bubble
-                        || event.button != gpui::MouseButton::Left
-                        || !event.modifiers.alt
-                        || !visible.contains(&event.position)
-                    {
-                        return;
-                    }
-                    view.update(cx, |this, cx| {
-                        this.conflict_resolver_mark_alignment_line(
-                            mark.column,
-                            side_line,
-                            event.modifiers.shift,
-                            cx,
-                        );
-                    });
-                });
-            }
-
-            if chunk_context.is_none()
-                && let Some(target_index) = semantic_nav_target
-            {
-                let visible = bounds.intersect(&clip_bounds);
-                let view = view.clone();
-                window.on_mouse_event(move |event: &gpui::MouseDownEvent, phase, _window, cx| {
-                    if phase != DispatchPhase::Bubble
-                        || event.button != gpui::MouseButton::Left
-                        || event.modifiers.alt
-                        || !visible.contains(&event.position)
-                    {
-                        return;
-                    }
-                    view.update(cx, |this, cx| {
-                        this.conflict_jump_to_nav_target(target_index, cx);
-                    });
-                });
+                crate::kit::click::on_canvas_click(
+                    window,
+                    target.clone(),
+                    &hitbox,
+                    gpui::MouseButton::Left,
+                    false,
+                    move |event, _, cx| {
+                        view.update(cx, |this, cx| {
+                            if event.modifiers().alt {
+                                if let Some(mark) = alignment_mark
+                                    && let Some(line) = mark.side_line
+                                {
+                                    this.conflict_resolver_mark_alignment_line(
+                                        mark.column,
+                                        line,
+                                        event.modifiers().shift,
+                                        cx,
+                                    );
+                                }
+                            } else if let Some(conflict_ix) = conflict_ix {
+                                if row_selection.is_none() {
+                                    this.conflict_resolver_select_conflict(conflict_ix, cx);
+                                }
+                            } else if let Some(target_index) = semantic_nav_target {
+                                this.conflict_jump_to_nav_target(target_index, cx);
+                            }
+                        });
+                    },
+                );
             }
 
             if let Some(chunk_context) = chunk_context.clone() {
-                let visible = bounds.intersect(&clip_bounds);
                 if row_selection.is_some() {
-                    // section 30 split: extend the drag as the cursor passes over
-                    // this row (begin happens on left-down below).
-                    let view = view.clone();
+                    // Row selection remains a continuous press/drag gesture.
+                    let selection_view = view.clone();
+                    let selection_hitbox = hitbox.clone();
                     let conflict_ix = chunk_context.conflict_ix;
                     window.on_mouse_event(
-                        move |event: &gpui::MouseMoveEvent, phase, _window, cx| {
-                            if phase != DispatchPhase::Bubble {
+                        move |event: &gpui::MouseDownEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Bubble
+                                || event.button != gpui::MouseButton::Left
+                                || event.modifiers.alt
+                                || !selection_hitbox.is_hovered(window)
+                            {
                                 return;
                             }
-                            if !visible.contains(&event.position) {
-                                return;
-                            }
-                            view.update(cx, |this, cx| {
+                            crate::press_gesture::claim_press(cx);
+                            selection_view.update(cx, |this, cx| {
+                                if event.modifiers.shift || event.modifiers.control {
+                                    this.conflict_resolver_click_row_selection(
+                                        conflict_ix,
+                                        row_ix,
+                                        event.modifiers,
+                                        cx,
+                                    );
+                                } else {
+                                    this.conflict_resolver_begin_row_selection(
+                                        conflict_ix,
+                                        row_ix,
+                                        cx,
+                                    );
+                                }
+                            });
+                        },
+                    );
+                    let selection_view = view.clone();
+                    let selection_hitbox = hitbox.clone();
+                    window.on_mouse_event(move |_: &gpui::MouseMoveEvent, phase, window, cx| {
+                        if phase == DispatchPhase::Bubble && selection_hitbox.is_hovered(window) {
+                            selection_view.update(cx, |this, cx| {
                                 this.conflict_resolver_extend_row_selection(
                                     conflict_ix,
                                     row_ix,
                                     cx,
                                 );
                             });
-                        },
-                    );
+                        }
+                    });
                 }
-                window.on_mouse_event({
-                    let view = view.clone();
-                    move |event: &gpui::MouseDownEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Bubble {
-                            return;
-                        }
-                        if !visible.contains(&event.position) {
-                            return;
-                        }
-                        if event.button == gpui::MouseButton::Left {
-                            // Alt+click belongs to the manual-alignment handler
-                            // above; it must not also start a split drag.
-                            if event.modifiers.alt {
-                                return;
-                            }
-                            let conflict_ix = chunk_context.conflict_ix;
-                            view.update(cx, |this, cx| {
-                                if row_selection.is_some() {
-                                    if event.modifiers.shift || event.modifiers.control {
-                                        this.conflict_resolver_click_row_selection(
-                                            conflict_ix,
-                                            row_ix,
-                                            event.modifiers,
-                                            cx,
-                                        );
-                                    } else {
-                                        // section 30 split: begin a drag selection (also
-                                        // selects the block).
-                                        this.conflict_resolver_begin_row_selection(
-                                            conflict_ix,
-                                            row_ix,
-                                            cx,
-                                        );
-                                    }
-                                } else {
-                                    // section 30: clicking a conflict block body selects it.
-                                    this.conflict_resolver_select_conflict(conflict_ix, cx);
-                                }
-                            });
-                            return;
-                        }
-                        if event.button != gpui::MouseButton::Right {
-                            return;
-                        }
-                        let invoker: SharedString = format!(
-                            "{}_{}_{}",
-                            chunk_menu_prefix, chunk_context.conflict_ix, row_ix
-                        )
-                        .into();
-                        let anchor = event.position;
-                        view.update(cx, |this, cx| {
-                            this.open_conflict_resolver_chunk_context_menu(
-                                invoker,
-                                chunk_context.conflict_ix,
-                                chunk_context.has_base,
-                                is_three_way,
-                                chunk_context.selected_choices.clone(),
-                                None,
-                                anchor,
-                                window,
-                                cx,
-                            );
-                            cx.notify();
-                        });
-                    }
-                });
+                let invoker = format!(
+                    "{}_{}_{}",
+                    chunk_menu_prefix, chunk_context.conflict_ix, row_ix,
+                )
+                .into();
+                chunk_context.install_menu(&view, target, &hitbox, invoker, is_three_way, window);
             }
         },
     )
-    .h(conflict_row_height(ui_scale_percent))
+    .h(theme.editor_row_height(ui_scale_percent))
     .min_w(min_width)
     .w_full()
-    .text_xs()
+    .text_size(theme.editor_font_size(ui_scale_percent))
     .whitespace_nowrap()
     .into_any_element()
 }
@@ -604,6 +614,8 @@ struct SplitRowPrepaintState {
     left_col: Bounds<Pixels>,
     handle_bounds: Bounds<Pixels>,
     right_col: Bounds<Pixels>,
+    left_hitbox: Hitbox,
+    right_hitbox: Hitbox,
 }
 
 #[derive(Clone, Debug)]
@@ -615,6 +627,7 @@ struct PreparedConflictText {
 }
 
 fn prepare_conflict_text_for_canvas(
+    tab_width: usize,
     text: SharedString,
     styled: Option<&CachedDiffStyledText>,
     reveal_whitespace_chars: bool,
@@ -634,21 +647,27 @@ fn prepare_conflict_text_for_canvas(
     };
 
     if styled.highlights.is_empty() {
-        let display = if reveal_whitespace_chars {
-            whitespace_visible_line_text(text.as_ref())
-        } else {
-            styled.text.clone()
-        };
+        if reveal_whitespace_chars {
+            let display = whitespace_visible_line_text(text.as_ref());
+            return PreparedConflictText {
+                text_hash: hash_text(display.as_ref()),
+                text: display,
+                highlights: empty_highlights(),
+                highlights_hash: 0,
+            };
+        }
+        // The text is the styled text unchanged, whose hash is already known;
+        // re-hashing it here ran per visible row per frame.
         return PreparedConflictText {
-            text_hash: hash_text(display.as_ref()),
-            text: display,
+            text_hash: styled.text_hash,
+            text: styled.text.clone(),
             highlights: empty_highlights(),
             highlights_hash: 0,
         };
     }
 
     if reveal_whitespace_chars {
-        let visible = whitespace_visible_line_styled_text_for_raw(styled, text.as_ref());
+        let visible = whitespace_visible_line_styled_text_for_raw(tab_width, styled, text.as_ref());
         return PreparedConflictText {
             text: visible.text,
             highlights: visible.highlights,
@@ -796,12 +815,14 @@ fn split_column_text_bounds(
     Bounds::new(point(left, col.top()), size(width, col.size.height))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_gutter_text(
     text: &SharedString,
     x: Pixels,
     y: Pixels,
     color: gpui::Rgba,
     metrics: LineMetrics,
+    style: &TextStyle,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -809,7 +830,7 @@ fn paint_gutter_text(
         return;
     }
     GUTTER_TEXT_LAYOUT_CACHE.with(|cache| {
-        let shaped = canvas_text::shaped_gutter_line(text, color, metrics, cache, window);
+        let shaped = canvas_text::shaped_gutter_line(text, color, metrics, style, cache, window);
         let _ = shaped.paint(
             point(x, y),
             metrics.line_height,
@@ -895,7 +916,7 @@ fn ensure_layout_cached(
         let run = base_style.to_run(prepared.text.len());
         window
             .text_system()
-            .shape_line(prepared.text.clone(), metrics.font_size, &[run], None)
+            .shape_line(prepared.text.clone(), metrics.font_size, &[run])
     } else {
         let runs = compute_runs(
             prepared.text.as_ref(),
@@ -904,7 +925,7 @@ fn ensure_layout_cached(
         );
         window
             .text_system()
-            .shape_line(prepared.text.clone(), metrics.font_size, &runs, None)
+            .shape_line(prepared.text.clone(), metrics.font_size, &runs)
     };
 
     CONFLICT_TEXT_LAYOUT_CACHE.with(|cache| {
@@ -939,7 +960,9 @@ mod tests {
 
     #[test]
     fn prepare_text_cell_applies_whitespace_when_no_styled_text() {
-        let prepared = prepare_conflict_text_for_canvas("a b\t".into(), None, true);
+        let tab_width = 4;
+
+        let prepared = prepare_conflict_text_for_canvas(tab_width, "a b\t".into(), None, true);
         assert_eq!(prepared.text.as_ref(), "a·b→↵");
         assert!(prepared.highlights.is_empty());
     }
@@ -1011,6 +1034,8 @@ mod tests {
 
     #[test]
     fn prepare_text_cell_remaps_highlighted_styled_text_for_whitespace() {
+        let tab_width = 4;
+
         let style = gpui::HighlightStyle::default();
         let styled = CachedDiffStyledText {
             text: "a b".into(),
@@ -1019,7 +1044,8 @@ mod tests {
             text_hash: 7,
         };
 
-        let prepared = prepare_conflict_text_for_canvas("a b".into(), Some(&styled), true);
+        let prepared =
+            prepare_conflict_text_for_canvas(tab_width, "a b".into(), Some(&styled), true);
         assert_eq!(prepared.text.as_ref(), "a·b↵");
         assert_eq!(prepared.highlights.len(), 1);
         assert_eq!(prepared.highlights[0].0, 1..4);
@@ -1029,6 +1055,8 @@ mod tests {
 
     #[test]
     fn prepare_text_cell_applies_whitespace_for_unhighlighted_styled_text() {
+        let tab_width = 4;
+
         let styled = CachedDiffStyledText {
             text: "a b\t".into(),
             highlights: empty_highlights(),
@@ -1036,7 +1064,8 @@ mod tests {
             text_hash: 1,
         };
 
-        let prepared = prepare_conflict_text_for_canvas("a b\t".into(), Some(&styled), true);
+        let prepared =
+            prepare_conflict_text_for_canvas(tab_width, "a b\t".into(), Some(&styled), true);
         assert_eq!(prepared.text.as_ref(), "a·b→↵");
         assert!(prepared.highlights.is_empty());
         assert_eq!(prepared.highlights_hash, 0);

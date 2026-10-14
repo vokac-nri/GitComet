@@ -15,16 +15,12 @@ use std::path::Path;
 /// only governs the opposite branch. Resolving the path ourselves is therefore
 /// the intended fix — so keep every worktree open going through here.
 ///
-/// The raw [`gix::open::Error`] is returned so callers can map it to their own
+/// The raw [`gix::Error`] is returned so callers can map it to their own
 /// error type or treat "not a repository" as absence.
-// This is a thin forwarder over `gix::open`, which itself returns the large
-// `gix::open::Error` by value; boxing here would only complicate every caller's
-// match without a real payoff.
-#[allow(clippy::result_large_err)]
-pub(crate) fn open_worktree_repo(
-    workdir: &Path,
-) -> std::result::Result<gix::Repository, gix::open::Error> {
-    gix::open_opts(git_dir_for_workdir(workdir), open_options())
+pub(crate) fn open_worktree_repo(workdir: &Path) -> gix::Result<gix::Repository> {
+    let mut repo = gix::open_opts(git_dir_for_workdir(workdir), open_options())?;
+    crate::refs::reload_conditional_includes(&mut repo)?;
+    Ok(repo)
 }
 
 /// The options every repository in this crate is opened with.
@@ -65,18 +61,69 @@ fn trust_repository_config(_meta: &gix::config::file::Metadata) -> bool {
 /// used for the catch-all `Backend` message; the two cases callers act on —
 /// "not a repository" and I/O — map to their own kinds so they stay
 /// distinguishable. Callers that treat a missing repository as absence rather
-/// than an error match on [`gix::open::Error`] themselves instead.
-#[allow(clippy::result_large_err)]
-pub(crate) fn map_open_error(error: gix::open::Error, context: &str) -> Error {
-    match error {
-        gix::open::Error::NotARepository { .. } => Error::new(ErrorKind::NotARepository),
-        gix::open::Error::Io(io) => Error::new(ErrorKind::Io(io.kind())),
-        error => Error::new(ErrorKind::Backend(format!("{context}: {error}"))),
+/// than an error check [`gix::Error::is_not_found`] themselves instead.
+pub(crate) fn map_open_error(error: gix::Error, context: &str) -> Error {
+    // gix classifies "not a git repository" (and a missing path) as not-found.
+    if error.is_not_found() {
+        return Error::new(ErrorKind::NotARepository);
+    }
+    match error.iter_errors().find_map(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .map(std::io::Error::kind)
+    }) {
+        Some(kind) => Error::new(ErrorKind::Io(kind)),
+        None => {
+            // The top frame is generic ("configuration could not be loaded");
+            // the innermost names the offending key or file.
+            let mut message = format!("{context}: {error}");
+            if let Some(cause) = error.iter_errors().last().map(ToString::to_string)
+                && !message.contains(&cause)
+            {
+                message.push_str(": ");
+                message.push_str(&cause);
+            }
+            Error::new(ErrorKind::Backend(message))
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn open_error_preserves_io_kinds_without_semantic_classifications() {
+        for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::InvalidData] {
+            let error = gix::Error::from_error(std::io::Error::new(kind, "repository read failed"));
+            let mapped = super::map_open_error(error, "gix open");
+            assert!(
+                matches!(mapped.kind(), gitcomet_core::error::ErrorKind::Io(actual) if *actual == kind)
+            );
+        }
+    }
+
+    #[test]
+    fn open_error_names_the_innermost_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let git = crate::util::git_workdir_cmd_for(dir.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap();
+        assert!(git.success());
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text = text.replace("repositoryformatversion = 0", "repositoryformatversion = 1");
+        text.push_str("[extensions]\n\tobjectFormat = sha512\n");
+        std::fs::write(&config, text).unwrap();
+
+        let error = super::open_worktree_repo(dir.path()).unwrap_err();
+        let message = super::map_open_error(error, "gix open").to_string();
+        assert!(message.contains("objectFormat"), "{message}");
+        assert!(message.contains("sha512"), "{message}");
+    }
+}
+
+#[cfg(test)]
+mod trust_tests {
     use super::open_worktree_repo;
     use std::path::Path;
     use std::process::Command;

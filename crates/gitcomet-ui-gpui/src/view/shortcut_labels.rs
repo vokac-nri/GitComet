@@ -31,6 +31,26 @@ fn alt_shortcut_for(suffix: &str, is_macos: bool) -> String {
     }
 }
 
+/// The keys for every diff surface's previous-file button.
+pub(crate) fn previous_file_shortcuts() -> Vec<gpui::SharedString> {
+    vec!["F1".into(), alt_shortcut("Left").into()]
+}
+
+/// The keys for every diff surface's next-file button.
+pub(crate) fn next_file_shortcuts() -> Vec<gpui::SharedString> {
+    vec!["F4".into(), alt_shortcut("Right").into()]
+}
+
+/// The keys for every diff surface's previous-change button.
+pub(crate) fn previous_change_shortcuts() -> Vec<gpui::SharedString> {
+    vec!["F2".into(), "Shift+F7".into(), alt_shortcut("Up").into()]
+}
+
+/// The keys for every diff surface's next-change button.
+pub(crate) fn next_change_shortcuts() -> Vec<gpui::SharedString> {
+    vec!["F3".into(), "F7".into(), alt_shortcut("Down").into()]
+}
+
 /// A displayable shortcut attached to a command-palette entry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Shortcut {
@@ -48,6 +68,8 @@ pub(crate) enum Shortcut {
     },
     /// A binding that is only registered on macOS.
     MacOs(&'static str),
+    /// An extension's binding in GPUI keystroke syntax, like `secondary-shift-k`.
+    Keystrokes(&'static str),
 }
 
 impl Shortcut {
@@ -64,6 +86,9 @@ impl Shortcut {
                 Some(if is_macos { *macos } else { *other }.to_string())
             }
             Shortcut::MacOs(label) => is_macos.then(|| (*label).to_string()),
+            Shortcut::Keystrokes(source) => Some(crate::kit::components::keystrokes_label_for(
+                source, is_macos,
+            )),
         }
     }
 }
@@ -92,5 +117,13 @@ mod tests {
         let macos_only = Shortcut::MacOs("Cmd+M");
         assert_eq!(macos_only.label_for(true).as_deref(), Some("Cmd+M"));
         assert_eq!(macos_only.label_for(false), None);
+    }
+
+    #[test]
+    fn extension_keystrokes_read_like_built_in_labels() {
+        let label = Shortcut::Keystrokes("ctrl-shift-k alt-f5").label_for(false);
+        assert_eq!(label.as_deref(), Some("Ctrl+Shift+K Alt+F5"));
+        let label = Shortcut::Keystrokes("alt-f5").label_for(true);
+        assert_eq!(label.as_deref(), Some("Option+F5"));
     }
 }

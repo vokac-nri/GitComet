@@ -13,6 +13,7 @@
 //! of actions to keep in step.
 
 use super::*;
+use crate::kit::click::PointerClickExt as _;
 
 /// The row whose menu is open, and where to draw it.
 #[derive(Clone)]
@@ -33,6 +34,11 @@ pub(super) struct PickerRowMenu {
 #[derive(Clone)]
 pub(super) enum PickerRowMenuTarget {
     Repo(repo_picker::RepoPickerEntry),
+    FileHistoryCommit {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        path: std::path::PathBuf,
+    },
     /// A row of the branch badge's checkout picker. Reuses the menu the branch's
     /// sidebar row opens, so the two offer the same actions by construction.
     Branch {
@@ -43,7 +49,7 @@ pub(super) enum PickerRowMenuTarget {
     /// sidebar row opens.
     Worktree {
         repo_id: RepoId,
-        row: workspace_picker::WorkspaceRow,
+        row: worktree_badge_picker::WorktreeBadgeRow,
     },
 }
 
@@ -53,6 +59,11 @@ impl PickerRowMenuTarget {
     fn model(&self, this: &PopoverHost, cx: &gpui::Context<PopoverHost>) -> ContextMenuModel {
         match self {
             Self::Repo(entry) => this.repo_picker_row_menu_model(entry),
+            Self::FileHistoryCommit {
+                repo_id,
+                commit_id,
+                path,
+            } => context_menu::file_history_commit::model(this, *repo_id, commit_id, path),
             Self::Branch { .. } | Self::Worktree { .. } => self
                 .popover_kind(this)
                 .and_then(|kind| this.context_menu_model(&kind, cx))
@@ -63,18 +74,16 @@ impl PickerRowMenuTarget {
     /// The popover whose menu this row borrows, for the targets that borrow one.
     fn popover_kind(&self, this: &PopoverHost) -> Option<PopoverKind> {
         match self {
-            Self::Repo(_) => None,
+            Self::Repo(_) | Self::FileHistoryCommit { .. } => None,
             Self::Branch { repo_id, row } => match row {
                 branch_picker::BranchPickerNavTarget::Ref(name) => Some(PopoverKind::BranchMenu {
                     repo_id: *repo_id,
-                    section: BranchSection::Local,
-                    name: name.clone(),
+                    target: BranchMenuTarget::local(name),
                 }),
                 branch_picker::BranchPickerNavTarget::RemoteBranch { remote, branch } => {
                     Some(PopoverKind::BranchMenu {
                         repo_id: *repo_id,
-                        section: BranchSection::Remote,
-                        name: format!("{remote}/{branch}"),
+                        target: BranchMenuTarget::remote(remote, branch),
                     })
                 }
                 // The create row names a branch that does not exist yet, and a
@@ -83,7 +92,7 @@ impl PickerRowMenuTarget {
                 | branch_picker::BranchPickerNavTarget::RowAction(_) => None,
             },
             Self::Worktree { repo_id, row } => match row {
-                workspace_picker::WorkspaceRow::Worktree(path) => {
+                worktree_badge_picker::WorktreeBadgeRow::Worktree(path) => {
                     // The sidebar's menu names the branch checked out in the
                     // worktree, so look it up the same way its rows do.
                     let branch = this
@@ -108,8 +117,8 @@ impl PickerRowMenuTarget {
                 }
                 // The create row names no worktree yet, and a menu entry is not
                 // a row at all.
-                workspace_picker::WorkspaceRow::CreateNew
-                | workspace_picker::WorkspaceRow::RowAction(_) => None,
+                worktree_badge_picker::WorktreeBadgeRow::CreateNew
+                | worktree_badge_picker::WorktreeBadgeRow::RowAction(_) => None,
             },
         }
     }
@@ -118,7 +127,8 @@ impl PickerRowMenuTarget {
     /// the right-click rather than opening an empty one.
     pub(super) fn has_menu(&self, this: &PopoverHost) -> bool {
         match self {
-            Self::Repo(_) => true,
+            Self::Repo(entry) => !this.repo_picker_row_menu_model(entry).items.is_empty(),
+            Self::FileHistoryCommit { .. } => true,
             Self::Branch { .. } | Self::Worktree { .. } => self.popover_kind(this).is_some(),
         }
     }
@@ -132,12 +142,21 @@ impl PickerRowMenuTarget {
                 .0
                 .iter()
                 .position(|candidate| candidate == entry),
+            Self::FileHistoryCommit { commit_id, .. } => {
+                let rows = file_history::cached(this, query);
+                rows.layout
+                    .item_indices
+                    .iter()
+                    .position(|ix| rows.payloads.get(*ix) == Some(commit_id))
+            }
             Self::Branch { row, .. } => branch_picker::nav_targets(this, query)
                 .iter()
                 .position(|candidate| candidate == row),
-            Self::Worktree { repo_id, row } => workspace_picker::nav_targets(this, *repo_id, query)
-                .iter()
-                .position(|candidate| candidate == row),
+            Self::Worktree { repo_id, row } => {
+                worktree_badge_picker::nav_targets(this, *repo_id, query)
+                    .iter()
+                    .position(|candidate| candidate == row)
+            }
         }
     }
 
@@ -146,6 +165,7 @@ impl PickerRowMenuTarget {
     /// entries that take you somewhere else are the exceptions.
     fn keeps_picker_open(&self, action: &ContextMenuAction) -> bool {
         match self {
+            Self::FileHistoryCommit { .. } => matches!(action, ContextMenuAction::CopyText { .. }),
             Self::Repo(_) => matches!(
                 action,
                 ContextMenuAction::PinRepository { .. }
@@ -232,6 +252,12 @@ pub(super) fn open(
         display_index,
         query: current_query(this, cx),
     });
+    this.picker_row_menu_scroll
+        .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+    this.picker_row_menu_placement.borrow_mut().reset();
+    this.picker_row_menu_arrows.reset();
+    this.picker_row_menu_rows.borrow_mut().clear();
+    this.picker_row_menu_revealed.set(None);
     // The selection index now addresses the menu's own actions, so it restarts
     // from nothing; the invoking row keeps its highlight through
     // `PickerRowMenu::display_index` instead.
@@ -350,11 +376,31 @@ pub(super) fn layer(
         .flex()
         .flex_col()
         .w(super::REPO_TAB_MENU_WIDTH.preferred_px(ui_scale))
-        .p(super::popover_scaled_px_from_percent(4.0, ui_scale_percent));
+        .p(crate::ui_scale::design_px_from_percent(
+            4.0,
+            ui_scale_percent,
+        ));
+    // Same rule as the shared context menu: once any entry has an icon, the
+    // icon-less ones keep its column so every label starts at one edge.
+    let reserve_icon_column = model
+        .items
+        .iter()
+        .any(|item| matches!(item, ContextMenuItem::Entry { icon: Some(_), .. }));
     // Only enabled entries are keyboard targets, so the menu's own selection
-    // index counts those alone.
+    // index counts those alone. `child_nav` maps each list child to that index.
     let mut nav_ix = 0usize;
+    let mut child_nav: Vec<Option<usize>> = Vec::new();
     for (ix, item) in model.items.into_iter().enumerate() {
+        let nav_target = matches!(
+            item,
+            ContextMenuItem::Entry {
+                disabled: false,
+                ..
+            }
+        );
+        if !matches!(item, ContextMenuItem::Segmented { .. }) {
+            child_nav.push(nav_target.then_some(nav_ix));
+        }
         match item {
             ContextMenuItem::Separator => {
                 list = list.child(components::context_menu_separator(theme, ui_scale_percent));
@@ -388,25 +434,23 @@ pub(super) fn layer(
                 if !disabled {
                     nav_ix += 1;
                 }
-                let mut entry = components::ContextMenuEntry::new(
-                    ("picker_row_action", ix),
-                    components::ContextMenuText::new(label),
-                );
-                if let Some(icon) = icon {
-                    entry = entry.icon(components::ContextMenuIconSlot::Icon(icon));
-                }
+                let icon_slot = match icon {
+                    Some(icon) => components::ContextMenuIconSlot::Icon(icon),
+                    None if reserve_icon_column => components::ContextMenuIconSlot::Reserved,
+                    None => components::ContextMenuIconSlot::None,
+                };
                 list = list.child(
-                    entry
-                        .disabled(disabled)
-                        .selected(selected)
-                        .render(theme, ui_scale_percent, cx)
-                        .debug_selector(move || format!("picker_row_action_{ix}"))
-                        .on_click(cx.listener(move |this, _e: &ClickEvent, window, cx| {
-                            if disabled {
-                                return;
-                            }
-                            activate(this, (*action).clone(), window, cx);
-                        })),
+                    components::ContextMenuEntry::new(
+                        ("picker_row_action", ix),
+                        components::ContextMenuText::new(label),
+                    )
+                    .icon(icon_slot)
+                    .disabled(disabled)
+                    .selected(selected)
+                    .on_select(theme, ui_scale_percent, cx, move |this, _e, window, cx| {
+                        activate(this, (*action).clone(), window, cx);
+                    })
+                    .debug_selector(move || format!("picker_row_action_{ix}")),
                 );
             }
             // Clicked rather than keyboard-selected, and no row menu has one.
@@ -419,28 +463,87 @@ pub(super) fn layer(
         close(this, cx);
     });
 
-    // The menu anchors at the pointer and gpui flips it above that point when it
-    // will not fit below, so the room it really has is the taller of the two
-    // sides. Capping to that and scrolling inside is what keeps the destructive
-    // entries at the bottom reachable in a short window or at a large UI scale —
-    // the treatment `popover_view` gives every other context menu.
-    let margin_y = super::popover_scaled_px_from_percent(16.0, ui_scale_percent);
-    let window_h = window.window_bounds().get_bounds().size.height;
-    let max_menu_h = ((window_h - menu.position.y) - margin_y)
-        .max(menu.position.y - margin_y)
-        .max(super::popover_scaled_px_from_percent(
-            96.0,
-            ui_scale_percent,
-        ));
-    let list = crate::view::restrict_scroll_to_vertical_axis(
+    // Placed like every other context menu: flipped, then slid inside the
+    // window, and only scrolled (behind arrows) when taller than the window.
+    let scroll = this.picker_row_menu_scroll.clone();
+    let placement = this.picker_row_menu_placement.clone();
+    let now = cx.background_executor().now();
+    this.picker_row_menu_arrows
+        .drive(&scroll, window, ui_scale, now);
+    if selected_index.is_some() {
+        placement.borrow_mut().latch();
+    }
+    let rows = this.picker_row_menu_rows.clone();
+    rows.borrow_mut().resize(nav_ix, None);
+    if this.picker_row_menu_revealed.replace(selected_index) != selected_index
+        && let Some((top, height)) = selected_index
+            .and_then(|nav| rows.borrow().get(nav).copied())
+            .flatten()
+    {
+        let offset = scroll.offset();
+        let target = crate::kit::menu_placement::reveal_scroll(
+            top,
+            top + height,
+            scroll.bounds().size.height,
+            scroll.max_offset().y,
+            -offset.y,
+            ui_scale.px(components::MENU_SCROLL_ARROW_HEIGHT_PX),
+        );
+        scroll.set_offset(gpui::point(offset.x, -target));
+    }
+    let list = list.on_children_prepainted(context_menu::record_row_extents(
+        rows,
+        scroll.clone(),
+        move |child| child_nav.get(child).copied().flatten(),
+    ));
+
+    let request = crate::kit::menu_placement::MenuRequest {
+        anchor: crate::kit::menu_placement::MenuAnchor::Point(menu.position),
+        prefer_below: true,
+        prefer_right: true,
+        gap: gpui::px(0.0),
+    };
+    let limits = super::menu_layer::menu_limits(
+        window,
+        crate::ui_scale::design_px_from_percent(16.0, ui_scale_percent),
+    );
+    // Less the surface's 1px border on both sides.
+    let content_max_h =
+        (placement.borrow().height_cap(&request, limits) - gpui::px(2.0)).max(gpui::px(0.0));
+    let latch_on_wheel = placement.clone();
+    let area = crate::view::restrict_scroll_to_vertical_axis(
         div()
             .id("picker_row_menu_scroll")
             .debug_selector(|| "picker_row_menu_scroll".to_string())
             .min_h(gpui::px(0.0))
-            .max_h(max_menu_h)
-            .overflow_y_scroll(),
+            .max_h(content_max_h)
+            .track_scroll(&scroll)
+            .overflow_y_scroll()
+            .on_scroll_wheel(move |_e, _w, _cx| latch_on_wheel.borrow_mut().latch()),
     )
     .child(list);
+    let arrows = this.picker_row_menu_arrows.clone();
+    let up = arrows.arrow(
+        components::MenuScrollDirection::Up,
+        &scroll,
+        &placement,
+        "picker_row_menu_scroll",
+        theme,
+        ui_scale,
+        cx,
+    );
+    let down = arrows.arrow(
+        components::MenuScrollDirection::Down,
+        &scroll,
+        &placement,
+        "picker_row_menu_scroll",
+        theme,
+        ui_scale,
+        cx,
+    );
+    let list = super::menu_layer::scroll_area_with_arrows(area, up, down);
+    let latch_on_press = placement.clone();
+    let latch_on_move = placement.clone();
 
     Some(
         div()
@@ -466,23 +569,28 @@ pub(super) fn layer(
                     // tooltip from the picker underneath stays painted wherever
                     // the pointer was when the menu opened.
                     .on_mouse_move(cx.listener(track_pointer_for_tooltips))
-                    .on_any_mouse_down(dismiss_menu),
+                    .on_any_pointer_click(dismiss_menu),
             )
-            .child(
-                anchored().position(menu.position).child(
-                    // This menu is its own floating layer rather than a panel
-                    // inside the popover container, so it has to bring the
-                    // elevated surface with it — `components::context_menu` is
-                    // layout only.
-                    components::popover_surface(theme)
-                        .id("picker_row_menu")
-                        .debug_selector(|| "picker_row_menu".to_string())
-                        .occlude()
-                        .on_any_mouse_down(|_e, _w, cx| cx.stop_propagation())
-                        .on_mouse_move(cx.listener(track_pointer_for_tooltips))
-                        .child(components::context_menu(theme, list)),
-                ),
-            )
+            .child(crate::kit::menu_placement::menu_placement(
+                placement,
+                request,
+                limits,
+                // This menu is its own floating layer rather than a panel
+                // inside the popover container, so it has to bring the
+                // elevated surface with it — `components::context_menu` is
+                // layout only.
+                components::popover_surface(theme)
+                    .id("picker_row_menu")
+                    .debug_selector(|| "picker_row_menu".to_string())
+                    .occlude()
+                    .on_any_mouse_down(move |_e, _w, cx| {
+                        latch_on_press.borrow_mut().latch();
+                        cx.stop_propagation();
+                    })
+                    .on_mouse_move(move |_e, _w, _cx| latch_on_move.borrow_mut().latch())
+                    .on_mouse_move(cx.listener(track_pointer_for_tooltips))
+                    .child(components::context_menu(theme, list)),
+            ))
             .into_any_element(),
     )
 }

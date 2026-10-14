@@ -3,10 +3,10 @@ use super::util::{
     EffectAccumulator, SelectedConflictTarget, append_auto_background_metadata_effects,
     append_refresh_full_effects, append_refresh_primary_effects,
     append_start_conflict_target_reload, append_start_current_conflict_target_reload,
-    background_metadata_effect_capacity, clear_banner_error_for_repo, dedup_paths_in_order,
-    format_failure_summary, handle_session_persist_result, normalize_repo_path, push_diagnostic,
-    push_notification, refresh_full_effect_capacity, refresh_full_effects,
-    refresh_primary_effect_capacity, selected_conflict_target, selected_diff_load_plan,
+    background_metadata_effect_capacity, dedup_paths_in_order, format_failure_summary,
+    handle_session_persist_result, normalize_repo_path, push_diagnostic, push_notification,
+    refresh_full_effect_capacity, refresh_full_effects, refresh_primary_effect_capacity,
+    selected_conflict_target, selected_diff_load_plan,
 };
 use crate::model::{
     AppNotificationKind, AppState, CloneOpState, CloneOpStatus, CloneProgressMeter,
@@ -38,6 +38,7 @@ pub(crate) type ReorderRepoTabsEffects =
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OpenRepoMode {
     Standard,
+    DocumentBackground,
     ProvisionalExternalDrop,
 }
 
@@ -145,6 +146,15 @@ fn clear_loading<T>(loadable: &mut Loadable<T>) -> bool {
 
 fn clear_cancelled_repo_loading(repo_state: &mut RepoState) {
     repo_state.loads_in_flight.clear();
+    // A dropped reply would otherwise leave a dialog waiting on it forever.
+    for lookup in [
+        &mut repo_state.history_state.commit_lookup,
+        &mut repo_state.history_state.mainline_lookup,
+    ] {
+        if lookup.result.is_loading() {
+            lookup.result = Loadable::NotLoaded;
+        }
+    }
     // The cancelled walk's reply is dropped by the repo-load guard, so nothing
     // downstream will ever clear the count it left on screen.
     repo_state.set_log_scan_progress(None);
@@ -209,7 +219,7 @@ fn clear_cancelled_repo_loading(repo_state: &mut RepoState) {
         repo_state.set_submodules(Loadable::NotLoaded);
     }
     clear_loading(&mut repo_state.history_state.file_history);
-    clear_loading(&mut repo_state.history_state.blame);
+    clear_loading(&mut repo_state.diff_state.blame);
     if repo_state.history_state.commit_details.is_loading() {
         repo_state.set_commit_details(Loadable::NotLoaded);
     }
@@ -269,6 +279,24 @@ pub(in crate::store::reducer) fn append_cancel_repo_loads_effect_for_repo(
     }));
 }
 
+/// Cancels the loads of the tab being switched away from, except a dropped
+/// folder still being validated: its open is all it has in flight, and
+/// cancelling it would strand the tab unvalidated until it is clicked again.
+fn append_cancel_loads_for_deactivated_repo(
+    state: &mut AppState,
+    repo_id: Option<RepoId>,
+    effects: &mut impl Extend<Effect>,
+) {
+    let validating_drop = repo_id.is_some_and(|repo_id| {
+        state.repos.iter().any(|repo| {
+            repo.id == repo_id && repo.is_provisional_external_drop_open() && repo.open.is_loading()
+        })
+    });
+    if !validating_drop {
+        append_cancel_repo_loads_effect_for_repo(state, repo_id, effects);
+    }
+}
+
 fn append_open_repo_effect_if_not_loaded(
     repo_state: &mut RepoState,
     effects: &mut impl Extend<Effect>,
@@ -302,9 +330,9 @@ pub(in crate::store::reducer) fn selected_history_reloads_for_activation(
         reloads.push(SelectedHistoryReload::FileHistory(path));
     }
 
-    if matches!(repo_state.history_state.blame, Loadable::NotLoaded)
-        && let Some(path) = repo_state.history_state.blame_path.clone()
-        && let Some(source) = repo_state.history_state.blame_source.clone()
+    if matches!(repo_state.diff_state.blame, Loadable::NotLoaded)
+        && let Some(path) = repo_state.diff_state.blame_path.clone()
+        && let Some(source) = repo_state.diff_state.blame_source.clone()
     {
         reloads.push(SelectedHistoryReload::Blame { path, source });
     }
@@ -332,10 +360,11 @@ pub(in crate::store::reducer) fn append_selected_history_reload_effects(
                     repo_id,
                     path,
                     limit: REACTIVATED_FILE_HISTORY_LIMIT,
+                    cursor: None,
                 });
             }
             SelectedHistoryReload::Blame { path, source } => {
-                repo_state.history_state.blame = Loadable::Loading;
+                repo_state.diff_state.blame = Loadable::Loading;
                 effects.push_effect(Effect::LoadBlame {
                     repo_id,
                     path,
@@ -357,6 +386,26 @@ pub(super) fn open_repo(
     path: PathBuf,
 ) -> Vec<Effect> {
     open_repo_with_mode(repos, id_alloc, state, path, OpenRepoMode::Standard)
+}
+
+pub(super) fn open_document_repository(
+    repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    id_alloc: &AtomicU64,
+    state: &mut AppState,
+    path: PathBuf,
+    activate: bool,
+) -> Vec<Effect> {
+    open_repo_with_mode(
+        repos,
+        id_alloc,
+        state,
+        path,
+        if activate {
+            OpenRepoMode::Standard
+        } else {
+            OpenRepoMode::DocumentBackground
+        },
+    )
 }
 
 pub(super) fn open_repo_from_external_drop(
@@ -383,12 +432,20 @@ fn open_repo_with_mode(
 ) -> Vec<Effect> {
     let now = SystemTime::now();
     let path = normalize_repo_path(path);
+    state.repository_open_failures.remove(&path);
     if let Some((repo_id, existing_is_provisional_drop)) = state
         .repos
         .iter()
         .find(|r| r.spec.workdir == path)
         .map(|r| (r.id, r.is_provisional_external_drop_open()))
     {
+        if mode == OpenRepoMode::DocumentBackground {
+            let mut effects = vec![];
+            if let Some(repo) = state.repos.iter_mut().find(|r| r.id == repo_id) {
+                append_open_repo_effect_if_not_loaded(repo, &mut effects);
+            }
+            return effects;
+        }
         // Re-opening an already open repository should still refresh primary state, so stale
         // status/diff data gets reconciled immediately.
         let mut effects = set_active_repo(repos, state, repo_id);
@@ -419,7 +476,9 @@ fn open_repo_with_mode(
 
     state.repos.push({
         let mut repo_state = match mode {
-            OpenRepoMode::Standard => RepoState::new_opening(repo_id, spec.clone()),
+            OpenRepoMode::Standard | OpenRepoMode::DocumentBackground => {
+                RepoState::new_opening(repo_id, spec.clone())
+            }
             OpenRepoMode::ProvisionalExternalDrop => {
                 RepoState::new_external_drop_opening(repo_id, spec.clone(), previous_active)
             }
@@ -430,24 +489,19 @@ fn open_repo_with_mode(
             .get(&workdir_key)
             .cloned()
             .flatten();
-        if let Some(enabled) = session_preferences
-            .repo_fetch_prune_deleted_remote_tracking_branches
-            .get(&workdir_key)
-            .copied()
-        {
-            repo_state.fetch_prune_deleted_remote_tracking_branches = enabled;
-        }
         repo_state.last_active_at = Some(now);
         repo_state
     });
-    state.active_repo = Some(repo_id);
     let mut effects = Vec::new();
-    append_cancel_repo_loads_effect_for_repo(state, previous_active, &mut effects);
+    if mode != OpenRepoMode::DocumentBackground {
+        state.active_repo = Some(repo_id);
+        append_cancel_loads_for_deactivated_repo(state, previous_active, &mut effects);
+    }
     effects.push(Effect::OpenRepo {
         repo_id,
         path: spec.workdir.clone(),
     });
-    if mode == OpenRepoMode::Standard {
+    if mode != OpenRepoMode::ProvisionalExternalDrop {
         effects.push(persist_recent_repo_effect(
             Some(repo_id),
             spec.workdir.clone(),
@@ -469,16 +523,17 @@ fn open_repo_with_mode(
 }
 
 pub(super) fn restore_session(
-    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    _repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
     id_alloc: &AtomicU64,
     state: &mut AppState,
     open_repos: Vec<PathBuf>,
     active_repo: Option<PathBuf>,
 ) -> Vec<Effect> {
     let now = SystemTime::now();
-    repos.clear();
-    state.repos.clear();
-    state.active_repo = None;
+    // Startup may wait for the Git probe while a drop or forwarded open is
+    // already loading. Keep those tabs, handles and IDs; their replies are
+    // still in flight, and an explicit selection takes precedence over restore.
+    let live_active_repo = state.active_repo;
 
     let session_preferences = session::load_repo_session_preferences();
     let default_history_mode = session_preferences.default_history_mode.unwrap_or_default();
@@ -488,7 +543,11 @@ pub(super) fn restore_session(
 
     let open_repos = dedup_paths_in_order(open_repos);
     let mut effects = Vec::with_capacity(4);
-    let mut seen_workdirs: FxHashSet<PathBuf> = FxHashSet::default();
+    let mut seen_workdirs: FxHashSet<PathBuf> = state
+        .repos
+        .iter()
+        .map(|repo| repo.spec.workdir.clone())
+        .collect();
     seen_workdirs.reserve(open_repos.len());
 
     for path in open_repos.into_iter().map(normalize_repo_path) {
@@ -526,13 +585,6 @@ pub(super) fn restore_session(
                 .get(&workdir_key)
                 .cloned()
                 .flatten();
-            if let Some(enabled) = session_preferences
-                .repo_fetch_prune_deleted_remote_tracking_branches
-                .get(&workdir_key)
-                .copied()
-            {
-                repo_state.fetch_prune_deleted_remote_tracking_branches = enabled;
-            }
             repo_state
         };
         repo_state.set_open(Loadable::NotLoaded);
@@ -542,11 +594,9 @@ pub(super) fn restore_session(
         }
     }
 
-    state.active_repo = if let Some(active_repo_id) = active_repo_id {
-        Some(active_repo_id)
-    } else {
-        state.repos.last().map(|r| r.id)
-    };
+    state.active_repo = live_active_repo
+        .or(active_repo_id)
+        .or_else(|| state.repos.last().map(|r| r.id));
     if let Some(active_repo_id) = state.active_repo
         && let Some(repo_state) = state
             .repos
@@ -578,7 +628,30 @@ pub(super) fn close_repo(
     state: &mut AppState,
     repo_id: RepoId,
 ) -> Vec<Effect> {
-    clear_banner_error_for_repo(state, repo_id);
+    remove_repo(repos, state, repo_id, true)
+}
+
+pub(super) fn move_repo_out(
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+) -> Vec<Effect> {
+    remove_repo(repos, state, repo_id, false)
+}
+
+fn remove_repo(
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    state: &mut AppState,
+    repo_id: RepoId,
+    record_recent: bool,
+) -> Vec<Effect> {
+    if state
+        .branch_exists_prompt
+        .as_ref()
+        .is_some_and(|prompt| prompt.repo_id == repo_id)
+    {
+        state.branch_exists_prompt = None;
+    }
     let mut effects = Vec::with_capacity(3 + SET_ACTIVE_REPO_INLINE_EFFECT_CAPACITY);
     let Some(removed_repo_ix) = state.repos.iter().position(|repo| repo.id == repo_id) else {
         effects.push(persist_session_effect(
@@ -596,6 +669,10 @@ pub(super) fn close_repo(
     // matter which of them (tab `x`, tab menu, picker row menu, close-others)
     // the user reached for.
     let closed_repo = &state.repos[removed_repo_ix];
+    closed_repo
+        .history_state
+        .commit_signatures_cancellation
+        .cancel();
     let closed_workdir = closed_repo.spec.workdir.clone();
     let persist_closed_recent = !closed_repo.is_provisional_external_drop_open();
     state.repos.remove(removed_repo_ix);
@@ -605,7 +682,7 @@ pub(super) fn close_repo(
     // repo is gone rather than merely idle -- `CancelRepoLoads` also fires on tab
     // switches and reloads, where the handles are still worth keeping.
     crate::store::effects::release_worktree_scan_handles(repo_id);
-    if persist_closed_recent {
+    if record_recent && persist_closed_recent {
         effects.push(persist_recent_repo_effect(Some(repo_id), closed_workdir));
     }
     if was_active {
@@ -623,6 +700,7 @@ pub(super) fn close_repo(
                 state,
                 active_repo_id,
                 &mut activation_effects,
+                false,
                 false,
             );
             effects.extend(activation_effects);
@@ -653,6 +731,13 @@ pub(super) fn close_repos(
     if close_ids.is_empty() {
         return Vec::new();
     }
+    if state
+        .branch_exists_prompt
+        .as_ref()
+        .is_some_and(|prompt| close_ids.contains(&prompt.repo_id))
+    {
+        state.branch_exists_prompt = None;
+    }
 
     let original_order: Vec<RepoId> = state.repos.iter().map(|repo| repo.id).collect();
     let original_active = state.active_repo;
@@ -668,7 +753,6 @@ pub(super) fn close_repos(
         if !close_ids.contains(&repo_id) {
             continue;
         }
-        clear_banner_error_for_repo(state, repo_id);
         append_cancel_repo_loads_effect_for_repo(state, Some(repo_id), &mut effects);
         if let Some(repo) = state
             .repos
@@ -685,7 +769,14 @@ pub(super) fn close_repos(
         crate::store::effects::release_worktree_scan_handles(repo_id);
     }
 
-    state.repos.retain(|repo| !close_ids.contains(&repo.id));
+    state.repos.retain(|repo| {
+        let keep = !close_ids.contains(&repo.id);
+        if !keep {
+            repo.history_state.commit_signatures_cancellation.cancel();
+            repo.history_state.authors.cancellation.cancel();
+        }
+        keep
+    });
 
     let repo_still_open =
         |repo_id: RepoId, state: &AppState| state.repos.iter().any(|repo| repo.id == repo_id);
@@ -727,6 +818,7 @@ pub(super) fn close_repos(
                 active_repo_id,
                 &mut activation_effects,
                 false,
+                false,
             );
             effects.extend(activation_effects);
         } else {
@@ -750,7 +842,7 @@ pub(super) fn set_active_repo(
     repo_id: RepoId,
 ) -> Vec<Effect> {
     let mut effects = SetActiveRepoEffects::new();
-    fill_set_active_repo_inline(repos, state, repo_id, &mut effects);
+    fill_set_active_repo_inline(repos, state, repo_id, false, &mut effects);
     effects.into_vec()
 }
 
@@ -760,23 +852,36 @@ pub(super) fn set_active_repo(
 /// toggles the sidebar tabs.
 fn file_browser_load_for_active_files_mode(
     sidebar_mode: SidebarMode,
-    repo_state: &RepoState,
+    repo_state: &mut RepoState,
 ) -> Option<Effect> {
-    (sidebar_mode == SidebarMode::Files && repo_state.file_browser.needs_load()).then(|| {
-        Effect::LoadFileBrowser {
-            repo_id: repo_state.id,
-            source: repo_state.file_browser.source.clone(),
-        }
-    })
+    if sidebar_mode != SidebarMode::Files || !repo_state.file_browser.needs_load() {
+        return None;
+    }
+    super::effects::request_file_browser_load(repo_state)
 }
 
 pub(super) fn fill_set_active_repo_inline(
     repos: &FxHashMap<RepoId, Arc<dyn GitRepository>>,
     state: &mut AppState,
     repo_id: RepoId,
+    unchanged: bool,
     effects: &mut SetActiveRepoEffects,
 ) {
-    fill_set_active_repo_inline_impl(repos, state, repo_id, effects, true);
+    fill_set_active_repo_inline_impl(repos, state, repo_id, effects, true, unchanged);
+}
+
+/// Everything a switch would reload is loaded, nothing for the repository is
+/// in flight and nothing was cancelled when it was left, so its retained state
+/// can be shown as is.
+fn repo_switch_state_complete(repo_state: &RepoState, git_log_settings: GitLogSettings) -> bool {
+    !repo_state.left_mid_refresh
+        && repo_switch_secondary_metadata_ready(repo_state, git_log_settings)
+        && matches!(repo_state.head_branch, Loadable::Ready(_))
+        && matches!(repo_state.upstream_divergence, Loadable::Ready(_))
+        && matches!(repo_state.status, Loadable::Ready(_))
+        && matches!(repo_state.log, Loadable::Ready(_))
+        && matches!(repo_state.worktrees, Loadable::Ready(_))
+        && !repo_state.loads_in_flight.any_in_flight()
 }
 
 fn fill_set_active_repo_inline_impl(
@@ -785,6 +890,7 @@ fn fill_set_active_repo_inline_impl(
     repo_id: RepoId,
     effects: &mut SetActiveRepoEffects,
     persist_on_change: bool,
+    unchanged: bool,
 ) {
     enum SelectedDiffReload {
         Conflict(PathBuf),
@@ -806,15 +912,31 @@ fn fill_set_active_repo_inline_impl(
         // attached to it. Refresh its retained path before capturing the diff
         // reload plan below.
         super::refresh_selected_head_gitlink(repos, state, repo_id);
+        // Leaving cancels whatever is in flight, but keeps the values it was
+        // about to replace.
+        if let Some(previous) = state
+            .repos
+            .iter_mut()
+            .find(|repo| Some(repo.id) == previous_active)
+        {
+            previous.left_mid_refresh = previous.loads_in_flight.any_in_flight()
+                || previous.diff_state.diff_reload_in_flight;
+        }
+        append_cancel_loads_for_deactivated_repo(state, previous_active, effects);
     }
-    if changed {
-        append_cancel_repo_loads_effect_for_repo(state, previous_active, effects);
+    if changed && state.git_log_settings.verify_commit_signatures {
+        for repo in &mut state.repos {
+            repo.history_state.commit_signatures_queue.clear();
+            repo.history_state.commit_signatures_visible = Default::default();
+        }
     }
     state.active_repo = Some(repo_id);
     let persist_effect = (changed && persist_on_change)
         .then(|| persist_session_effect(state, Some(repo_id), "switching active repository"));
     let git_log_settings = state.git_log_settings;
+    let maintenance_settings = state.maintenance_settings;
     let sidebar_mode = state.sidebar_mode;
+    let follow_selection = state.file_browser_settings.follow_selected_commit;
 
     let repo_state = &mut state.repos[repo_ix];
 
@@ -847,6 +969,9 @@ fn fill_set_active_repo_inline_impl(
         // retires multi/range and linked-worktree selections.
         repo_state.set_selected_commit(None);
         repo_state.set_commit_details(Loadable::NotLoaded);
+        // Before `file_browser_load_for_active_files_mode` below reads the
+        // source, so the one load it emits already carries the live tree.
+        super::effects::sync_file_browser_to_selection(repo_state, follow_selection, sidebar_mode);
 
         // Activation is not a user navigation step, so replace the snapshot at
         // the cursor rather than pushing one. This explicit replacement is
@@ -868,9 +993,22 @@ fn fill_set_active_repo_inline_impl(
         return;
     }
 
-    let use_full_refresh =
-        changed && !repo_switch_can_use_primary_refresh(repo_state, git_log_settings, now);
+    // A monitor kept running while this tab was inactive saw nothing change:
+    // its status, history, refs and worktree list are what the refresh below
+    // would load again. The retained diff is current for the same reason.
+    let reuse_retained =
+        changed && unchanged && repo_switch_state_complete(repo_state, git_log_settings);
+    repo_state.left_mid_refresh = false;
+    let use_full_refresh = changed
+        && !reuse_retained
+        && !repo_switch_can_use_primary_refresh(repo_state, git_log_settings, now);
     repo_state.last_active_at = Some(now);
+    let selected_diff_reload = selected_diff_reload.filter(|reload| {
+        !(reuse_retained
+            && matches!(reload, SelectedDiffReload::Diff(_))
+            && matches!(repo_state.diff_state.diff, Loadable::Ready(_))
+            && !matches!(repo_state.diff_state.diff_file, Loadable::Loading))
+    });
 
     let selected_history_reloads = if changed {
         selected_history_reloads_for_activation(repo_state)
@@ -891,7 +1029,8 @@ fn fill_set_active_repo_inline_impl(
         + usize::from(file_browser_load.is_some())
         + usize::from(repo_state.sidebar_data_request.worktrees)
         + usize::from(repo_state.sidebar_data_request.submodules)
-        + usize::from(repo_state.sidebar_data_request.stashes);
+        + usize::from(repo_state.sidebar_data_request.stashes)
+        + usize::from(changed);
     let base_effect_capacity = if use_full_refresh {
         refresh_full_effect_capacity()
     } else {
@@ -900,21 +1039,28 @@ fn fill_set_active_repo_inline_impl(
     debug_assert!(
         base_effect_capacity + extra_effect_capacity <= SET_ACTIVE_REPO_INLINE_EFFECT_CAPACITY
     );
-    if use_full_refresh {
-        append_refresh_full_effects(repo_state, git_log_settings, effects);
+    if reuse_retained {
+        // Linked worktrees live outside this repository's monitor.
+        if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
+            effects.push(effect);
+        }
     } else {
-        append_refresh_primary_effects(repo_state, effects);
-    }
-    if changed
-        && !use_full_refresh
-        && repo_state
-            .loads_in_flight
-            .request(RepoLoadsInFlight::BRANCHES)
-    {
-        effects.push(Effect::LoadBranches { repo_id });
-    }
-    if changed {
-        append_repo_switch_worktree_refresh_effect(repo_state, effects);
+        if use_full_refresh {
+            append_refresh_full_effects(repo_state, git_log_settings, effects);
+        } else {
+            append_refresh_primary_effects(repo_state, effects);
+        }
+        if changed
+            && !use_full_refresh
+            && repo_state
+                .loads_in_flight
+                .request(RepoLoadsInFlight::BRANCHES)
+        {
+            effects.push(Effect::LoadBranches { repo_id });
+        }
+        if changed {
+            append_repo_switch_worktree_refresh_effect(repo_state, effects);
+        }
     }
     append_ensure_sidebar_data_effects(repo_state, effects);
     if let Some(effect) = file_browser_load {
@@ -922,6 +1068,10 @@ fn fill_set_active_repo_inline_impl(
     }
     if changed {
         append_auto_background_metadata_effects(repo_state, git_log_settings, effects);
+        effects.extend(super::maintenance::request_check_for(
+            maintenance_settings,
+            repo_state,
+        ));
     }
 
     if let Some(selected_diff_reload) = selected_diff_reload {
@@ -933,6 +1083,7 @@ fn fill_set_active_repo_inline_impl(
                 append_start_conflict_target_reload(effects, repo_state, &conflict_path);
             }
             SelectedDiffReload::Diff(load_plan) => {
+                super::util::mark_text_attributes_loading(repo_state);
                 effects.push(Effect::LoadSelectedDiff {
                     repo_id,
                     load_patch_diff: load_plan.load_patch_diff,
@@ -945,38 +1096,14 @@ fn fill_set_active_repo_inline_impl(
         }
     }
     append_selected_history_reload_effects(repo_id, repo_state, selected_history_reloads, effects);
+    if changed {
+        // Hosted panes whose loads the deactivation cancelled; unbounded, so
+        // not in the inline capacity above.
+        super::diff_session::resume_queued_loads(repo_state, effects);
+    }
     if let Some(effect) = persist_effect {
         effects.push(effect);
     }
-}
-
-pub(super) fn set_fetch_prune_deleted_remote_tracking_branches(
-    state: &mut AppState,
-    repo_id: RepoId,
-    enabled: bool,
-) -> Vec<Effect> {
-    let Some(repo_ix) = state.repos.iter().position(|r| r.id == repo_id) else {
-        return Vec::new();
-    };
-
-    let workdir = {
-        let repo_state = &mut state.repos[repo_ix];
-        if repo_state.fetch_prune_deleted_remote_tracking_branches == enabled {
-            return Vec::new();
-        }
-
-        repo_state.fetch_prune_deleted_remote_tracking_branches = enabled;
-        repo_state.spec.workdir.clone()
-    };
-    let persist_result =
-        session::persist_repo_fetch_prune_deleted_remote_tracking_branches(&workdir, enabled);
-    handle_session_persist_result(
-        state,
-        Some(repo_id),
-        "updating fetch prune settings",
-        persist_result,
-    );
-    Vec::new()
 }
 
 pub(super) fn reorder_repo_tabs(
@@ -1060,6 +1187,7 @@ pub(super) fn clone_repo(state: &mut AppState, url: String, dest: PathBuf) -> Ve
     vec![Effect::CloneRepo {
         url,
         dest,
+        remote_url_policy: state.remote_url_policy,
         auth: None,
     }]
 }
@@ -1188,22 +1316,32 @@ pub(super) fn repo_opened_ok(
     repo_id: RepoId,
     spec: RepoSpec,
     repo: Arc<dyn GitRepository>,
+    preferences: Option<crate::model::RepositoryPreferencesSnapshot>,
 ) -> Vec<Effect> {
     if !state.repos.iter().any(|repo| repo.id == repo_id) {
         return Vec::new();
     }
 
+    let common_dir = repo.common_dir().map(Arc::<std::path::Path>::from);
     repos.insert(repo_id, repo);
     let git_log_settings = state.git_log_settings;
+    let maintenance_settings = state.maintenance_settings;
 
     let spec = RepoSpec {
         workdir: normalize_repo_path(spec.workdir),
     };
-    let mut clear_banner = false;
     let mut committed_external_drop = None;
     let should_refresh_worktrees = state.active_repo == Some(repo_id);
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         repo_state.set_spec(spec);
+        repo_state.common_dir = common_dir;
+        if let Some(snapshot) = preferences {
+            repo_state.history_state.history_scope = snapshot.preferences.history_mode;
+            repo_state.file_browser.show_hidden = snapshot.preferences.show_hidden_files;
+            repo_state.file_browser.show_ignored = snapshot.preferences.show_ignored_files;
+            repo_state.shared_preferences = Some(snapshot);
+            repo_state.branch_sidebar_rev += 1;
+        }
         if repo_state.commit_external_drop_open() {
             committed_external_drop = Some((
                 repo_state.spec.workdir.clone(),
@@ -1215,7 +1353,6 @@ pub(super) fn repo_opened_ok(
         if !should_refresh_worktrees {
             clear_cancelled_repo_loading(repo_state);
             repo_state.feedback.last_error = None;
-            clear_banner = true;
         } else {
             repo_state.set_head_branch(Loadable::Loading);
             repo_state.set_detached_head_commit(None);
@@ -1235,9 +1372,9 @@ pub(super) fn repo_opened_ok(
             repo_state.set_merge_commit_message(Loadable::Loading);
             repo_state.history_state.file_history_path = None;
             repo_state.history_state.file_history = Loadable::NotLoaded;
-            repo_state.history_state.blame_path = None;
-            repo_state.history_state.blame_source = None;
-            repo_state.history_state.blame = Loadable::NotLoaded;
+            repo_state.diff_state.blame_path = None;
+            repo_state.diff_state.blame_source = None;
+            repo_state.diff_state.blame = Loadable::NotLoaded;
             repo_state.clear_retained_blame();
             repo_state.set_worktrees(Loadable::NotLoaded);
             repo_state.set_submodules(Loadable::NotLoaded);
@@ -1257,12 +1394,7 @@ pub(super) fn repo_opened_ok(
             // start the navigation stacks fresh.
             repo_state.navigation.main_history.clear();
             repo_state.navigation.view_history.clear();
-            clear_banner = true;
         }
-    }
-
-    if clear_banner {
-        clear_banner_error_for_repo(state, repo_id);
     }
 
     let mut effects = Vec::new();
@@ -1284,6 +1416,7 @@ pub(super) fn repo_opened_ok(
         return effects;
     }
     let sidebar_mode = state.sidebar_mode;
+    let follow_selection = state.file_browser_settings.follow_selected_commit;
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         effects.extend(refresh_full_effects(repo_state, git_log_settings));
         if should_refresh_worktrees
@@ -1300,14 +1433,26 @@ pub(super) fn repo_opened_ok(
         if let Some(effect) = super::effects::request_worktree_dirty_effect(repo_state) {
             effects.push(effect);
         }
+        if let Some(effect) = super::effects::request_large_file_support_effect(repo_state) {
+            effects.push(effect);
+        }
         if should_refresh_worktrees {
             append_ensure_sidebar_data_effects(repo_state, &mut effects);
+            super::effects::sync_file_browser_to_selection(
+                repo_state,
+                follow_selection,
+                sidebar_mode,
+            );
             if let Some(effect) = file_browser_load_for_active_files_mode(sidebar_mode, repo_state)
             {
                 effects.push(effect);
             }
             append_auto_background_metadata_effects(repo_state, git_log_settings, &mut effects);
         }
+        effects.extend(super::maintenance::request_check_for(
+            maintenance_settings,
+            repo_state,
+        ));
         return effects;
     }
 
@@ -1324,7 +1469,6 @@ fn discard_failed_repo_open(
     activation: FailedOpenActivation,
 ) -> Vec<Effect> {
     let mut effects = Vec::new();
-    clear_banner_error_for_repo(state, repo_id);
     push_notification(state, AppNotificationKind::Warning, message);
 
     if remove_from_recents {
@@ -1339,7 +1483,19 @@ fn discard_failed_repo_open(
 
     repos.remove(&repo_id);
     if let Some(ix) = state.repos.iter().position(|r| r.id == repo_id) {
+        // Drops opened after this one fall back past it, so several failed
+        // drops in a row still land on the tab that was active before them.
+        let fallback = state.repos[ix].external_drop_previous_active_repo();
+        for repo in &mut state.repos {
+            if repo.external_drop_previous_active_repo() == Some(repo_id) {
+                repo.set_external_drop_previous_active_repo(fallback);
+            }
+        }
         let was_active = state.active_repo == Some(repo_id);
+        state.repos[ix]
+            .history_state
+            .commit_signatures_cancellation
+            .cancel();
         state.repos.remove(ix);
         if was_active {
             let adjacent_repo = if ix > 0 {
@@ -1368,6 +1524,7 @@ fn discard_failed_repo_open(
                     state,
                     active_repo_id,
                     &mut activation_effects,
+                    false,
                     false,
                 );
                 effects.extend(activation_effects);
@@ -1410,6 +1567,19 @@ pub(super) fn repo_opened_err(
     let spec = RepoSpec {
         workdir: normalize_repo_path(spec.workdir),
     };
+    if state.repository_open_failures.len() >= 50 {
+        state.repository_open_failures.pop_first();
+    }
+    state.repository_open_failures.insert(
+        spec.workdir.clone(),
+        (
+            gitcomet_core::filesystem::OperationId::allocate(),
+            error.to_string(),
+        ),
+    );
+    state.repo_open_failure_revision += 1;
+    Arc::make_mut(&mut state.repo_open_failures)
+        .insert(spec.workdir.clone(), state.repo_open_failure_revision);
     let not_a_repository = matches!(error.kind(), ErrorKind::NotARepository);
     if not_a_repository || provisional_external_drop {
         let message = if not_a_repository {
@@ -1438,21 +1608,16 @@ pub(super) fn repo_opened_err(
         );
     }
 
-    let mut clear_banner = false;
     if let Some(repo_state) = state.repos.iter_mut().find(|r| r.id == repo_id) {
         repo_state.set_spec(spec);
         repo_state.set_open(Loadable::Error(error.to_string()));
         repo_state.feedback.missing_on_disk = is_missing_repo_error(&error);
         if repo_state.feedback.missing_on_disk {
             repo_state.feedback.last_error = None;
-            clear_banner = true;
         } else {
             repo_state.feedback.last_error = Some(error.to_string());
             push_diagnostic(repo_state, DiagnosticKind::Error, error.to_string());
         }
-    }
-    if clear_banner {
-        clear_banner_error_for_repo(state, repo_id);
     }
     Vec::new()
 }

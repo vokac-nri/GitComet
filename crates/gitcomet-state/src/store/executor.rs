@@ -1,14 +1,30 @@
 use super::send_diagnostics::{SendFailureKind, panic_payload_to_string, send_or_log};
-use gitcomet_core::mergetool_trace;
+use gitcomet_core::{mergetool_trace, op_trace};
 use std::any::Any;
 use std::panic::{self, AssertUnwindSafe};
-#[cfg(any(test, feature = "test-support"))]
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
+
+/// One replaceable queue entry. Already-running work owns its cancellation
+/// token; obsolete requests that haven't started release their captures here.
+#[derive(Clone, Default)]
+pub(super) struct LatestTaskSlot(Arc<std::sync::Mutex<Option<Task>>>);
+
+/// One slot per selected-diff load kind. Sharing a slot would let complementary
+/// results replace each other before running, so each kind gets its own field.
+#[derive(Clone, Default)]
+pub(super) struct SelectedDiffSlots {
+    pub(super) patch: LatestTaskSlot,
+    pub(super) file_text: LatestTaskSlot,
+    pub(super) submodule_summary: LatestTaskSlot,
+    pub(super) file_image: LatestTaskSlot,
+    pub(super) preview_text: LatestTaskSlot,
+    pub(super) text_attributes: LatestTaskSlot,
+}
 
 static WORKER_TASK_PANICS: AtomicU64 = AtomicU64::new(0);
 
@@ -34,18 +50,27 @@ pub(super) fn metadata_worker_threads() -> usize {
     2
 }
 
-#[cfg(any(test, feature = "test-support"))]
 #[derive(Clone, Copy)]
 pub(super) enum StoreExecutorPool {
     Primary,
-    RepoLoad,
     Metadata,
+    Signatures,
     SessionPersist,
+    /// `git maintenance`, which can run for hours; one thread of its own.
+    Maintenance,
 }
 
 pub(super) struct TaskExecutor {
     tx: mpsc::Sender<Task>,
+    /// Thread-name prefix, also the pool label in operation traces.
+    name: &'static str,
     _threads: Vec<thread::JoinHandle<()>>,
+}
+
+/// One submission queue across windows for disk writes and explorer mutations.
+pub(super) fn filesystem_executor() -> &'static TaskExecutor {
+    static EXECUTOR: std::sync::OnceLock<TaskExecutor> = std::sync::OnceLock::new();
+    EXECUTOR.get_or_init(|| TaskExecutor::named("gitcomet-filesystem", 1))
 }
 
 /// A panicking task must not take its worker thread with it. These pools are
@@ -62,6 +87,9 @@ pub(super) struct TaskExecutor {
 /// process survived it — unchanged by this recovery, which only decides whether
 /// the worker thread lives.
 fn worker_loop(rx: Arc<std::sync::Mutex<mpsc::Receiver<Task>>>) {
+    // These long-lived workers run unrelated jobs across repositories. Mark
+    // each worker once, before its first task, for mimalloc's locality heuristics.
+    rustfs_mimalloc::set_current_thread_in_threadpool();
     loop {
         let task = {
             let rx = rx.lock().unwrap_or_else(|e| e.into_inner());
@@ -89,24 +117,77 @@ fn record_worker_task_panic(payload: &(dyn Any + Send)) {
 }
 
 impl TaskExecutor {
-    #[cfg_attr(feature = "test-support", allow(dead_code))]
+    /// Coalesce queued work without occupying a worker for every obsolete request.
+    /// `Some` means a queue entry already owns this slot. Taking it before running
+    /// allows a concurrent replacement to enqueue its own entry; do not hold the
+    /// slot lock across `task()`. Running work still needs cooperative cancellation.
+    /// Returns `true` when this replaced a queued request that had not started.
+    pub(super) fn spawn_latest(
+        &self,
+        slot: &LatestTaskSlot,
+        task: impl FnOnce() + Send + 'static,
+    ) -> bool {
+        let context = mergetool_trace::current_capture_context();
+        #[cfg(any(test, feature = "test-support"))]
+        let task = super::test_support::track_task(task);
+        // Traced at request time: a replacement also replaces the operation
+        // the running task is attributed to.
+        let task = op_trace::wrap_task(self.name, task);
+        let task: Task = Box::new(move || {
+            let _trace = context.as_ref().map(mergetool_trace::attach_capture);
+            task();
+        });
+        let already_queued = slot
+            .0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(task)
+            .is_some();
+        if !already_queued {
+            let queued = slot.clone();
+            let sent = self.try_spawn_untraced(move || {
+                let task = queued.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(task) = task {
+                    task();
+                }
+            });
+            // No queue entry owns the slot, so later requests must not wait on one.
+            if !sent {
+                slot.0.lock().unwrap_or_else(|e| e.into_inner()).take();
+            }
+        }
+        already_queued
+    }
+
+    #[cfg(test)]
     pub(super) fn new(threads: usize) -> Self {
+        Self::named("gitcomet-store-worker", threads)
+    }
+
+    #[cfg_attr(feature = "test-support", allow(dead_code))]
+    pub(super) fn named(name: &'static str, threads: usize) -> Self {
         let (tx, rx) = mpsc::channel::<Task>();
         let rx = Arc::new(std::sync::Mutex::new(rx));
 
+        // Named so profilers and per-thread CPU samples can attribute work.
         let mut worker_threads = Vec::with_capacity(threads);
-        for _ in 0..threads {
+        for ix in 0..threads {
             let rx = Arc::clone(&rx);
-            worker_threads.push(thread::spawn(move || worker_loop(rx)));
+            worker_threads.push(
+                thread::Builder::new()
+                    .name(format!("{name}-{ix}"))
+                    .spawn(move || worker_loop(rx))
+                    .expect("spawn store executor thread"),
+            );
         }
 
         Self {
             tx,
+            name,
             _threads: worker_threads,
         }
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub(super) fn shared_for_store(pool: StoreExecutorPool, threads: usize) -> Self {
         fn sender_for(
             cell: &'static OnceLock<mpsc::Sender<Task>>,
@@ -128,34 +209,60 @@ impl TaskExecutor {
         }
 
         static PRIMARY: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
-        static REPO_LOAD: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
+        static SIGNATURES: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
         static METADATA: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
         static SESSION_PERSIST: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
+        static MAINTENANCE: OnceLock<mpsc::Sender<Task>> = OnceLock::new();
 
-        let tx = match pool {
-            StoreExecutorPool::Primary => {
-                sender_for(&PRIMARY, "gitcomet-test-store-primary", threads)
+        let (cell, name) = match pool {
+            StoreExecutorPool::Primary => (&PRIMARY, "gitcomet-store-primary"),
+            StoreExecutorPool::Signatures => (&SIGNATURES, "gitcomet-store-signatures"),
+            StoreExecutorPool::Metadata => (&METADATA, "gitcomet-store-metadata"),
+            StoreExecutorPool::SessionPersist => {
+                (&SESSION_PERSIST, "gitcomet-store-session-persist")
             }
-            StoreExecutorPool::RepoLoad => {
-                sender_for(&REPO_LOAD, "gitcomet-test-store-repo-load", threads)
-            }
-            StoreExecutorPool::Metadata => {
-                sender_for(&METADATA, "gitcomet-test-store-metadata", threads)
-            }
-            StoreExecutorPool::SessionPersist => sender_for(
-                &SESSION_PERSIST,
-                "gitcomet-test-store-session-persist",
-                threads,
-            ),
+            StoreExecutorPool::Maintenance => (&MAINTENANCE, "gitcomet-store-maintenance"),
         };
 
         Self {
-            tx,
+            tx: sender_for(cell, name, threads),
+            name,
             _threads: Vec::new(),
         }
     }
 
+    /// Closes the queue and waits for the workers, so a test process never
+    /// exits with store workers still running.
+    #[cfg(test)]
+    pub(super) fn join(mut self) {
+        self.join_workers();
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) fn join_workers(&mut self) {
+        // Only private pools own handles. Never close a shared pool's sender.
+        if self._threads.is_empty() {
+            return;
+        }
+        let (disconnected, _) = mpsc::channel();
+        drop(std::mem::replace(&mut self.tx, disconnected));
+        for thread in self._threads.drain(..) {
+            thread.join().expect("store executor worker panicked");
+        }
+    }
+
     pub(super) fn spawn(&self, task: impl FnOnce() + Send + 'static) {
+        self.try_spawn(task);
+    }
+
+    /// `false` when the worker queue is disconnected (the failure is recorded).
+    fn try_spawn(&self, task: impl FnOnce() + Send + 'static) -> bool {
+        self.try_spawn_untraced(op_trace::wrap_task(self.name, task))
+    }
+
+    fn try_spawn_untraced(&self, task: impl FnOnce() + Send + 'static) -> bool {
+        #[cfg(any(test, feature = "test-support"))]
+        let task = super::test_support::track_task(task);
         let mergetool_trace_context = mergetool_trace::current_capture_context();
         send_or_log(
             &self.tx,
@@ -167,7 +274,7 @@ impl TaskExecutor {
             }),
             SendFailureKind::ExecutorQueue,
             "TaskExecutor::spawn",
-        );
+        )
     }
 }
 
@@ -175,6 +282,65 @@ impl TaskExecutor {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    #[ignore = "manual find worker startup measurement"]
+    fn history_find_worker_startup_measurement() {
+        let start = std::time::Instant::now();
+        let workers: Vec<_> = (0..32)
+            .map(|_| {
+                std::sync::LazyLock::new(|| {
+                    TaskExecutor::named(crate::history_find::HISTORY_FIND_THREAD, 1)
+                })
+            })
+            .collect();
+        eprintln!(
+            "32 find executors: {:?}, started threads={}",
+            start.elapsed(),
+            workers
+                .iter()
+                .filter_map(std::sync::LazyLock::get)
+                .map(|worker| worker._threads.len())
+                .sum::<usize>()
+        );
+    }
+
+    #[test]
+    fn latest_slot_replaces_pending_work_without_blocking_other_slots() {
+        let executor = TaskExecutor::new(1);
+        let (release_tx, release_rx) = mpsc::channel();
+        executor.spawn(move || {
+            release_rx.recv().unwrap();
+        });
+        let slot = LatestTaskSlot::default();
+        let (done_tx, done_rx) = mpsc::channel();
+        for value in 0..100 {
+            let tx = done_tx.clone();
+            executor.spawn_latest(&slot, move || {
+                tx.send(value).unwrap();
+            });
+        }
+        let other = LatestTaskSlot::default();
+        executor.spawn_latest(&other, move || {
+            done_tx.send(100).unwrap();
+        });
+        release_tx.send(()).unwrap();
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 99);
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap(), 100);
+        assert!(done_rx.recv_timeout(Duration::from_secs(5)).is_err());
+    }
+
+    #[test]
+    fn latest_slot_is_released_when_the_queue_is_disconnected() {
+        // No workers: the shared receiver is dropped, so every send fails.
+        let executor = TaskExecutor::new(0);
+        let slot = LatestTaskSlot::default();
+        executor.spawn_latest(&slot, || {});
+        assert!(
+            slot.0.lock().unwrap().is_none(),
+            "a failed enqueue must not leave the slot claiming a queued entry"
+        );
+    }
 
     #[test]
     fn worker_keeps_serving_tasks_after_one_panics() {

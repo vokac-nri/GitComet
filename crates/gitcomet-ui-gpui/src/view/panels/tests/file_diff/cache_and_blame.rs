@@ -4,7 +4,7 @@ use super::*;
 fn file_diff_cache_does_not_rebuild_when_rev_changes_with_identical_payload(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -469,7 +469,7 @@ fn file_diff_cache_rebuilds_when_patch_arrives_after_same_file_refresh(
         );
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -480,10 +480,7 @@ fn file_diff_cache_rebuilds_when_patch_arrives_after_same_file_refresh(
         std::process::id()
     ));
     let path = std::path::PathBuf::from("src/refresh_highlights.rs");
-    let target = DiffTarget::WorkingTree {
-        path: path.clone(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = DiffTarget::working_tree(path.clone(), gitcomet_core::domain::DiffArea::Unstaged);
     let old_text = "fn main() {\n    let value = 1;\n    let stable = 10;\n}\n";
     let new_text = "fn main() {\n    let value = 2;\n    let stable = 10;\n    let added = value + stable;\n}\n";
     let unified = "\
@@ -599,7 +596,7 @@ index 1111111..2222222 100644
 fn file_image_diff_cache_does_not_rebuild_when_rev_changes_with_identical_payload(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -666,7 +663,7 @@ fn file_image_diff_cache_does_not_rebuild_when_rev_changes_with_identical_payloa
 
 #[gpui::test]
 fn replacing_file_image_diff_cache_releases_old_sprite_atlas_tiles(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -744,7 +741,7 @@ fn replacing_file_image_diff_cache_releases_old_sprite_atlas_tiles(cx: &mut gpui
 fn file_image_diff_cache_keeps_valid_svg_on_render_fast_path_across_rev_refreshes(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -825,7 +822,7 @@ fn file_image_diff_cache_keeps_valid_svg_on_render_fast_path_across_rev_refreshe
 fn file_image_diff_cache_keeps_distinct_valid_svg_sides_on_render_fast_path(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -882,7 +879,7 @@ fn file_image_diff_cache_keeps_distinct_valid_svg_sides_on_render_fast_path(
 fn file_image_diff_cache_falls_back_to_cached_svg_paths_for_invalid_svg_payloads(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -935,7 +932,7 @@ fn file_image_diff_cache_falls_back_to_cached_svg_paths_for_invalid_svg_payloads
 fn failed_raster_image_diff_cache_is_terminal_instead_of_processing_forever(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -976,7 +973,7 @@ fn failed_raster_image_diff_cache_is_terminal_instead_of_processing_forever(
 /// either diff mode, and the Image/Code toggle has to stay reachable.
 #[gpui::test]
 fn untracked_svg_keeps_the_code_view_and_toggle_in_collapsed_mode(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -990,10 +987,10 @@ fn untracked_svg_keeps_the_code_view_and_toggle_in_collapsed_mode(cx: &mut gpui:
     let path = PathBuf::from("assets/diagram.svg");
     let source = String::from_utf8(image_diff_svg_fixture(64, 64, "#22cc66"))
         .expect("svg fixture should be utf-8");
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: path.clone(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(
+        path.clone(),
+        gitcomet_core::domain::DiffArea::Unstaged,
+    );
 
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
@@ -1056,7 +1053,7 @@ fn untracked_svg_keeps_the_code_view_and_toggle_in_collapsed_mode(cx: &mut gpui:
 fn file_diff_view_renders_split_and_inline_syntax_from_real_documents(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1259,7 +1256,7 @@ fn file_diff_view_renders_split_and_inline_syntax_from_real_documents(
 fn html_file_diff_renders_injected_attribute_syntax_from_real_documents(
     cx: &mut gpui::TestAppContext,
 ) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -1468,7 +1465,7 @@ fn html_file_diff_renders_injected_attribute_syntax_from_real_documents(
 
 #[gpui::test]
 fn xml_file_diff_renders_syntax_highlights_from_real_documents(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2093,7 +2090,7 @@ fn yaml_file_diff_keeps_consistent_highlighting_for_added_paths_and_keys(
         }
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2104,12 +2101,8 @@ fn yaml_file_diff_keeps_consistent_highlighting_for_added_paths_and_keys(
         std::process::id()
     ));
     let path = std::path::PathBuf::from(".github/workflows/deployment-ci.yml");
-    let repo_root = fixture_repo_root();
-    let git_show = |spec: &str| fixture_git_show(&repo_root, spec, "YAML diff regression fixture");
-    let old_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/deployment-ci.yml");
-    let new_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/deployment-ci.yml");
+    let old_text = DEPLOYMENT_CI.old_text.to_owned();
+    let new_text = DEPLOYMENT_CI.new_text.to_owned();
 
     let baseline_path_line = 17u32;
     let affected_path_lines = [18u32, 22, 24, 26, 27, 28, 29, 30, 31, 32, 33];
@@ -2703,12 +2696,6 @@ fn yaml_file_diff_fallback_matches_prepared_document_for_deployment_ci(
     use gitcomet_core::file_diff::FileDiffRowKind;
     use std::collections::BTreeMap;
 
-    #[derive(Clone, Debug, PartialEq)]
-    struct LineSyntaxSnapshot {
-        text: String,
-        syntax: Vec<(std::ops::Range<usize>, Option<gpui::Hsla>)>,
-    }
-
     fn split_right_cached_styled_by_new_line(
         pane: &MainPaneView,
         new_line: u32,
@@ -2794,86 +2781,6 @@ fn yaml_file_diff_fallback_matches_prepared_document_for_deployment_ci(
         }
     }
 
-    fn one_based_line_byte_range(
-        text: &str,
-        line_starts: &[usize],
-        line_no: u32,
-    ) -> Option<std::ops::Range<usize>> {
-        let line_ix = usize::try_from(line_no).ok()?.checked_sub(1)?;
-        let start = (*line_starts.get(line_ix)?).min(text.len());
-        let mut end = line_starts
-            .get(line_ix.saturating_add(1))
-            .copied()
-            .unwrap_or(text.len())
-            .min(text.len());
-        if end > start && text.as_bytes().get(end.saturating_sub(1)) == Some(&b'\n') {
-            end = end.saturating_sub(1);
-        }
-        Some(start..end)
-    }
-
-    fn shared_text_and_line_starts(text: &str) -> (gpui::SharedString, Arc<[usize]>) {
-        let mut line_starts = Vec::with_capacity(text.len().saturating_div(64).saturating_add(1));
-        line_starts.push(0usize);
-        for (ix, byte) in text.as_bytes().iter().enumerate() {
-            if *byte == b'\n' {
-                line_starts.push(ix.saturating_add(1));
-            }
-        }
-        (text.to_string().into(), Arc::from(line_starts))
-    }
-
-    fn prepared_document_snapshot_for_line(
-        theme: AppTheme,
-        text: &str,
-        line_starts: &[usize],
-        document: rows::PreparedDiffSyntaxDocument,
-        language: rows::DiffSyntaxLanguage,
-        line_no: u32,
-    ) -> Option<LineSyntaxSnapshot> {
-        let byte_range = one_based_line_byte_range(text, line_starts, line_no)?;
-        let line_text = text.get(byte_range.clone())?.to_string();
-        let started = std::time::Instant::now();
-
-        loop {
-            let highlights = rows::request_syntax_highlights_for_prepared_document_byte_range(
-                theme,
-                text,
-                line_starts,
-                document,
-                language,
-                byte_range.clone(),
-            )?;
-
-            if !highlights.pending {
-                return Some(LineSyntaxSnapshot {
-                    text: line_text.clone(),
-                    syntax: highlights
-                        .highlights
-                        .into_iter()
-                        .filter(|(_, style)| style.background_color.is_none())
-                        .map(|(range, style)| {
-                            (
-                                range.start.saturating_sub(byte_range.start)
-                                    ..range.end.saturating_sub(byte_range.start),
-                                style.color,
-                            )
-                        })
-                        .collect(),
-                });
-            }
-
-            let completed =
-                rows::drain_completed_prepared_diff_syntax_chunk_builds_for_document(document);
-            if completed == 0 && started.elapsed() >= std::time::Duration::from_secs(2) {
-                return None;
-            }
-            if completed == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-    }
-
     fn cached_snapshot(line: (&str, &super::CachedDiffStyledText)) -> LineSyntaxSnapshot {
         let (text, styled) = line;
         LineSyntaxSnapshot {
@@ -2932,7 +2839,7 @@ fn yaml_file_diff_fallback_matches_prepared_document_for_deployment_ci(
         })
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -2944,13 +2851,8 @@ fn yaml_file_diff_fallback_matches_prepared_document_for_deployment_ci(
         std::process::id()
     ));
     let path = std::path::PathBuf::from(".github/workflows/deployment-ci.yml");
-    let repo_root = fixture_repo_root();
-    let git_show =
-        |spec: &str| fixture_git_show(&repo_root, spec, "YAML fallback prepared baseline fixture");
-    let old_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/deployment-ci.yml");
-    let new_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/deployment-ci.yml");
+    let old_text = DEPLOYMENT_CI.old_text.to_owned();
+    let new_text = DEPLOYMENT_CI.new_text.to_owned();
     let (old_shared_text, old_line_starts) = shared_text_and_line_starts(old_text.as_str());
     let (new_shared_text, new_line_starts) = shared_text_and_line_starts(new_text.as_str());
     let old_document = match rows::prepare_diff_syntax_document_with_budget_reuse_text(
@@ -3464,7 +3366,7 @@ fn yaml_file_diff_keeps_consistent_highlighting_for_build_release_artifacts(
             .collect()
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -3476,20 +3378,8 @@ fn yaml_file_diff_keeps_consistent_highlighting_for_build_release_artifacts(
         std::process::id()
     ));
     let path = std::path::PathBuf::from(".github/workflows/build-release-artifacts.yml");
-    let repo_root = fixture_repo_root();
-    let git_show = |spec: &str| {
-        fixture_git_show(
-            &repo_root,
-            spec,
-            "build-release YAML file-diff regression fixture",
-        )
-    };
-    let old_text = git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/build-release-artifacts.yml",
-    );
-    let new_text = git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/build-release-artifacts.yml",
-    );
+    let old_text = BUILD_RELEASE_ARTIFACTS.old_text.to_owned();
+    let new_text = BUILD_RELEASE_ARTIFACTS.new_text.to_owned();
 
     let baseline_secret_key_line = 20u32;
     let affected_secret_key_lines = [22u32, 24, 26, 28, 30, 32];
@@ -3749,12 +3639,6 @@ fn yaml_file_diff_matches_prepared_document_for_build_release_artifacts(
     use gitcomet_core::file_diff::FileDiffRowKind;
     use std::collections::BTreeMap;
 
-    #[derive(Clone, Debug, PartialEq)]
-    struct LineSyntaxSnapshot {
-        text: String,
-        syntax: Vec<(std::ops::Range<usize>, Option<gpui::Hsla>)>,
-    }
-
     fn split_right_cached_styled_by_new_line(
         pane: &MainPaneView,
         new_line: u32,
@@ -3864,86 +3748,6 @@ fn yaml_file_diff_matches_prepared_document_for_build_release_artifacts(
         }
     }
 
-    fn one_based_line_byte_range(
-        text: &str,
-        line_starts: &[usize],
-        line_no: u32,
-    ) -> Option<std::ops::Range<usize>> {
-        let line_ix = usize::try_from(line_no).ok()?.checked_sub(1)?;
-        let start = (*line_starts.get(line_ix)?).min(text.len());
-        let mut end = line_starts
-            .get(line_ix.saturating_add(1))
-            .copied()
-            .unwrap_or(text.len())
-            .min(text.len());
-        if end > start && text.as_bytes().get(end.saturating_sub(1)) == Some(&b'\n') {
-            end = end.saturating_sub(1);
-        }
-        Some(start..end)
-    }
-
-    fn shared_text_and_line_starts(text: &str) -> (gpui::SharedString, Arc<[usize]>) {
-        let mut line_starts = Vec::with_capacity(text.len().saturating_div(64).saturating_add(1));
-        line_starts.push(0usize);
-        for (ix, byte) in text.as_bytes().iter().enumerate() {
-            if *byte == b'\n' {
-                line_starts.push(ix.saturating_add(1));
-            }
-        }
-        (text.to_string().into(), Arc::from(line_starts))
-    }
-
-    fn prepared_document_snapshot_for_line(
-        theme: AppTheme,
-        text: &str,
-        line_starts: &[usize],
-        document: rows::PreparedDiffSyntaxDocument,
-        language: rows::DiffSyntaxLanguage,
-        line_no: u32,
-    ) -> Option<LineSyntaxSnapshot> {
-        let byte_range = one_based_line_byte_range(text, line_starts, line_no)?;
-        let line_text = text.get(byte_range.clone())?.to_string();
-        let started = std::time::Instant::now();
-
-        loop {
-            let highlights = rows::request_syntax_highlights_for_prepared_document_byte_range(
-                theme,
-                text,
-                line_starts,
-                document,
-                language,
-                byte_range.clone(),
-            )?;
-
-            if !highlights.pending {
-                return Some(LineSyntaxSnapshot {
-                    text: line_text.clone(),
-                    syntax: highlights
-                        .highlights
-                        .into_iter()
-                        .filter(|(_, style)| style.background_color.is_none())
-                        .map(|(range, style)| {
-                            (
-                                range.start.saturating_sub(byte_range.start)
-                                    ..range.end.saturating_sub(byte_range.start),
-                                style.color,
-                            )
-                        })
-                        .collect(),
-                });
-            }
-
-            let completed =
-                rows::drain_completed_prepared_diff_syntax_chunk_builds_for_document(document);
-            if completed == 0 && started.elapsed() >= std::time::Duration::from_secs(2) {
-                return None;
-            }
-            if completed == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-        }
-    }
-
     fn cached_snapshot(line: (&str, &super::CachedDiffStyledText)) -> LineSyntaxSnapshot {
         let (text, styled) = line;
         LineSyntaxSnapshot {
@@ -4002,7 +3806,7 @@ fn yaml_file_diff_matches_prepared_document_for_build_release_artifacts(
         })
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -4014,15 +3818,8 @@ fn yaml_file_diff_matches_prepared_document_for_build_release_artifacts(
         std::process::id()
     ));
     let path = std::path::PathBuf::from(".github/workflows/build-release-artifacts.yml");
-    let repo_root = fixture_repo_root();
-    let git_show =
-        |spec: &str| fixture_git_show(&repo_root, spec, "build-release prepared-baseline fixture");
-    let old_text = git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/build-release-artifacts.yml",
-    );
-    let new_text = git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/build-release-artifacts.yml",
-    );
+    let old_text = BUILD_RELEASE_ARTIFACTS.old_text.to_owned();
+    let new_text = BUILD_RELEASE_ARTIFACTS.new_text.to_owned();
     let (old_shared_text, old_line_starts) = shared_text_and_line_starts(old_text.as_str());
     let (new_shared_text, new_line_starts) = shared_text_and_line_starts(new_text.as_str());
     let old_document = match rows::prepare_diff_syntax_document_with_budget_reuse_text(
@@ -4374,231 +4171,11 @@ fn yaml_file_diff_matches_prepared_document_for_build_release_artifacts(
     }
 }
 
-#[gpui::test]
-fn yaml_commit_file_diff_transition_from_patch_clears_stale_split_cache(
-    cx: &mut gpui::TestAppContext,
-) {
-    use gitcomet_core::domain::DiffTarget;
-
-    fn split_right_cached_styled_by_new_line(
-        pane: &MainPaneView,
-        new_line: u32,
-    ) -> Option<(&str, &super::CachedDiffStyledText)> {
-        let row_ix = pane
-            .file_diff_cache_rows
-            .iter()
-            .position(|row| row.new_line == Some(new_line))?;
-        let text = pane.file_diff_cache_rows.get(row_ix)?.new.as_deref()?;
-        let key = pane.file_diff_split_cache_key(row_ix, DiffTextRegion::SplitRight)?;
-        let epoch = pane.file_diff_split_style_cache_epoch(DiffTextRegion::SplitRight);
-        let styled = pane.diff_text_segments_cache_get(key, epoch)?;
-        Some((text, styled))
-    }
-
-    fn highlight_snapshot(
-        highlights: &[(std::ops::Range<usize>, gpui::HighlightStyle)],
-    ) -> Vec<(
-        std::ops::Range<usize>,
-        Option<gpui::Hsla>,
-        Option<gpui::Hsla>,
-    )> {
-        highlights
-            .iter()
-            .map(|(range, style)| (range.clone(), style.color, style.background_color))
-            .collect()
-    }
-
-    fn expected_yaml_snapshot(
-        theme: AppTheme,
-        text: &str,
-    ) -> Vec<(
-        std::ops::Range<usize>,
-        Option<gpui::Hsla>,
-        Option<gpui::Hsla>,
-    )> {
-        highlight_snapshot(
-            rows::syntax_highlights_for_line(
-                theme,
-                text,
-                rows::DiffSyntaxLanguage::Yaml,
-                rows::DiffSyntaxMode::Auto,
-            )
-            .as_slice(),
-        )
-    }
-
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
-    let (view, cx) = cx.add_window_view(|window, cx| {
-        super::super::GitCometView::new(store, events, None, window, cx)
-    });
-
-    let theme = cx.update(|_window, app| view.read(app).main_pane.read(app).theme);
-    let repo_id = gitcomet_state::model::RepoId(85);
-    let workdir = std::env::temp_dir().join(format!(
-        "gitcomet_ui_test_{}_yaml_commit_patch_to_file_transition",
-        std::process::id()
-    ));
-    let commit_id =
-        gitcomet_core::domain::CommitId("bd8b4a04b4d7a04caf97392d6a66cbeebd665606".into());
-    let patch_text =
-        std::fs::read_to_string(fixture_repo_root().join("test_data/commit-bd8b4a04.patch"))
-            .expect("read patch fixture");
-    let patch_target = DiffTarget::Commit {
-        commit_id: commit_id.clone(),
-        path: None,
-    };
-    let patch_diff = gitcomet_core::domain::Diff::from_unified(patch_target.clone(), &patch_text);
-
-    cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            let mut repo = opening_repo_state(repo_id, &workdir);
-            repo.status = gitcomet_state::model::Loadable::Ready(
-                gitcomet_core::domain::RepoStatus::default().into(),
-            );
-            repo.diff_state.diff_target = Some(patch_target);
-            repo.diff_state.diff_rev = 1;
-            repo.diff_state.diff = gitcomet_state::model::Loadable::Ready(Arc::new(patch_diff));
-
-            push_test_state(this, app_state_with_repo(repo, repo_id), cx);
-        });
-    });
-
-    cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            this.main_pane.update(cx, |pane, cx| {
-                pane.diff_view = DiffViewMode::Split;
-                cx.notify();
-            });
-        });
-    });
-
-    wait_for_main_pane_condition(
-        cx,
-        &view,
-        "patch diff split cache seeded before switching to file diff",
-        |pane| {
-            !pane.is_file_diff_view_active()
-                && pane.patch_diff_split_row_len() > 0
-                && !pane.diff_text_segments_cache.is_empty()
-        },
-        |pane| {
-            format!(
-                "file_diff_active={} diff_view={:?} patch_rows={} split_rows={} text_cache_len={}",
-                pane.is_file_diff_view_active(),
-                pane.diff_view,
-                pane.patch_diff_row_len(),
-                pane.patch_diff_split_row_len(),
-                pane.diff_text_segments_cache.len(),
-            )
-        },
-    );
-
-    let repo_root = fixture_repo_root();
-    let path = std::path::PathBuf::from(".github/workflows/deployment-ci.yml");
-    let git_show =
-        |spec: &str| fixture_git_show(&repo_root, spec, "patch->file YAML transition fixture");
-    let old_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/deployment-ci.yml");
-    let new_text =
-        git_show("bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/deployment-ci.yml");
-    let unified = fixture_git_diff(
-        &repo_root,
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/deployment-ci.yml",
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/deployment-ci.yml",
-        "patch->file YAML transition fixture",
-    );
-    let file_target = DiffTarget::Commit {
-        commit_id,
-        path: Some(path.clone()),
-    };
-    let file_diff = gitcomet_core::domain::Diff::from_unified(file_target.clone(), &unified);
-
-    cx.update(|_window, app| {
-        view.update(app, |this, cx| {
-            let mut repo = opening_repo_state(repo_id, &workdir);
-            repo.status = gitcomet_state::model::Loadable::Ready(
-                gitcomet_core::domain::RepoStatus::default().into(),
-            );
-            repo.diff_state.diff_target = Some(file_target.clone());
-            repo.diff_state.diff_rev = 2;
-            repo.diff_state.diff = gitcomet_state::model::Loadable::Ready(Arc::new(file_diff));
-            repo.diff_state.diff_file_rev = 1;
-            repo.diff_state.diff_file = gitcomet_state::model::Loadable::Ready(Some(Arc::new(
-                gitcomet_core::domain::FileDiffText::new(
-                    path.clone(),
-                    Some(old_text.clone()),
-                    Some(new_text.clone()),
-                ),
-            )));
-
-            push_test_state(this, app_state_with_repo(repo, repo_id), cx);
-        });
-    });
-
-    wait_for_main_pane_condition(
-        cx,
-        &view,
-        "patch -> file diff transition yields fresh deployment-ci split highlights",
-        |pane| {
-            pane.is_file_diff_view_active()
-                && pane.file_diff_cache_inflight.is_none()
-                && pane.file_diff_cache_target == Some(file_target.clone())
-                && split_right_cached_styled_by_new_line(pane, 17).is_some()
-                && split_right_cached_styled_by_new_line(pane, 18).is_some()
-                && split_right_cached_styled_by_new_line(pane, 33).is_some()
-        },
-        |pane| {
-            format!(
-                "file_diff_active={} inflight={:?} cache_target={:?} active_target={:?} cache_len={} split17={:?} split18={:?} split33={:?}",
-                pane.is_file_diff_view_active(),
-                pane.file_diff_cache_inflight,
-                pane.file_diff_cache_target.clone(),
-                pane.active_repo()
-                    .and_then(|repo| repo.diff_state.diff_target.clone()),
-                pane.diff_text_segments_cache.len(),
-                split_right_cached_styled_by_new_line(pane, 17).map(|(text, styled)| (
-                    text.to_string(),
-                    highlight_snapshot(styled.highlights.as_ref())
-                )),
-                split_right_cached_styled_by_new_line(pane, 18).map(|(text, styled)| (
-                    text.to_string(),
-                    highlight_snapshot(styled.highlights.as_ref())
-                )),
-                split_right_cached_styled_by_new_line(pane, 33).map(|(text, styled)| (
-                    text.to_string(),
-                    highlight_snapshot(styled.highlights.as_ref())
-                )),
-            )
-        },
-    );
-
-    cx.update(|_window, app| {
-        let pane = view.read(app).main_pane.read(app);
-        for new_line in [17u32, 18, 22, 33] {
-            let Some((text, styled)) = split_right_cached_styled_by_new_line(pane, new_line) else {
-                panic!("expected cached split-right styled text for deployment-ci new line {new_line}");
-            };
-            let expected = expected_yaml_snapshot(theme, text);
-            let actual = highlight_snapshot(styled.highlights.as_ref());
-            assert_eq!(
-                actual, expected,
-                "patch->file transition should not reuse stale split-right styling for deployment-ci new line {new_line}: text={text:?}"
-            );
-        }
-    });
-}
-
 #[allow(dead_code)]
 fn yaml_same_content_rev_refresh_invalidates_cached_heuristic_file_diff_rows(
     cx: &mut gpui::TestAppContext,
 ) {
     use std::collections::BTreeMap;
-
-    #[derive(Clone, Debug, PartialEq)]
-    struct LineSyntaxSnapshot {
-        text: String,
-        syntax: Vec<(std::ops::Range<usize>, Option<gpui::Hsla>)>,
-    }
 
     fn split_right_cached_styled_by_new_line(
         pane: &MainPaneView,
@@ -4667,86 +4244,6 @@ fn yaml_same_content_rev_refresh_invalidates_cached_heuristic_file_diff_rows(
             cx.update(|window, app| {
                 let _ = window.draw(app);
             });
-        }
-    }
-
-    fn one_based_line_byte_range(
-        text: &str,
-        line_starts: &[usize],
-        line_no: u32,
-    ) -> Option<std::ops::Range<usize>> {
-        let line_ix = usize::try_from(line_no).ok()?.checked_sub(1)?;
-        let start = (*line_starts.get(line_ix)?).min(text.len());
-        let mut end = line_starts
-            .get(line_ix.saturating_add(1))
-            .copied()
-            .unwrap_or(text.len())
-            .min(text.len());
-        if end > start && text.as_bytes().get(end.saturating_sub(1)) == Some(&b'\n') {
-            end = end.saturating_sub(1);
-        }
-        Some(start..end)
-    }
-
-    fn shared_text_and_line_starts(text: &str) -> (gpui::SharedString, Arc<[usize]>) {
-        let mut line_starts = Vec::with_capacity(text.len().saturating_div(64).saturating_add(1));
-        line_starts.push(0usize);
-        for (ix, byte) in text.as_bytes().iter().enumerate() {
-            if *byte == b'\n' {
-                line_starts.push(ix.saturating_add(1));
-            }
-        }
-        (text.to_string().into(), Arc::from(line_starts))
-    }
-
-    fn prepared_document_snapshot_for_line(
-        theme: AppTheme,
-        text: &str,
-        line_starts: &[usize],
-        document: rows::PreparedDiffSyntaxDocument,
-        language: rows::DiffSyntaxLanguage,
-        line_no: u32,
-    ) -> Option<LineSyntaxSnapshot> {
-        let byte_range = one_based_line_byte_range(text, line_starts, line_no)?;
-        let line_text = text.get(byte_range.clone())?.to_string();
-        let started = std::time::Instant::now();
-
-        loop {
-            let highlights = rows::request_syntax_highlights_for_prepared_document_byte_range(
-                theme,
-                text,
-                line_starts,
-                document,
-                language,
-                byte_range.clone(),
-            )?;
-
-            if !highlights.pending {
-                return Some(LineSyntaxSnapshot {
-                    text: line_text.clone(),
-                    syntax: highlights
-                        .highlights
-                        .into_iter()
-                        .filter(|(_, style)| style.background_color.is_none())
-                        .map(|(range, style)| {
-                            (
-                                range.start.saturating_sub(byte_range.start)
-                                    ..range.end.saturating_sub(byte_range.start),
-                                style.color,
-                            )
-                        })
-                        .collect(),
-                });
-            }
-
-            let completed =
-                rows::drain_completed_prepared_diff_syntax_chunk_builds_for_document(document);
-            if completed == 0 && started.elapsed() >= std::time::Duration::from_secs(2) {
-                return None;
-            }
-            if completed == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
         }
     }
 
@@ -4849,7 +4346,7 @@ fn yaml_same_content_rev_refresh_invalidates_cached_heuristic_file_diff_rows(
             .collect()
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -4861,14 +4358,6 @@ fn yaml_same_content_rev_refresh_invalidates_cached_heuristic_file_diff_rows(
         std::process::id()
     ));
     let path = std::path::PathBuf::from(".github/workflows/build-release-artifacts.yml");
-    let repo_root = fixture_repo_root();
-    let git_show = |spec: &str| {
-        fixture_git_show(
-            &repo_root,
-            spec,
-            "same-content YAML refresh regression fixture",
-        )
-    };
     fn append_yaml_padding(text: &str) -> String {
         use std::fmt::Write as _;
 
@@ -4887,12 +4376,8 @@ fn yaml_same_content_rev_refresh_invalidates_cached_heuristic_file_diff_rows(
         out
     }
 
-    let old_text = append_yaml_padding(&git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606^:.github/workflows/build-release-artifacts.yml",
-    ));
-    let new_text = append_yaml_padding(&git_show(
-        "bd8b4a04b4d7a04caf97392d6a66cbeebd665606:.github/workflows/build-release-artifacts.yml",
-    ));
+    let old_text = append_yaml_padding(BUILD_RELEASE_ARTIFACTS.old_text);
+    let new_text = append_yaml_padding(BUILD_RELEASE_ARTIFACTS.new_text);
     let affected_lines = [173u32, 175, 176, 183, 190, 193, 206, 212, 218, 221];
     let (new_shared_text, new_line_starts) = shared_text_and_line_starts(new_text.as_str());
     let new_document = match rows::prepare_diff_syntax_document_with_budget_reuse_text(
@@ -5287,10 +4772,10 @@ fn push_unstaged_text_diff_for_blame_toggle(
         std::process::id()
     ));
     let path = PathBuf::from("src/lib.rs");
-    let target = gitcomet_core::domain::DiffTarget::WorkingTree {
-        path: path.clone(),
-        area: gitcomet_core::domain::DiffArea::Unstaged,
-    };
+    let target = gitcomet_core::domain::DiffTarget::working_tree(
+        path.clone(),
+        gitcomet_core::domain::DiffArea::Unstaged,
+    );
 
     cx.update(|_window, app| {
         view.update(app, |this, cx| {
@@ -5350,7 +4835,7 @@ fn click_blame_toggle(cx: &mut gpui::VisualTestContext) {
 /// survive the toggle in both directions.
 #[gpui::test]
 fn blame_toggle_keeps_split_view(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -5393,7 +4878,7 @@ fn blame_toggle_keeps_split_view(cx: &mut gpui::TestAppContext) {
 
 #[gpui::test]
 fn blame_toggle_keeps_inline_view(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -5422,7 +4907,7 @@ fn blame_toggle_keeps_inline_view(cx: &mut gpui::TestAppContext) {
 /// Inline unnecessary in the first place.
 #[gpui::test]
 fn split_annotate_reserves_the_annotation_column(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -5468,7 +4953,7 @@ fn split_annotate_reserves_the_annotation_column(cx: &mut gpui::TestAppContext) 
 /// against the same epochs, so a stale entry can paint the wrong row.
 #[gpui::test]
 fn toggle_diff_view_command_clears_styled_segment_caches(cx: &mut gpui::TestAppContext) {
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
@@ -5558,19 +5043,31 @@ fn assert_diff_search_scrolls_sideways(
         }
     }
 
-    let (store, events) = AppStore::new(Arc::new(TestBackend));
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
     let (view, cx) = cx.add_window_view(|window, cx| {
         super::super::GitCometView::new(store, events, None, window, cx)
     });
 
-    cx.simulate_resize(gpui::size(px(900.0), px(420.0)));
-    push_raw_patch_diff_state_with_rev(cx, &view, repo_id, fixture_name, unified, 1, true);
+    cx.simulate_resize(gpui::size(px(900.0), px(560.0)));
+    push_file_patch_diff_state_with_rev(cx, &view, repo_id, fixture_name, unified, 1);
     wait_for_main_pane_condition(
         cx,
         &view,
-        "wide patch diff ready for horizontal search reveal",
-        |pane| pane.diff_cache_rev == 1 && pane.patch_diff_row_len() > 0,
-        |pane| (pane.diff_cache_rev, pane.patch_diff_row_len()),
+        "wide file diff ready for horizontal search reveal",
+        |pane| {
+            pane.file_diff_cache_rev == 1
+                && pane.diff_visible_len() > 0
+                && pane.diff_scroll.0.borrow().base_handle.max_offset().x > px(0.0)
+        },
+        |pane| {
+            (
+                pane.file_diff_cache_rev,
+                pane.diff_visible_len(),
+                pane.diff_view,
+                pane.diff_word_wrap,
+                pane.diff_scroll.0.borrow().base_handle.max_offset(),
+            )
+        },
     );
 
     cx.update(|_window, app| {
@@ -5579,6 +5076,9 @@ fn assert_diff_search_scrolls_sideways(
             pane.diff_view = DiffViewMode::Inline;
             pane.diff_search_active = true;
             pane.diff_search_query = "needle tail".into();
+            pane.diff_search_input.update(cx, |input, cx| {
+                input.set_text("needle tail", cx);
+            });
             pane.diff_search_recompute_matches_and_scroll_to_first();
             cx.notify();
         });
@@ -5619,9 +5119,103 @@ fn assert_diff_search_scrolls_sideways(
 
 #[gpui::test]
 fn diff_search_scrolls_sideways_to_a_match_far_along_a_long_line(cx: &mut gpui::TestAppContext) {
+    // Measures Compact layout; a fresh session now defaults to Comfortable.
+    cx.update(crate::appearance::pin_compact_for_test);
     assert_diff_search_scrolls_sideways(
         cx,
         gitcomet_state::model::RepoId(9141),
         "search_horizontal_reveal",
     );
+}
+
+#[gpui::test]
+fn review_split_search_retries_when_one_column_has_stale_scroll_geometry(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (store, events) = AppStore::new_test(Arc::new(TestBackend));
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        super::super::GitCometView::new(store, events, None, window, cx)
+    });
+    let patch = "diff --git a/wide.txt b/wide.txt\n--- a/wide.txt\n+++ b/wide.txt\n@@ -1 +1 @@\n-old\n+new\n".to_string();
+    push_file_patch_diff_state_with_rev(
+        cx,
+        &view,
+        gitcomet_state::model::RepoId(9142),
+        "split_search_retry",
+        patch,
+        1,
+    );
+    wait_for_main_pane_condition(
+        cx,
+        &view,
+        "split diff ready",
+        |pane| pane.file_diff_cache_rev == 1 && pane.diff_visible_len() > 0,
+        |pane| (pane.file_diff_cache_rev, pane.diff_visible_len()),
+    );
+    cx.update(|_, app| {
+        view.read(app).main_pane.clone().update(app, |pane, cx| {
+            pane.diff_view = DiffViewMode::Split;
+            cx.notify();
+        })
+    });
+    draw_and_drain_test_window(cx);
+    fn assert_pending_reveal(pane: &mut crate::view::panes::MainPaneView, window: &mut Window) {
+        let ix = pane
+            .diff_text_hitboxes
+            .keys()
+            .find_map(|(ix, region)| {
+                (*region == DiffTextRegion::SplitRight
+                    && pane
+                        .diff_text_hitboxes
+                        .contains_key(&(*ix, DiffTextRegion::SplitLeft)))
+                .then_some(*ix)
+            })
+            .expect("a row painted in both columns");
+        for stale_region in [DiffTextRegion::SplitLeft, DiffTextRegion::SplitRight] {
+            for region in [DiffTextRegion::SplitLeft, DiffTextRegion::SplitRight] {
+                let hitbox = pane.diff_text_hitboxes.get_mut(&(ix, region)).unwrap();
+                hitbox.painted_text = if region == stale_region {
+                    format!("{}needle", "x".repeat(10_000)).into()
+                } else {
+                    "no match".into()
+                };
+                hitbox.streamed_ascii_monospace_cell_width = Some(px(8.0));
+            }
+            pane.diff_search_query = "needle".into();
+            pane.diff_search_horizontal_reveal = Some((ix, 3));
+            pane.apply_pending_diff_search_horizontal_reveal(window);
+            assert_eq!(
+                pane.diff_search_horizontal_reveal,
+                Some((ix, 2)),
+                "the settled opposite column dropped {stale_region:?}'s pending reveal"
+            );
+        }
+    }
+
+    // Run the reveal during layout, as production does: retrying schedules a
+    // frame for the current rendered view.
+    struct RevealProbe {
+        pane: Entity<crate::view::panes::MainPaneView>,
+    }
+    impl gpui::Render for RevealProbe {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            let pane = self.pane.clone();
+            gpui::canvas(
+                move |_, window, app| {
+                    pane.update(app, |pane, _| {
+                        assert_pending_reveal(pane, window);
+                    });
+                },
+                |_, _, _, _| {},
+            )
+            .size_full()
+        }
+    }
+    cx.update(|window, app| {
+        let pane = view.read(app).main_pane.clone();
+        window.replace_root(app, |_, _| RevealProbe { pane });
+    });
+    cx.update(|window, app| {
+        let _ = window.draw(app);
+    });
 }

@@ -1,4 +1,5 @@
 use super::*;
+use gitcomet_core::domain::Upstream;
 use gitcomet_core::services::InteractiveRebaseAction;
 
 const COMMIT_DETAILS_MESSAGE_MAX_HEIGHT_PX: f32 = 240.0;
@@ -11,7 +12,14 @@ pub(in crate::view) enum AppMenuAction {
     /// variant here, whether it can run is carried by the menu item's own
     /// `disabled` flag rather than duplicated in the payload.
     LocateFileInExplorer,
+    /// Open the active repository's remote in the browser, or its picker.
+    OpenRemoteInBrowser,
     Settings,
+    OpenWorkspace,
+    /// Zoom this window; its footer zoom button offers the presets.
+    ZoomIn,
+    ZoomOut,
+    ResetZoom,
     OpenInCodeEditor {
         path: Option<std::path::PathBuf>,
     },
@@ -26,6 +34,10 @@ pub(in crate::view) enum AppMenuAction {
     InstallDesktopIntegration,
     Quit,
     CloseWindow,
+    /// An extension command, by contribution id.
+    ExtensionCommand {
+        id: SharedString,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -35,8 +47,48 @@ pub(in crate::view) enum AddRepoMenuAction {
     Initialize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub(in crate::view) enum HistoryMenuRef {
+    Branch(BranchMenuTarget),
+    Tag(String),
+}
+
 #[derive(Clone)]
 pub(in crate::view) enum ContextMenuAction {
+    Explorer {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        action: panes::ExplorerAction,
+    },
+    Hosted(gitcomet_extension_api::HostedAction),
+    /// An extension command for one repository tab.
+    RunExtensionCommand {
+        id: SharedString,
+        repo_id: RepoId,
+    },
+    /// Read the open file in this encoding; `None` goes back to attributes
+    /// and detection.
+    SetTextEncoding {
+        encoding: Option<gitcomet_core::text_format::TextEncoding>,
+    },
+    ConvertLineEndings {
+        ending: gitcomet_core::text_format::LineEnding,
+    },
+    /// Write the editor's buffer in another encoding on its next save.
+    SaveWithEncoding {
+        format: gitcomet_core::text_format::TextFormat,
+    },
+    /// Tab width for the open file; `None` goes back to its attributes or
+    /// Settings.
+    SetTabSize {
+        size: Option<u8>,
+    },
+    AddGitattributesRule {
+        rule: String,
+    },
+    ToggleHistoryRefGroup {
+        target: HistoryMenuRef,
+    },
     AppMenu(AppMenuAction),
     AddRepoMenu(AddRepoMenuAction),
     SelectDiff {
@@ -49,6 +101,19 @@ pub(in crate::view) enum ContextMenuAction {
     },
     OpenFile {
         repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
+    OpenWorktreeDiff {
+        repo_id: RepoId,
+        worktree_path: std::path::PathBuf,
+        target: DiffTarget,
+    },
+    OpenWorktreeFile {
+        worktree_path: std::path::PathBuf,
+        path: std::path::PathBuf,
+    },
+    OpenWorktreeFileLocation {
+        worktree_path: std::path::PathBuf,
         path: std::path::PathBuf,
     },
     OpenFileLocation {
@@ -88,14 +153,14 @@ pub(in crate::view) enum ContextMenuAction {
         path: std::path::PathBuf,
     },
     /// Flip one sidebar collapse key — the branch tree's counterpart to
-    /// clicking a group or section header.
+    /// clicking a group chevron or a rail section header.
     ToggleSidebarCollapseKey {
         collapse_key: SharedString,
     },
     /// Drive one sidebar collapse key to an explicit state.
     ///
     /// For rows whose rendered state can diverge from the stored key — a live
-    /// branch filter force-expands the pinned sections — where a flip would
+    /// branch filter force-expands groups — where a flip would
     /// move the key the opposite way from what the entry's label promised.
     SetSidebarCollapseKey {
         collapse_key: SharedString,
@@ -138,6 +203,21 @@ pub(in crate::view) enum ContextMenuAction {
         repo_id: RepoId,
         commit_id: CommitId,
     },
+    ShowFileChangesAtCommit {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        path: std::path::PathBuf,
+    },
+    OpenFileAtCommit {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        path: std::path::PathBuf,
+    },
+    OpenFileAtCommitParent {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        path: std::path::PathBuf,
+    },
     BrowseRepositoryAtCommit {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -157,6 +237,24 @@ pub(in crate::view) enum ContextMenuAction {
     CloseRepos {
         repo_ids: Vec<RepoId>,
         activate_after: Option<RepoId>,
+    },
+    MoveRepoToWorkspace {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+        target_workspace: Option<gitcomet_state::session::WorkspaceId>,
+    },
+    /// Open a workspace from its picker row: adopted into an empty window,
+    /// otherwise focused or opened in its own.
+    ActivateWorkspace {
+        workspace_id: gitcomet_state::session::WorkspaceId,
+    },
+    /// Forget the workspace; its window closes, or returns to Home if last.
+    DeleteWorkspace {
+        workspace_id: gitcomet_state::session::WorkspaceId,
+    },
+    /// Settings › Workspaces with this workspace selected.
+    OpenWorkspaceSettings {
+        workspace_id: gitcomet_state::session::WorkspaceId,
     },
     /// Keep a repository in the picker's Pinned section. Pins outlive both the
     /// recents cap and the repository being closed, so this is what keeps one
@@ -191,6 +289,11 @@ pub(in crate::view) enum ContextMenuAction {
         commit_id: CommitId,
         label: String,
     },
+    CompareWithMergeBase {
+        repo_id: RepoId,
+        commit_id: CommitId,
+        label: String,
+    },
     CompareWithWorkingTree {
         repo_id: RepoId,
         commit_id: CommitId,
@@ -211,6 +314,28 @@ pub(in crate::view) enum ContextMenuAction {
         repo_id: RepoId,
         commit_id: CommitId,
     },
+    /// Expands or collapses a file list folder; `recursive` takes every folder
+    /// below it along.
+    SetFileListFolderCollapsed {
+        repo_id: RepoId,
+        list: crate::view::rows::FileListId,
+        key: std::sync::Arc<std::path::Path>,
+        chain: std::sync::Arc<[std::sync::Arc<std::path::Path>]>,
+        collapsed: bool,
+        recursive: bool,
+    },
+    /// Stages (or, in the staged section, unstages) everything under a status
+    /// tree folder.
+    StageStatusFolder {
+        repo_id: RepoId,
+        section: StatusSection,
+        key: std::sync::Arc<std::path::Path>,
+    },
+    /// Opens the "Apply change" confirmation for files of a commit or comparison.
+    ApplyFileChange {
+        repo_id: RepoId,
+        target: gitcomet_core::domain::ApplyChangeTarget,
+    },
     /// Opens the squash confirmation prompt for the current multi-selection.
     SquashSelectedCommits {
         repo_id: RepoId,
@@ -229,12 +354,22 @@ pub(in crate::view) enum ContextMenuAction {
         section: BranchSection,
         name: String,
     },
+    ToggleBranchGroupPin {
+        repo_id: RepoId,
+        group_key: String,
+    },
     SetHistoryScope {
         repo_id: RepoId,
         scope: gitcomet_core::domain::LogScope,
     },
     SetCommitFileSort {
+        list: crate::view::rows::FileListId,
         sort: crate::view::rows::CommitFileSort,
+    },
+    SetFileListLayout {
+        repo_id: RepoId,
+        list: crate::view::rows::FileListId,
+        layout: crate::view::FileListLayout,
     },
     SetDiffContentMode {
         mode: DiffContentMode,
@@ -251,8 +386,17 @@ pub(in crate::view) enum ContextMenuAction {
     SetDiffShowLineNumbers {
         enabled: bool,
     },
+    SetExplorerVisibility {
+        repo_id: RepoId,
+        hidden: Option<bool>,
+        ignored: Option<bool>,
+    },
     SetChangeTrackingView {
         view: ChangeTrackingView,
+    },
+    /// This window's zoom; `None` follows the default UI scale.
+    SetUiScale {
+        percent: Option<u32>,
     },
     SetCommitAmendEnabled {
         enabled: bool,
@@ -262,9 +406,6 @@ pub(in crate::view) enum ContextMenuAction {
     },
     UseCommitMessage {
         message: String,
-    },
-    SetUiScale {
-        percent: u32,
     },
     StageSelectionOrPath {
         repo_id: RepoId,
@@ -281,6 +422,10 @@ pub(in crate::view) enum ContextMenuAction {
         area: DiffArea,
         path: std::path::PathBuf,
     },
+    AddExplorerToGitignore {
+        repo_id: RepoId,
+        path: std::path::PathBuf,
+    },
     AddToGitignoreSelectionOrPath {
         repo_id: RepoId,
         area: DiffArea,
@@ -295,6 +440,13 @@ pub(in crate::view) enum ContextMenuAction {
     LaunchMergetool {
         repo_id: RepoId,
         path: std::path::PathBuf,
+    },
+    RunLargeFileCommand {
+        repo_id: RepoId,
+        command: gitcomet_core::large_files::LargeFileCommand,
+    },
+    LoadLfsLocks {
+        repo_id: RepoId,
     },
     FetchAll {
         repo_id: RepoId,
@@ -345,13 +497,17 @@ pub(in crate::view) enum ContextMenuAction {
         index: usize,
         message: String,
     },
+    PushWithTags {
+        repo_id: RepoId,
+        mode: gitcomet_core::tag_push::TagPushMode,
+    },
     Push {
         repo_id: RepoId,
     },
     SetUpstreamBranch {
         repo_id: RepoId,
         branch: String,
-        upstream: String,
+        upstream: Upstream,
     },
     UnsetUpstreamBranch {
         repo_id: RepoId,
@@ -418,6 +574,11 @@ pub(in crate::view) enum ContextMenuAction {
     CopyLinkAddress {
         url: String,
     },
+    /// Approve one repository-controlled remote image in the current Markdown
+    /// preview. The pane re-checks that Ask mode is still active when invoked.
+    LoadRemoteMarkdownImage {
+        url: SharedString,
+    },
     OpenWebUrl {
         url: String,
     },
@@ -428,29 +589,23 @@ pub(in crate::view) enum ContextMenuAction {
         visible_ix: usize,
         region: DiffTextRegion,
     },
-    TerminalCopy {
+    TerminalCommand {
         repo_id: RepoId,
-    },
-    TerminalPaste {
-        repo_id: RepoId,
-    },
-    TerminalSelectAll {
-        repo_id: RepoId,
-    },
-    TerminalClear {
-        repo_id: RepoId,
+        session_seq: u64,
+        command: terminal_panel::TerminalCommand,
     },
     TerminalOpenExternal {
         repo_id: RepoId,
+        session_seq: u64,
     },
     ApplyIndexPatch {
         repo_id: RepoId,
-        patch: String,
+        patch: gitcomet_state::msg::ContentBytes,
         reverse: bool,
     },
     ApplyWorktreePatch {
         repo_id: RepoId,
-        patch: String,
+        patch: gitcomet_state::msg::ContentBytes,
         reverse: bool,
     },
     StageHunk {
@@ -525,6 +680,9 @@ struct ContextMenuModel {
     /// Stable debug selectors for menus whose entries predate the shared context-menu
     /// renderer. Sparse so ordinary menus continue deriving selectors from labels.
     entry_debug_selectors: FxHashMap<usize, SharedString>,
+    /// Item ranges painted as one tinted block: an inline submenu's header
+    /// plus the rows it expands to. Sparse and ordered.
+    groups: Vec<std::ops::Range<usize>>,
 }
 
 impl ContextMenuModel {
@@ -534,6 +692,7 @@ impl ContextMenuModel {
             shortcut_keycaps: false,
             entry_tooltips: FxHashMap::default(),
             entry_debug_selectors: FxHashMap::default(),
+            groups: Vec::new(),
         }
     }
 
@@ -598,18 +757,23 @@ impl ContextMenuModel {
 // HistoryColResizeDragGhost moved to view/mod.rs for accessibility from panes::HistoryView.
 
 mod action_bar;
+pub(in crate::view) mod bar_items;
 mod bars;
 mod bottom_status_bar;
 mod layout;
 mod main;
-mod popover;
+pub(in crate::view) mod popover;
 mod repo_tabs_bar;
 
-pub(super) use action_bar::{ActionBarView, action_bar_height};
-pub(super) use bottom_status_bar::BottomStatusBarView;
+#[cfg(test)]
+pub(in crate::view) use action_bar::action_bar_breakpoints;
+pub(super) use action_bar::{ActionBarView, action_bar_density, action_bar_height};
+pub(super) use bottom_status_bar::{BottomStatusBarView, bottom_status_bar_height};
 pub(super) use popover::{PopoverHost, PopoverHostInit};
 #[cfg(feature = "benchmarks")]
-pub(in crate::view) use popover::{benchmark_branch_checkout_rows, benchmark_workspace_rows};
+pub(in crate::view) use popover::{
+    benchmark_branch_checkout_rows, benchmark_file_history_rows, benchmark_workspace_rows,
+};
 /// Layout guards outside this module assert against the tab padding, so they
 /// follow the constant instead of hardcoding the current value.
 #[cfg(test)]

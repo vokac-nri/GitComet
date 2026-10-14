@@ -1,6 +1,6 @@
 use super::*;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
-use alacritty_terminal::event_loop::{EventLoop, Msg};
+use alacritty_terminal::event_loop::{EventLoop, EventLoopSendError, Msg};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::Point as AlacPoint;
 use alacritty_terminal::sync::FairMutex;
@@ -189,30 +189,48 @@ pub(super) struct SpawnedAlacTerminal {
 }
 
 #[derive(Clone)]
-pub(super) struct PtySender {
-    event_loop_tx: alacritty_terminal::event_loop::EventLoopSender,
+pub(super) enum PtySender {
+    EventLoop(alacritty_terminal::event_loop::EventLoopSender),
+    #[cfg(test)]
+    Recording(smol::channel::Sender<Msg>),
 }
 
 impl PtySender {
+    fn send(&self, msg: Msg) -> Result<(), EventLoopSendError> {
+        match self {
+            Self::EventLoop(sender) => sender.send(msg),
+            #[cfg(test)]
+            Self::Recording(sender) => {
+                sender.try_send(msg).ok();
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn recording() -> (Self, smol::channel::Receiver<Msg>) {
+        let (sender, receiver) = smol::channel::unbounded();
+        (Self::Recording(sender), receiver)
+    }
+
     pub fn write(&self, bytes: impl Into<Cow<'static, [u8]>>) {
-        if let Err(err) = self.event_loop_tx.send(Msg::Input(bytes.into())) {
+        if let Err(err) = self.send(Msg::Input(bytes.into())) {
             eprintln!("terminal: failed to write input to pty: {err}");
         }
     }
 
     pub fn resize(&self, columns: usize, screen_lines: usize) {
-        self.event_loop_tx
-            .send(Msg::Resize(alacritty_terminal::event::WindowSize {
-                num_lines: screen_lines as u16,
-                num_cols: columns as u16,
-                cell_width: 1,
-                cell_height: 1,
-            }))
-            .ok();
+        self.send(Msg::Resize(alacritty_terminal::event::WindowSize {
+            num_lines: screen_lines as u16,
+            num_cols: columns as u16,
+            cell_width: 1,
+            cell_height: 1,
+        }))
+        .ok();
     }
 
     pub fn shutdown(&self) {
-        self.event_loop_tx.send(Msg::Shutdown).ok();
+        self.send(Msg::Shutdown).ok();
     }
 }
 
@@ -226,10 +244,15 @@ pub(super) fn spawn_alacritty_terminal(
     let env: Vec<(String, String)> = vec![
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
-        ("TERM_PROGRAM".to_string(), "GitComet".to_string()),
+        (
+            "TERM_PROGRAM".to_string(),
+            gitcomet_core::identity::current()
+                .display_name()
+                .to_string(),
+        ),
         (
             "TERM_PROGRAM_VERSION".to_string(),
-            env!("CARGO_PKG_VERSION").to_string(),
+            gitcomet_core::identity::current().version().to_string(),
         ),
     ];
 
@@ -283,7 +306,7 @@ pub(super) fn spawn_alacritty_terminal(
     Ok(SpawnedAlacTerminal {
         term_lock,
         events_rx,
-        pty_sender: PtySender { event_loop_tx },
+        pty_sender: PtySender::EventLoop(event_loop_tx),
         child_pid,
     })
 }
@@ -331,6 +354,39 @@ pub(super) fn new_term(
     Arc::new(FairMutex::new(term))
 }
 
+/// Clear both grids without resetting terminal modes or sending input to the
+/// running process. In particular, leaving an alternate screen must not bring
+/// back the primary screen's old output or scrollback.
+pub(super) fn clear_terminal_screen_and_scrollback(term: &mut Term<GitCometListener>) {
+    let mut cursor = term.grid().cursor.clone();
+    let mut saved_cursor = term.grid().saved_cursor.clone();
+    cursor.point = AlacPoint::default();
+    cursor.input_needs_wrap = false;
+    saved_cursor.point = AlacPoint::default();
+    saved_cursor.input_needs_wrap = false;
+
+    term.grid_mut().reset();
+    // The inactive grid is private. Swapping twice restores the original
+    // screen and its keyboard mode stack, and marks the terminal fully damaged.
+    term.swap_alt();
+    let mut inactive_cursor = term.grid().cursor.clone();
+    let mut inactive_saved_cursor = term.grid().saved_cursor.clone();
+    inactive_cursor.point = AlacPoint::default();
+    inactive_cursor.input_needs_wrap = false;
+    inactive_saved_cursor.point = AlacPoint::default();
+    inactive_saved_cursor.input_needs_wrap = false;
+    term.grid_mut().reset();
+    term.grid_mut().cursor = inactive_cursor;
+    term.grid_mut().saved_cursor = inactive_saved_cursor;
+    term.swap_alt();
+
+    // Entering the alternate screen copies the primary cursor, so restore the
+    // active screen's rendition and character sets after the swaps.
+    term.grid_mut().cursor = cursor;
+    term.grid_mut().saved_cursor = saved_cursor;
+    term.vi_mode_cursor.point = AlacPoint::default();
+}
+
 fn pty_child_pid(pty: &tty::Pty) -> Option<u32> {
     #[cfg(not(windows))]
     {
@@ -351,6 +407,7 @@ pub(super) struct TerminalContent {
     pub cells: Vec<IndexedCell>,
     pub mode: TerminalModes,
     pub display_offset: usize,
+    pub history_size: usize,
     pub cursor: TerminalCursor,
     pub cursor_char: char,
     pub terminal_bounds: AlacTerminalBounds,
@@ -679,6 +736,7 @@ pub(super) fn make_terminal_content(term: &Term<GitCometListener>) -> TerminalCo
         cells,
         mode,
         display_offset: content.display_offset,
+        history_size: term.grid().history_size(),
         cursor: TerminalCursor {
             point: cursor_point,
             shape: terminal_cursor_shape(content.cursor.shape),
@@ -1564,11 +1622,16 @@ pub(super) struct TerminalImeState {
 // ---------------------------------------------------------------------------
 
 pub(super) struct TerminalTextInputHandler {
+    pub(super) focus_handle: gpui::FocusHandle,
     pub(super) pty_sender: Option<PtySender>,
     pub(super) ime_state: Option<TerminalImeState>,
 }
 
 impl gpui::InputHandler for TerminalTextInputHandler {
+    fn accepts_text_input(&mut self, window: &mut Window, _cx: &mut App) -> bool {
+        crate::window_focus::is_active(&self.focus_handle, window) && self.pty_sender.is_some()
+    }
+
     fn selected_text_range(
         &mut self,
         _ignore_disabled_input: bool,
@@ -1609,9 +1672,12 @@ impl gpui::InputHandler for TerminalTextInputHandler {
         &mut self,
         _replacement_range: Option<std::ops::Range<usize>>,
         text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
+        if !crate::window_focus::is_active(&self.focus_handle, window) {
+            return;
+        }
         if let Some(ref pty) = self.pty_sender {
             self.ime_state = None;
             pty.write(text.as_bytes().to_vec());
@@ -1623,9 +1689,12 @@ impl gpui::InputHandler for TerminalTextInputHandler {
         _range_utf16: Option<std::ops::Range<usize>>,
         new_text: &str,
         _new_selected_range: Option<std::ops::Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         _cx: &mut App,
     ) {
+        if !crate::window_focus::is_active(&self.focus_handle, window) {
+            return;
+        }
         self.ime_state = Some(TerminalImeState {
             marked_text: new_text.to_string(),
         });
@@ -1704,6 +1773,7 @@ mod tests {
             font_size: px(14.0).into(),
             font_style: FontStyle::Normal,
             font_weight: FontWeight::NORMAL,
+            font_width: Default::default(),
             line_height: px(20.0).into(),
             background_color: Some(gpui::Hsla::default()),
             white_space: WhiteSpace::Normal,
@@ -2312,10 +2382,7 @@ mod tests {
             mode,
         )
         .unwrap();
-        assert_eq!(
-            report,
-            vec![0x1b, b'[', b'M', 32 + 0, 32 + 1 + 0, 32 + 1 + 0]
-        );
+        assert_eq!(report, vec![0x1b, b'[', b'M', 32, (32 + 1), (32 + 1)]);
     }
 
     #[test]
@@ -2330,10 +2397,7 @@ mod tests {
             mode,
         )
         .unwrap();
-        assert_eq!(
-            report,
-            vec![0x1b, b'[', b'M', 32 + 3, 32 + 1 + 0, 32 + 1 + 0]
-        );
+        assert_eq!(report, vec![0x1b, b'[', b'M', 32 + 3, (32 + 1), (32 + 1)]);
     }
 
     #[test]
@@ -2353,6 +2417,7 @@ mod tests {
             cells: vec![],
             mode: TerminalModes::default(),
             display_offset: 0,
+            history_size: 0,
             cursor: TerminalCursor {
                 point: AlacPoint::new(Line(0), Column(0)),
                 shape: TerminalCursorShape::Beam,
@@ -2675,18 +2740,20 @@ mod tests {
     // IME InputHandler tests
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn ime_handler_marked_text_range_none_when_empty() {
+    #[gpui::test]
+    fn ime_handler_marked_text_range_none_when_empty(cx: &mut gpui::TestAppContext) {
         let handler = TerminalTextInputHandler {
+            focus_handle: cx.update(|app| app.focus_handle()),
             pty_sender: None,
             ime_state: None,
         };
         assert!(handler.ime_state.is_none());
     }
 
-    #[test]
-    fn ime_handler_replace_and_mark_stores_text() {
+    #[gpui::test]
+    fn ime_handler_replace_and_mark_stores_text(cx: &mut gpui::TestAppContext) {
         let mut handler = TerminalTextInputHandler {
+            focus_handle: cx.update(|app| app.focus_handle()),
             pty_sender: None,
             ime_state: None,
         };
@@ -2697,9 +2764,10 @@ mod tests {
         assert_eq!(handler.ime_state.as_ref().unwrap().marked_text, "test");
     }
 
-    #[test]
-    fn ime_handler_unmark_clears_state() {
+    #[gpui::test]
+    fn ime_handler_unmark_clears_state(cx: &mut gpui::TestAppContext) {
         let mut handler = TerminalTextInputHandler {
+            focus_handle: cx.update(|app| app.focus_handle()),
             pty_sender: None,
             ime_state: Some(TerminalImeState {
                 marked_text: "x".to_string(),
@@ -2709,9 +2777,10 @@ mod tests {
         assert!(handler.ime_state.is_none());
     }
 
-    #[test]
-    fn ime_handler_apple_press_and_hold_disabled() {
+    #[gpui::test]
+    fn ime_handler_apple_press_and_hold_disabled(cx: &mut gpui::TestAppContext) {
         let mut handler = TerminalTextInputHandler {
+            focus_handle: cx.update(|app| app.focus_handle()),
             pty_sender: None,
             ime_state: None,
         };

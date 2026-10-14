@@ -22,7 +22,17 @@ impl SettingsWindowView {
             repo_sidebar_collapsed_items: None,
             repo_sidebar_pinned_branches: None,
             theme_mode: Some(self.theme_mode.key().to_string()),
-            ui_scale_percent: Some(self.ui_scale_percent),
+            ui_scale_percent: Some(self.default_ui_scale_percent),
+            window_controls_mode: Some(self.window_controls_mode.key().to_string()),
+            // Renderer changes are persisted separately; ordinary preferences must not overwrite a fallback.
+            windows_renderer: None,
+            browser_open_target: Some(self.browser_open_target.key().to_string()),
+            ui_density: Some(self.appearance_metrics.density.key().to_string()),
+            ui_font_size_px: Some(self.appearance_metrics.ui_font_size_px),
+            editor_font_size_px: Some(self.appearance_metrics.editor_font_size_px),
+            markdown_preview_font_size_px: Some(
+                self.appearance_metrics.markdown_preview_font_size_px,
+            ),
             ui_font_family: Some(self.ui_font_family.clone()),
             editor_font_family: Some(self.editor_font_family.clone()),
             use_font_ligatures: Some(self.use_font_ligatures),
@@ -30,6 +40,8 @@ impl SettingsWindowView {
             timezone: Some(self.timezone.key()),
             show_timezone: Some(self.show_timezone),
             change_tracking_view: Some(self.change_tracking_view.key().to_string()),
+            file_list_layout: Some(self.file_list_layout.key().to_string()),
+            file_list_sort: Some(self.file_list_sort.key().to_string()),
             diff_scroll_sync: Some(self.diff_scroll_sync.key().to_string()),
             diff_content_mode: Some(self.diff_content_mode.key().to_string()),
             diff_whitespace_mode: Some(self.diff_whitespace_mode.key().to_string()),
@@ -39,9 +51,16 @@ impl SettingsWindowView {
             annotate_enabled: None,
             diff_reveal_whitespace_chars: Some(self.diff_reveal_whitespace_chars),
             diff_word_wrap: Some(self.diff_word_wrap),
+            diff_tab_size: Some(self.diff_tab_size),
             diff_show_line_numbers: Some(self.diff_show_line_numbers),
+            allowed_remote_protocols: Some(
+                self.remote_url_policy
+                    .allowed_protocols()
+                    .map(|protocol| protocol.key().to_string())
+                    .collect(),
+            ),
+            remote_markdown_image_policy: Some(self.remote_markdown_image_policy.key().to_string()),
             auto_save_file_edits: Some(self.auto_save_file_edits),
-            markdown_preview_load_remote_images: Some(self.markdown_preview_load_remote_images),
             // Merge tool settings are managed from the resolver's cog menu;
             // None never overwrites the stored values.
             mergetool_auto_advance: None,
@@ -51,16 +70,24 @@ impl SettingsWindowView {
             mergetool_view_three_way: None,
             change_tracking_height: None,
             untracked_height: None,
+            history_branch_names: Some(self.history_branch_names.key().to_string()),
             history_show_graph: Some(self.history_show_graph),
             history_show_author: Some(self.history_show_author),
             history_show_date: Some(self.history_show_date),
             history_show_sha: Some(self.history_show_sha),
             history_relative_dates: Some(self.history_relative_dates),
             history_highlight_commit_chain: Some(self.history_highlight_commit_chain),
+            file_browser_follow_selected_commit: Some(self.files_follow_selected_commit),
             history_show_tags: Some(self.history_show_tags),
+            history_verify_commit_signatures: Some(self.history_verify_commit_signatures),
             history_tag_fetch_mode: Some(self.history_tag_fetch_mode),
             default_history_mode: Some(self.default_history_mode),
             default_tag_type: Some(self.default_tag_type),
+            fetch_prune_deleted_remote_branches: Some(self.prune_deleted_remote_branches_on_fetch),
+            annex_hide_bookkeeping_refs: Some(self.large_file_settings.hide_annex_refs),
+            annex_pull_push_on_adjusted: Some(self.large_file_settings.annex_pull_push),
+            annex_sync_content: Some(self.large_file_settings.annex_sync_content),
+            recommend_repo_maintenance: Some(self.recommend_repo_maintenance),
             commit_push_after_enabled: None,
             git_executable_path: Some(applied_git_executable_path(&self.runtime_info.git.runtime)),
             terminal_external_mode: None,
@@ -134,17 +161,17 @@ impl SettingsWindowView {
         self.apply_terminal_preferences_change(next, cx);
     }
 
-    pub(super) fn set_action_bar_terminal_target(
+    pub(super) fn set_terminal_button_target(
         &mut self,
-        target: ActionBarTerminalTarget,
+        target: TerminalButtonTarget,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.terminal_preferences.action_bar_terminal_target == target {
+        if self.terminal_preferences.terminal_button_target == target {
             return;
         }
 
         let mut next = self.terminal_preferences.clone();
-        next.action_bar_terminal_target = target;
+        next.terminal_button_target = target;
         self.terminal_status = None;
         self.apply_terminal_preferences_change(next, cx);
     }
@@ -384,10 +411,14 @@ impl SettingsWindowView {
         let setting = self.external_editor_setting.clone();
         crate::external_editor::set_configured_setting_override(setting.clone());
         let persist_queue = external_editor_preference_persist_queue().clone();
-        let sequence = persist_queue.next_sequence();
+        let sequence = persist_queue.next();
         let setting_for_persist = setting.clone();
         cx.background_spawn(async move {
-            let _ = persist_queue.persist_if_latest(sequence, setting_for_persist);
+            let _ = persist_queue.persist(sequence, || {
+                session::persist_ui_settings(external_editor_preference_settings(
+                    setting_for_persist,
+                ))
+            });
         })
         .detach();
         cx.defer(move |cx| {
@@ -454,9 +485,13 @@ impl SettingsWindowView {
 
     pub(super) fn font_option_detail(&self, family: &str) -> Option<SharedString> {
         match family {
-            crate::font_preferences::UI_SYSTEM_FONT_FAMILY => {
-                Some("Use GitComet's best match for the operating system UI font stack".into())
-            }
+            crate::font_preferences::UI_SYSTEM_FONT_FAMILY => Some(
+                format!(
+                    "Use {}'s best match for the operating system UI font stack",
+                    crate::view::product_name()
+                )
+                .into(),
+            ),
             _ => None,
         }
     }
@@ -489,17 +524,52 @@ impl SettingsWindowView {
         window: &mut Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let percent = ui_scale::set_current(cx, percent).percent;
-        if self.ui_scale_percent == percent {
+        let percent = ui_scale::set_default(cx, percent).percent;
+        if self.default_ui_scale_percent == percent {
             return;
         }
 
+        self.default_ui_scale_percent = percent;
         self.expanded_section = None;
-        self.apply_ui_scale_percent(percent, window, cx);
+        if ui_scale::window_override(cx, window.window_handle().window_id()).is_none() {
+            self.apply_ui_scale_percent(percent, window, cx);
+        }
         self.persist_preferences(cx);
-        self.update_main_windows(cx, move |view, root_window, cx| {
-            view.apply_ui_scale_percent(percent, root_window, cx);
-        });
+        // Other windows without their own zoom follow; deferred, since this
+        // window is mid-update.
+        cx.defer(crate::app::apply_ui_scale_to_windows);
+        cx.notify();
+    }
+
+    pub(super) fn set_window_controls_mode(
+        &mut self,
+        mode: crate::window_controls::WindowControlsMode,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.window_controls_mode == mode {
+            return;
+        }
+
+        self.window_controls_mode = mode;
+        self.expanded_section = None;
+        crate::window_controls::set_current(cx, mode);
+        self.persist_preferences(cx);
+        cx.defer(|cx| cx.refresh_windows());
+        cx.notify();
+    }
+
+    pub(super) fn set_browser_open_target(
+        &mut self,
+        target: crate::app::BrowserOpenTarget,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.browser_open_target == target {
+            return;
+        }
+
+        self.browser_open_target = target;
+        self.expanded_section = None;
+        self.persist_preferences(cx);
         cx.notify();
     }
 
@@ -514,13 +584,13 @@ impl SettingsWindowView {
         }
 
         self.theme_mode = mode.clone();
-        self.theme = mode.resolve_theme(window.appearance());
+        self.theme = mode
+            .resolve_theme(window.appearance())
+            .with_appearance(self.appearance_metrics);
         self.expanded_section = None;
         self.persist_preferences(cx);
         self.update_main_windows(cx, move |view, root_window, cx| {
-            view.popover_host.update(cx, |host, cx| {
-                host.set_theme_mode(mode.clone(), root_window.appearance(), cx);
-            });
+            view.set_theme_mode(mode.clone(), root_window.appearance(), cx);
         });
         cx.notify();
     }
@@ -647,6 +717,42 @@ impl SettingsWindowView {
         cx.notify();
     }
 
+    pub(super) fn set_file_list_layout(
+        &mut self,
+        next: FileListLayout,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.file_list_layout == next {
+            return;
+        }
+
+        self.file_list_layout = next;
+        self.expanded_section = None;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_file_list_layout(next, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_file_list_sort(
+        &mut self,
+        next: crate::view::rows::CommitFileSort,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.file_list_sort == next {
+            return;
+        }
+
+        self.file_list_sort = next;
+        self.expanded_section = None;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_file_list_sort(next, cx);
+        });
+        cx.notify();
+    }
+
     pub(super) fn set_diff_scroll_sync(
         &mut self,
         next: DiffScrollSync,
@@ -744,6 +850,19 @@ impl SettingsWindowView {
         cx.notify();
     }
 
+    pub(super) fn set_diff_tab_size(&mut self, next: u8, cx: &mut gpui::Context<Self>) {
+        if self.diff_tab_size == next {
+            return;
+        }
+
+        self.diff_tab_size = next;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_diff_tab_size(next, cx);
+        });
+        cx.notify();
+    }
+
     pub(super) fn set_diff_show_line_numbers(&mut self, next: bool, cx: &mut gpui::Context<Self>) {
         if self.diff_show_line_numbers == next {
             return;
@@ -770,19 +889,50 @@ impl SettingsWindowView {
         cx.notify();
     }
 
-    pub(super) fn set_markdown_preview_load_remote_images(
+    pub(super) fn set_remote_markdown_image_policy(
         &mut self,
-        next: bool,
+        next: RemoteMarkdownImagePolicy,
         cx: &mut gpui::Context<Self>,
     ) {
-        if self.markdown_preview_load_remote_images == next {
+        if self.remote_markdown_image_policy == next {
             return;
         }
-
-        self.markdown_preview_load_remote_images = next;
+        self.remote_markdown_image_policy = next;
+        self.expanded_section = None;
         self.persist_preferences(cx);
         self.update_main_windows(cx, move |view, _window, cx| {
-            view.set_markdown_preview_load_remote_images(next, cx);
+            view.set_remote_markdown_image_policy(next, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn toggle_remote_protocol(
+        &mut self,
+        protocol: RemoteProtocol,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let allowed = !self.remote_url_policy.allows(protocol);
+        self.remote_url_policy.set_allowed(protocol, allowed);
+        let next = self.remote_url_policy;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_remote_url_policy(next, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_history_branch_names(
+        &mut self,
+        next: HistoryBranchNamesMode,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.history_branch_names == next {
+            return;
+        }
+        self.history_branch_names = next;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_history_branch_names(next, cx);
         });
         cx.notify();
     }
@@ -830,6 +980,22 @@ impl SettingsWindowView {
         cx.notify();
     }
 
+    pub(super) fn set_files_follow_selected_commit(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.files_follow_selected_commit == enabled {
+            return;
+        }
+        self.files_follow_selected_commit = enabled;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_files_follow_selected_commit_preference(enabled, cx);
+        });
+        cx.notify();
+    }
+
     pub(super) fn set_history_relative_dates(
         &mut self,
         enabled: bool,
@@ -860,6 +1026,28 @@ impl SettingsWindowView {
         self.persist_preferences(cx);
         self.update_main_windows(cx, move |view, _window, cx| {
             view.set_history_tag_preferences(enabled, tag_fetch_mode, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_verify_commit_signatures(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.history_verify_commit_signatures == enabled {
+            return;
+        }
+
+        self.history_verify_commit_signatures = enabled;
+        if enabled {
+            self.refresh_signing_tools(cx);
+        } else {
+            self.cancel_signing_tools_probe();
+        }
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_verify_commit_signatures_preference(enabled, cx);
         });
         cx.notify();
     }
@@ -916,5 +1104,97 @@ impl SettingsWindowView {
             view.set_default_tag_type_preference(tag_type, cx);
         });
         cx.notify();
+    }
+
+    pub(super) fn set_large_file_settings(
+        &mut self,
+        settings: gitcomet_state::model::LargeFileSettings,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.large_file_settings == settings {
+            return;
+        }
+        self.large_file_settings = settings;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_large_file_settings_preference(settings, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_prune_deleted_remote_branches_on_fetch(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.prune_deleted_remote_branches_on_fetch == enabled {
+            return;
+        }
+
+        self.prune_deleted_remote_branches_on_fetch = enabled;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_remote_prune_preference(enabled, cx);
+        });
+        cx.notify();
+    }
+
+    pub(super) fn set_recommend_repo_maintenance(
+        &mut self,
+        enabled: bool,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if self.recommend_repo_maintenance == enabled {
+            return;
+        }
+
+        self.recommend_repo_maintenance = enabled;
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, move |view, _window, cx| {
+            view.set_maintenance_recommendation_preference(enabled, cx);
+        });
+        cx.notify();
+    }
+}
+
+impl SettingsWindowView {
+    fn publish_appearance(&mut self, cx: &mut gpui::Context<Self>) {
+        self.theme = self.theme.with_appearance(self.appearance_metrics);
+        cx.set_global(self.appearance_metrics);
+        self.persist_preferences(cx);
+        self.update_main_windows(cx, |view, _window, cx| {
+            view.notify_font_preferences_changed(cx);
+        });
+        cx.refresh_windows();
+        cx.notify();
+    }
+
+    pub(super) fn set_font_size(
+        &mut self,
+        role: FontRole,
+        value: u32,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        if !role.range().contains(&value) {
+            return;
+        }
+        self.font_size_inputs[role.index()].update(cx, |input, cx| {
+            if input.text() != value.to_string() {
+                input.set_text(value.to_string(), cx);
+            }
+        });
+        if self.appearance_metrics.size(role) == value {
+            return;
+        }
+        self.appearance_metrics.set_size(role, value);
+        self.publish_appearance(cx);
+    }
+
+    pub(super) fn set_density(&mut self, density: UiDensity, cx: &mut gpui::Context<Self>) {
+        if self.appearance_metrics.density == density {
+            return;
+        }
+        self.appearance_metrics.density = density;
+        self.publish_appearance(cx);
     }
 }

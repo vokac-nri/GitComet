@@ -15,7 +15,44 @@ pub(crate) fn sync_store_snapshot(view: &GitCometView, cx: &mut impl gpui::AppCo
     push_test_state(view, view.store.snapshot(), cx);
 }
 
-#[cfg(target_os = "macos")]
+pub(crate) fn startup_repository_state_for_test(
+    view: &GitCometView,
+) -> (bool, usize, Option<std::path::PathBuf>) {
+    (
+        view.startup_repo_bootstrap_pending,
+        view.state.repos.len(),
+        view.active_repo_workdir(),
+    )
+}
+
+pub(crate) fn dispatch_restore_session_for_test(
+    view: &GitCometView,
+    open_repos: Vec<std::path::PathBuf>,
+    active_repo: Option<std::path::PathBuf>,
+) {
+    view.store.dispatch(Msg::RestoreSession {
+        open_repos,
+        active_repo,
+    });
+}
+
+pub(crate) fn activate_closed_repo_picker_entry_for_test(
+    view: &GitCometView,
+    path: std::path::PathBuf,
+    cx: &mut gpui::Context<GitCometView>,
+) {
+    view.popover_host.update(cx, |host, cx| {
+        host.activate_closed_repo_picker_entry_for_test(path, cx);
+    });
+}
+
+/// Close every error toast, for fixtures whose backend reports errors the
+/// test is not about: error toasts stay, and would cover the controls it clicks.
+pub(crate) fn dismiss_error_toasts(view: &Entity<GitCometView>, cx: &mut App) {
+    let toast_host = view.read(cx).toast_host.clone();
+    toast_host.update(cx, |host, cx| host.dismiss_all_errors(cx));
+}
+
 pub(crate) fn apply_state_snapshot_for_test(
     view: &mut GitCometView,
     state: Arc<AppState>,
@@ -42,6 +79,17 @@ pub(crate) fn popover_is_open(view: &GitCometView, app: &App) -> bool {
 
 pub(crate) fn command_palette_is_open(view: &GitCometView) -> bool {
     view.command_palette_open
+}
+
+/// The Reveal Commit dialog reports two things: the root's flag, and the
+/// dialog's own. They only disagree if a close path forgot one of them.
+pub(crate) fn reveal_commit_is_open(view: &GitCometView, app: &App) -> bool {
+    let dialog_open = view.reveal_commit_dialog.read(app).is_open();
+    assert_eq!(
+        view.reveal_commit_open, dialog_open,
+        "the root flag and the dialog disagree about being open"
+    );
+    dialog_open
 }
 
 /// `(scrolled, max_scroll)` of the repository tab strip, in pixels.
@@ -125,6 +173,84 @@ pub(crate) fn redraw(cx: &mut gpui::VisualTestContext) {
     cx.update(|window, app| {
         let _ = window.draw(app);
     });
+}
+
+/// Blocks until the store worker has reduced every message dispatched so far.
+///
+/// GPUI's test executor does not drive the worker thread, so a snapshot read
+/// right after a dispatch may predate it. A plain message sent now is reduced
+/// strictly after everything already queued (only control messages overtake,
+/// and only internal ones), so its acknowledgment covers every earlier
+/// dispatch without changing preferences.
+/// Messages the worker itself sends while handling a command's effects can
+/// still land later; wait on their own state when a test depends on them.
+pub(crate) fn drain_store_worker(
+    view: &gpui::Entity<GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+) {
+    let store = cx.update(|_window, app| view.read(app).store.clone());
+    let barrier = store.barrier_for_test();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        redraw(cx);
+        cx.run_until_parked();
+        match barrier.try_recv() {
+            Ok(_) => return,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                panic!("store worker stopped before its barrier")
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the store worker did not acknowledge its barrier"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The repo's `ops_rev`, bumped when a local action begins and again when it
+/// finishes. Read after [`drain_store_worker`], it has moved since an earlier
+/// read if and only if an action was dispatched in between. The in-flight
+/// counters cannot say that: against a backend that never opens a repository
+/// an action completes at once with a missing-handle error, so they are back
+/// to zero on both sides of the worker.
+pub(crate) fn repo_ops_rev(
+    view: &gpui::Entity<GitCometView>,
+    cx: &mut gpui::VisualTestContext,
+    repo_id: gitcomet_state::model::RepoId,
+) -> u64 {
+    cx.update(|_window, app| {
+        view.read(app)
+            .store
+            .snapshot()
+            .repos
+            .iter()
+            .find(|repo| repo.id == repo_id)
+            .map(|repo| repo.ops_rev)
+            .expect("the repo under test is in the store")
+    })
+}
+
+/// Inspect render output inside a frame so GPUI releases arena-owned elements.
+/// Return only inspected data; rendered elements must stay inside the callback.
+pub(crate) fn inspect_render<R>(
+    cx: &mut gpui::VisualTestContext,
+    inspect: impl FnOnce(&mut Window, &mut App) -> R,
+) -> R {
+    let mut result = None;
+    cx.draw(
+        gpui::point(px(0.0), px(0.0)),
+        gpui::size(
+            gpui::AvailableSpace::MinContent,
+            gpui::AvailableSpace::MinContent,
+        ),
+        |window, app| {
+            result = Some(inspect(window, app));
+            gpui::Empty
+        },
+    );
+    result.expect("render inspection should run while drawing the test frame")
 }
 
 pub(crate) fn wait_for_native_tooltip(cx: &mut gpui::VisualTestContext) {
@@ -244,3 +370,44 @@ impl gpui::http_client::HttpClient for RecordingHttpClient {
         Box::pin(async { anyhow::bail!("RecordingHttpClient answers nothing") })
     }
 }
+
+/// Head of a real `tests/unit/helpers.ts` whose file preview once showed
+/// garbled colours from row 14 on: a stale parse, not the grammar.
+pub(crate) const TS_COMPILER_OPTIONS_HELPERS: &str = r#"import * as assert from 'node:assert/strict'
+import * as ts from 'typescript'
+import transformer from '../../src'
+
+/*
+ * Assertion based test helpers. The reference suite (tests/index.ts) compiles whole files and compares them
+ * to tests/references*, these helpers compile small TSX snippets in memory so a test can pin one behaviour.
+ */
+
+// Same flavour of options as tests/index.ts: no "use strict" prologue, LF newlines
+const baseCompilerOptions: ts.CompilerOptions = {
+    jsx: ts.JsxEmit.Preserve,
+    strict: false,
+    // alwaysStrict=false is deprecated in TypeScript 6 and reported as a diagnostic without this
+    ignoreDeprecations: '6.0',
+    alwaysStrict: false,
+    experimentalDecorators: true,
+    target: ts.ScriptTarget.ESNext,
+    module: ts.ModuleKind.ESNext,
+    newLine: ts.NewLineKind.LineFeed
+}
+
+// Compiler options that can be passed as `compilerOptions` to the transform functions
+export const es5: ts.CompilerOptions = {target: ts.ScriptTarget.ES5, module: ts.ModuleKind.ESNext}
+export const es5CommonJS: ts.CompilerOptions = {target: ts.ScriptTarget.ES5, module: ts.ModuleKind.CommonJS}
+export const es2015: ts.CompilerOptions = {target: ts.ScriptTarget.ES2015, module: ts.ModuleKind.ES2015}
+export const commonJS: ts.CompilerOptions = {module: ts.ModuleKind.CommonJS}
+
+export interface TranspileResult {
+    code: string
+    map: string | undefined
+    diagnostics: readonly ts.Diagnostic[]
+}
+
+/*
+ * Compiles `input` with the plugin as an `after` transformer and returns the emitted code untouched,
+ * the source map when compilerOptions.sourceMap is set, and the syntactic diagnostics of the input.
+ */"#;

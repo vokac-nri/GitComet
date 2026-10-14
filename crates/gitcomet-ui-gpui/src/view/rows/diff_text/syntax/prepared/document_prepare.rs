@@ -5,6 +5,10 @@ pub(crate) fn should_apply_chunk_build_result(
     current_thread: std::thread::ThreadId,
     target_cache_key: Option<PreparedSyntaxCacheKey>,
 ) -> bool {
+    #[cfg(test)]
+    if !syntax_test_scope_is_active(result.chunk_key.cache_key) {
+        return false;
+    }
     result.thread_id == current_thread
         && match target_cache_key {
             Some(cache_key) => result.chunk_key.cache_key == cache_key,
@@ -76,15 +80,11 @@ pub(crate) fn prepared_syntax_cache_metrics() -> PreparedSyntaxCacheMetrics {
 
 #[cfg(test)]
 pub(crate) fn reset_prepared_syntax_cache() {
+    reset_syntax_test_scope();
     TS_DOCUMENT_CACHE.with(|cache| {
         *cache.borrow_mut() = TreesitterDocumentCache::new();
     });
     TS_PENDING_PARSE_REQUESTS.with(|requests| requests.borrow_mut().clear());
-    let mut store = match shared_prepared_document_seed_store().lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    store.clear();
 }
 
 #[cfg(test)]
@@ -421,13 +421,18 @@ pub(crate) fn prepared_line_span(
 /// at a caret boundary beyond the line, or when nothing pairs. Geometric clicks
 /// in trailing blank space are rejected by the view before reaching this API.
 ///
-/// Injections *are* consulted, and first -- see [`injected_syntax_pair_at`]. The
-/// injected region's own tree is kept for exactly this, because to the host
+/// Injections *are* consulted, and first -- see [`prepared_injected_layer_at`].
+/// The injected region's own tree is kept for exactly this, because to the host
 /// grammar an injected body is one opaque leaf: a delimiter inside it matches
 /// nothing, and the walk falls out to the enclosing element. That was the whole
 /// bug -- clicking the `<` of a `<html>` tag in a PHP file did nothing.
-/// Combined injections stay out of it, and the host tree remains the fallback.
+///
+/// Combined layers are consulted too, which matters most for templates: all of a
+/// `.njk`'s markup is one combined HTML layer, so while they were skipped here
+/// the Jinja host tree -- which has that markup as a single opaque `text` node --
+/// was the only tree left, and clicking any tag lit nothing at all.
 pub(in crate::view) fn prepared_document_syntax_pair_at_display_offset(
+    tab_width: usize,
     document: PreparedSyntaxDocument,
     line_ix: usize,
     display_offset: usize,
@@ -440,8 +445,8 @@ pub(in crate::view) fn prepared_document_syntax_pair_at_display_offset(
 
     let clicked = line_span(line_ix)?;
     let clicked_line = text.get(clicked.clone())?;
-    let offset =
-        clicked.start + clicked_raw_offset_for_display_offset(clicked_line, display_offset)?;
+    let offset = clicked.start
+        + clicked_raw_offset_for_display_offset(tab_width, clicked_line, display_offset)?;
 
     let source_ranges_equal = |left: Range<usize>, right: Range<usize>| {
         let bytes = text.as_bytes();
@@ -450,8 +455,11 @@ pub(in crate::view) fn prepared_document_syntax_pair_at_display_offset(
             _ => false,
         }
     };
-    ensure_injection_chain_cached_for_pair_lookup(&state, offset);
-    let pair = injected_syntax_pair_at(text, state.source_hash, offset)
+    let deadline = Instant::now() + TS_CLICK_INJECTION_BUDGET;
+    let combined_layers = state.combined_layers_within(deadline);
+    ensure_injection_chain_cached_for_click_lookup(&state, offset, combined_layers, deadline);
+    let pair = prepared_injected_layer_at(&state, offset, combined_layers)
+        .and_then(|layer| syntax_pair_in_injected_layer(text, &layer, offset))
         .or_else(|| syntax_pair_in_tree(&state.tree, offset, &source_ranges_equal))?;
 
     let project = |range: &Range<usize>| -> Vec<PreparedSyntaxPairSpan> {
@@ -477,8 +485,8 @@ pub(in crate::view) fn prepared_document_syntax_pair_at_display_offset(
             if start < end {
                 out.push(PreparedSyntaxPairSpan {
                     line_ix: ix,
-                    display_range: display_offset_for_raw_offset(line, start)
-                        ..display_offset_for_raw_offset(line, end),
+                    display_range: display_offset_for_raw_offset(tab_width, line, start)
+                        ..display_offset_for_raw_offset(tab_width, line, end),
                 });
             }
             if span.end >= range.end {
@@ -503,8 +511,22 @@ pub(in crate::view) fn prepared_document_syntax_pair_at_display_offset(
 /// Shares the display/raw conversion and the line projection with
 /// [`prepared_document_syntax_pair_at_display_offset`], for the same reason:
 /// this is the only place holding both the tree's byte offsets and the text the
-/// rows were painted from.
+/// rows were painted from. It shares that function's layer selection too, so a
+/// click cannot resolve to one grammar for pairing and another for naming.
+///
+/// One click, one grammar's opinion: the injected answer is *not* unioned with
+/// the host's. A name in a `<script>` means the JavaScript one, and lighting a
+/// same-spelled attribute value beside it would be noise.
+///
+/// The scope falls out of the tree rather than needing a second filter, because
+/// [`syntax_occurrences_in_tree`] confirms every textual candidate against an
+/// exactly-matching named leaf. A single injection is handed only its own bytes.
+/// A combined layer is handed the whole document, but its tree was built with
+/// `set_included_ranges`, so it has no leaf inside a host gap and candidates
+/// there are dropped -- while a name used on both sides of a `{% for %}` is
+/// still one set, which is the entire point of a combined layer.
 pub(in crate::view) fn prepared_document_occurrences_at_display_offset(
+    tab_width: usize,
     document: PreparedSyntaxDocument,
     line_ix: usize,
     display_offset: usize,
@@ -527,13 +549,20 @@ pub(in crate::view) fn prepared_document_occurrences_at_display_offset(
     // A caret boundary beyond the line names nothing. The view separately
     // rejects pixel clicks in trailing blank space, whose clamped boundary can
     // equal the valid end boundary produced by the final glyph's right half.
-    let Some(raw_offset) = clicked_raw_offset_for_display_offset(clicked_line, display_offset)
+    let Some(raw_offset) =
+        clicked_raw_offset_for_display_offset(tab_width, clicked_line, display_offset)
     else {
         return Vec::new();
     };
     let offset = clicked.start + raw_offset;
 
-    let Some(found) = syntax_occurrences_in_tree(&state.tree, text, offset) else {
+    let deadline = Instant::now() + TS_CLICK_INJECTION_BUDGET;
+    let combined_layers = state.combined_layers_within(deadline);
+    ensure_injection_chain_cached_for_click_lookup(&state, offset, combined_layers, deadline);
+    let found = prepared_injected_layer_at(&state, offset, combined_layers)
+        .and_then(|layer| syntax_occurrences_in_injected_layer(text, &layer, offset))
+        .or_else(|| syntax_occurrences_in_tree(&state.tree, text, offset));
+    let Some(found) = found else {
         return Vec::new();
     };
     found
@@ -550,8 +579,8 @@ pub(in crate::view) fn prepared_document_occurrences_at_display_offset(
             let end = range.end.clamp(span.start, span.end) - span.start;
             (start < end).then(|| PreparedSyntaxPairSpan {
                 line_ix: ix,
-                display_range: display_offset_for_raw_offset(line, start)
-                    ..display_offset_for_raw_offset(line, end),
+                display_range: display_offset_for_raw_offset(tab_width, line, start)
+                    ..display_offset_for_raw_offset(tab_width, line, end),
             })
         })
         .collect()
@@ -608,6 +637,8 @@ pub(crate) fn benchmark_cache_replacement_drop_step(
     for (nonce, line_tokens) in payloads.into_iter().enumerate() {
         cache.insert_document_with_mode(
             PreparedSyntaxCacheKey {
+                #[cfg(test)]
+                test_scope: syntax_test_scope(),
                 language: DiffSyntaxLanguage::Rust,
                 doc_hash: 0,
             },
@@ -723,6 +754,7 @@ pub(crate) fn parse_treesitter_document_core(
     }
 
     let old_tree_for_parse = incremental_seed.as_ref().map(|seed| &seed.tree);
+    let started = Instant::now();
     let tree = with_ts_parser_parse_result(&request.ts_language, |parser| {
         parse_treesitter_tree(
             parser,
@@ -731,6 +763,31 @@ pub(crate) fn parse_treesitter_document_core(
             foreground_timeout,
         )
     })?;
+    // Combined layers ride the root parse's remaining budget. A miss does not
+    // fail the prepare -- the document was Ready before layers existed and must
+    // stay so -- it leaves the cell empty for the first chunk build to fill.
+    let combined_layers = match tree_sitter_highlight_spec(request.language) {
+        Some(spec) => build_prepared_combined_layers(
+            spec,
+            &tree,
+            request.input.text.as_bytes(),
+            &request.input.line_starts,
+            request.cache_key.doc_hash,
+            foreground_timeout.map(|budget| {
+                #[cfg(test)]
+                if TS_FORCE_COMBINED_LAYER_DEADLINE_MISS.with(|force| force.get()) {
+                    return started;
+                }
+                started + budget
+            }),
+            TS_COMBINED_LAYER_MAX_RANGES,
+        ),
+        None => Some(Some(Vec::new())),
+    };
+    let combined_layers = match combined_layers {
+        Some(built) => Arc::new(OnceLock::from(built)),
+        None => Arc::new(OnceLock::new()),
+    };
 
     #[cfg(test)]
     let parse_mode = if incremental_seed.is_some() {
@@ -773,6 +830,7 @@ pub(crate) fn parse_treesitter_document_core(
             source_hash: request.cache_key.doc_hash,
             source_version,
             tree,
+            combined_layers,
             #[cfg(test)]
             parse_mode,
         }),

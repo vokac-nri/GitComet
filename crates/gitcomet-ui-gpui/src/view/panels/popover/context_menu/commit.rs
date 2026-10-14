@@ -19,6 +19,40 @@ fn multi_cherry_pick_plan(
     if !(selection.is_multi() && selection.contains(commit_id)) {
         return None;
     }
+    if let Some(index) = &repo.history_state.indexed.range_index {
+        let mut selected: Vec<_> = selection
+            .commits
+            .iter()
+            .filter_map(|id| index.position(id.as_ref()).map(|row| (row, id)))
+            .collect();
+        if selected.len() == selection.commits.len() {
+            selected.sort_unstable_by_key(|(row, _)| std::cmp::Reverse(*row));
+            let entries = selected
+                .iter()
+                .map(|(row, id)| {
+                    let summary = repo
+                        .history_state
+                        .indexed
+                        .commit(&index.snapshot, *row)
+                        .map_or_else(String::new, |commit| commit.summary.to_string());
+                    InteractiveRebaseEntry {
+                        action: InteractiveRebaseAction::Pick,
+                        commit_id: id.as_ref().to_owned(),
+                        message: summary.clone(),
+                        summary,
+                        new_message: None,
+                    }
+                })
+                .collect();
+            let colors = selected
+                .iter()
+                .map(|(_, id)| (id.as_ref().to_owned(), 0))
+                .collect();
+            return Some((entries, colors));
+        }
+        // Never silently cherry-pick just the loaded part of a selection.
+        return None;
+    }
     let Loadable::Ready(page) = &repo.log else {
         return None;
     };
@@ -131,19 +165,81 @@ fn repo_commit_is_ancestor_of_head(repo: &RepoState, commit_id: &CommitId) -> bo
     false
 }
 
+/// Branch names a commit's menu offers to copy: the local branches pointing at
+/// it, or, when there are none, its remote branches as `remote/branch` (the
+/// same text the branch's own menu copies).
+fn commit_branch_names_to_copy(
+    this: &PopoverHost,
+    repo_id: RepoId,
+    commit_id: &CommitId,
+) -> Vec<String> {
+    let Some(repo) = this.state.repos.iter().find(|repo| repo.id == repo_id) else {
+        return Vec::new();
+    };
+    let local: Vec<String> = repo
+        .branches
+        .ready()
+        .map(|branches| {
+            branches
+                .iter()
+                .filter(|branch| branch.target == *commit_id)
+                .map(|branch| branch.name.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    if !local.is_empty() {
+        return local;
+    }
+    repo.remote_branches
+        .ready()
+        .map(|branches| {
+            branches
+                .iter()
+                .filter(|branch| branch.target == *commit_id)
+                .map(|branch| format!("{}/{}", branch.remote, branch.name))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -> ContextMenuModel {
+    model_with_header(this, repo_id, commit_id, true)
+}
+
+pub(super) fn action_items(
+    this: &PopoverHost,
+    repo_id: RepoId,
+    commit_id: &CommitId,
+) -> ContextMenuModel {
+    model_with_header(this, repo_id, commit_id, false)
+}
+
+fn model_with_header(
+    this: &PopoverHost,
+    repo_id: RepoId,
+    commit_id: &CommitId,
+    include_header: bool,
+) -> ContextMenuModel {
     let sha = commit_id.as_ref().to_string();
     let short: SharedString = sha.get(0..8).unwrap_or(&sha).to_string().into();
 
     let commit_summary = this
         .active_repo()
-        .and_then(|r| match &r.log {
-            Loadable::Ready(page) => page
-                .commits
-                .iter()
-                .find(|c| c.id == *commit_id)
-                .map(|c| format!("{} — {}", c.author, c.summary)),
-            _ => None,
+        .and_then(|r| {
+            if let Some(index) = &r.history_state.indexed.range_index
+                && let Some(row) = index.position(commit_id.as_ref())
+                && let Some(commit) = r.history_state.indexed.commit(&index.snapshot, row)
+            {
+                return Some(format!("{} — {}", commit.author, commit.summary));
+            }
+            match &r.log {
+                Loadable::Ready(page) => page
+                    .commits
+                    .iter()
+                    .find(|c| c.id == *commit_id)
+                    .map(|c| format!("{} — {}", c.author, c.summary)),
+                _ => None,
+            }
         })
         .unwrap_or_default();
 
@@ -166,15 +262,21 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
         [name] => name.clone().into(),
         names => names.join(", ").into(),
     };
-    let mut items = vec![ContextMenuItem::Header(
-        components::ContextMenuText::new(header_text).max_lines(2),
-    )];
-    if !commit_summary.is_empty() {
+    let mut items = Vec::new();
+    if include_header {
+        items.push(ContextMenuItem::Header(
+            components::ContextMenuText::new(header_text).max_lines(2),
+        ));
+    }
+    let mut entry_tooltips = FxHashMap::default();
+    if include_header && !commit_summary.is_empty() {
         items.push(ContextMenuItem::Label(
             components::ContextMenuText::new(commit_summary).max_lines(4),
         ));
     }
-    items.push(ContextMenuItem::Separator);
+    if include_header {
+        items.push(ContextMenuItem::Separator);
+    }
     let multi_cherry_pick_plan = multi_cherry_pick_plan(this, repo_id, commit_id);
     let has_multi_cherry_pick = multi_cherry_pick_plan.is_some();
     let is_head_commit = this
@@ -202,17 +304,14 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
             if !(selection.is_multi() && selection.contains(commit_id)) {
                 return None;
             }
-            let Loadable::Ready(page) = &repo.log else {
-                return None;
-            };
-            let head = repo.head_commit_id()?;
-            gitcomet_core::squash::squash_eligibility(&page.commits, &selection.commits, &head)
+            repo.history_squash_plan()
         });
     if let Some(plan) = squash_plan {
         let label = format!("Squash {} commits", plan.commit_count).into();
         items.push(ContextMenuItem::Entry {
             label,
-            icon: Some("icons/git_commit.svg".into()),
+            // The branch menu's "Squash into current" icon.
+            icon: Some("icons/arrow_right.svg".into()),
             shortcut: None,
             disabled: history_rewrite_disabled,
             action: Box::new(ContextMenuAction::SquashSelectedCommits { repo_id }),
@@ -235,20 +334,7 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
         items.push(ContextMenuItem::Separator);
     }
     items.push(ContextMenuItem::Entry {
-        label: "Open diff".into(),
-        icon: Some("icons/open_external.svg".into()),
-        shortcut: None,
-        disabled: false,
-        action: Box::new(ContextMenuAction::SelectDiff {
-            repo_id,
-            target: DiffTarget::Commit {
-                commit_id: commit_id.clone(),
-                path: None,
-            },
-        }),
-    });
-    items.push(ContextMenuItem::Entry {
-        label: "Browse repository at this point".into(),
+        label: "Start file browsing".into(),
         icon: Some("icons/history.svg".into()),
         shortcut: None,
         disabled: false,
@@ -257,6 +343,32 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
             commit_id: commit_id.clone(),
         }),
     });
+    // The file history menu embeds these actions without the header and
+    // offers its own "Copy SHA" among its file entries.
+    if include_header {
+        items.push(ContextMenuItem::Entry {
+            label: "Copy commit SHA".into(),
+            icon: Some("icons/copy.svg".into()),
+            shortcut: Some("C".into()),
+            disabled: false,
+            action: Box::new(ContextMenuAction::CopyText { text: sha.clone() }),
+        });
+        let names = commit_branch_names_to_copy(this, repo_id, commit_id);
+        let single = names.len() == 1;
+        for name in names {
+            items.push(ContextMenuItem::Entry {
+                label: if single {
+                    "Copy branch name".into()
+                } else {
+                    format!("Copy branch name {name}").into()
+                },
+                icon: Some("icons/copy.svg".into()),
+                shortcut: None,
+                disabled: false,
+                action: Box::new(ContextMenuAction::CopyText { text: name }),
+            });
+        }
+    }
     if let Some(permalink) = this
         .state
         .repos
@@ -320,6 +432,17 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
             }),
         });
         items.push(ContextMenuItem::Entry {
+            label: "Compare with merge base".into(),
+            icon: Some("icons/open_external.svg".into()),
+            shortcut: None,
+            disabled: false,
+            action: Box::new(ContextMenuAction::CompareWithMergeBase {
+                repo_id,
+                commit_id: commit_id.clone(),
+                label: short.to_string(),
+            }),
+        });
+        items.push(ContextMenuItem::Entry {
             label: "Clear comparison mark".into(),
             icon: Some("icons/generic_close.svg".into()),
             shortcut: None,
@@ -337,11 +460,13 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
             commit_id: commit_id.clone(),
         }),
     });
+    let add_tag_disabled = !this.state.git_log_settings.show_history_tags;
+    let add_tag_ix = items.len();
     items.push(ContextMenuItem::Entry {
         label: "Add tag…".into(),
         icon: Some("icons/tag.svg".into()),
         shortcut: Some("T".into()),
-        disabled: false,
+        disabled: add_tag_disabled,
         action: Box::new(ContextMenuAction::OpenPopover {
             kind: PopoverKind::CreateTagPrompt {
                 repo_id,
@@ -349,6 +474,12 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
             },
         }),
     });
+    if add_tag_disabled {
+        entry_tooltips.insert(
+            add_tag_ix,
+            "Enable “Show tags in history view” in Settings > Git log to add tags.".into(),
+        );
+    }
     items.push(ContextMenuItem::Entry {
         label: "Checkout (detached)".into(),
         icon: Some("icons/git_branch.svg".into()),
@@ -386,7 +517,7 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
         });
     }
     items.push(ContextMenuItem::Entry {
-        label: "Revert".into(),
+        label: format!("Revert {short}…").into(),
         icon: Some("icons/undo.svg".into()),
         shortcut: Some("R".into()),
         disabled: history_rewrite_disabled,
@@ -481,9 +612,10 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
     // about to refuse. `commit_is_ancestor_of_head` already looks the repository
     // up this way.
     let merge_repo = this.state.repos.iter().find(|repo| repo.id == repo_id);
-    let merge_into_current_disabled =
-        !super::super::merge_commit_confirm::merge_commit_repo_is_ready(merge_repo)
-            || commit_is_ancestor_of_head(this, repo_id, commit_id);
+    let merge_into_current_disabled = !super::super::merge_commit_confirm::merge_commit_is_allowed(
+        merge_repo,
+        &this.state.large_file_settings,
+    ) || commit_is_ancestor_of_head(this, repo_id, commit_id);
     let merge_destination =
         super::super::merge_commit_confirm::merge_commit_destination_label(merge_repo);
     items.push(ContextMenuItem::Entry {
@@ -532,7 +664,7 @@ pub(super) fn model(this: &PopoverHost, repo_id: RepoId, commit_id: &CommitId) -
         });
     }
 
-    ContextMenuModel::new(items)
+    ContextMenuModel::new(items).with_entry_tooltips(entry_tooltips)
 }
 
 #[cfg(test)]

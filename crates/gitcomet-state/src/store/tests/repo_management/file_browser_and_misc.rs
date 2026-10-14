@@ -4,7 +4,7 @@ use super::*;
 fn dropped_existing_repo_focuses_its_tab_without_creating_a_duplicate() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo1");
     open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo2");
@@ -50,7 +50,7 @@ fn diagnostics_are_capped() {
 
 #[test]
 fn session_persist_error_reports_notification_and_repo_diagnostic() {
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -91,7 +91,7 @@ fn session_persist_error_reports_notification_and_repo_diagnostic() {
 
 #[test]
 fn session_persist_error_without_repo_still_reports_notification() {
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     super::reducer::handle_session_persist_result(
         &mut state,
@@ -113,7 +113,7 @@ fn session_persist_error_without_repo_still_reports_notification() {
 fn session_persist_failed_msg_reports_notification_and_repo_diagnostic() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     state.repos.push(RepoState::new_opening(
         RepoId(1),
         RepoSpec {
@@ -188,7 +188,7 @@ fn recursive_expand_opens_the_folder_and_every_directory_under_it() {
 #[test]
 fn recursive_collapse_closes_exactly_the_subtree_it_opened() {
     let (mut repos, id_alloc, mut state, repo_id) = state_with_file_browser_tree();
-    for path in ["other", "src", "src/nested"] {
+    for path in ["other", "src", "src/nested", "src/no-longer-listed/deep"] {
         state.repos[0]
             .file_browser
             .expanded_dirs
@@ -228,12 +228,14 @@ fn recursive_expand_does_not_match_name_prefixes_of_sibling_folders() {
             path: Arc::new(PathBuf::from("src")),
             kind: gitcomet_core::domain::FileEntryKind::Directory,
             depth: 0,
+            ignored: false,
         },
         gitcomet_core::domain::FileEntry {
             name: "src_generated".to_string(),
             path: Arc::new(PathBuf::from("src_generated")),
             kind: gitcomet_core::domain::FileEntryKind::Directory,
             depth: 0,
+            ignored: false,
         },
     ]));
 
@@ -373,7 +375,7 @@ fn folder_toggles_stay_live_for_a_whitespace_only_query() {
 fn delete_branches_emits_one_effect_carrying_every_name() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     reduce(
         &mut repos,
         &id_alloc,
@@ -423,7 +425,7 @@ fn delete_branches_emits_one_effect_carrying_every_name() {
 fn delete_branches_with_an_empty_list_does_nothing() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     reduce(
         &mut repos,
         &id_alloc,
@@ -455,7 +457,7 @@ fn delete_branches_with_an_empty_list_does_nothing() {
 fn delete_remote_branches_keeps_the_batch_under_one_remote() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     reduce(
         &mut repos,
         &id_alloc,

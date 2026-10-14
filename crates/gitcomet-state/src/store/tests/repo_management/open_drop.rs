@@ -4,7 +4,7 @@ use super::*;
 fn open_repo_sets_opening_and_emits_effect() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let effects = reduce(
         &mut repos,
@@ -33,7 +33,7 @@ fn open_repo_sets_opening_and_emits_effect() {
 fn dropped_repo_stays_provisional_until_the_backend_opens_it() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let path = PathBuf::from("/tmp/dropped-repo");
 
     let effects = reduce(
@@ -66,7 +66,7 @@ fn dropped_repo_stays_provisional_until_the_backend_opens_it() {
 fn repeating_or_closing_a_provisional_drop_never_records_it_as_recent() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let path = PathBuf::from("/tmp/dropped-repo");
 
     reduce(
@@ -112,7 +112,7 @@ fn repeating_or_closing_a_provisional_drop_never_records_it_as_recent() {
 fn bulk_close_skips_provisional_drop_when_recording_recents() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     reduce(
         &mut repos,
@@ -151,7 +151,7 @@ fn bulk_close_skips_provisional_drop_when_recording_recents() {
 fn successful_dropped_repo_commits_and_emits_deferred_persistence() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let path = PathBuf::from("/tmp/dropped-repo");
 
     reduce(
@@ -166,6 +166,7 @@ fn successful_dropped_repo_commits_and_emits_deferred_persistence() {
         &id_alloc,
         &mut state,
         Msg::Internal(crate::msg::InternalMsg::RepoOpenedOk {
+            preferences: None,
             repo_id: RepoId(1),
             spec,
             repo: Arc::new(DummyRepo::new(path.to_string_lossy().as_ref())),
@@ -201,7 +202,7 @@ fn successful_dropped_repo_commits_and_emits_deferred_persistence() {
 fn operational_error_discards_dropped_tab_and_preserves_existing_recents() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let dir = tempfile::tempdir().expect("tempdir");
     let existing = dir.path().join("existing");
     let dropped = dir.path().join("dropped");
@@ -264,7 +265,7 @@ fn operational_error_discards_dropped_tab_and_preserves_existing_recents() {
 fn failed_dropped_repo_restores_the_repo_active_before_the_drop() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     let session_dir = tempfile::tempdir().expect("session tempdir");
     let _session_file_override = crate::session::push_test_session_file_path_override(Some(
         session_dir.path().join("session.json"),
@@ -332,7 +333,7 @@ fn failed_dropped_repo_restores_the_repo_active_before_the_drop() {
 fn open_repo_focuses_existing_repo_instead_of_opening_duplicate() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo1");
     open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo2");
@@ -368,7 +369,7 @@ fn open_repo_focuses_existing_repo_instead_of_opening_duplicate() {
 fn open_repo_allows_same_basename_in_different_folders() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let dir = std::env::temp_dir().join(format!(
         "gitcomet-open-repo-same-basename-test-{}-{}",
@@ -439,7 +440,7 @@ fn open_repo_allows_same_basename_in_different_folders() {
 fn open_repo_refreshes_when_repo_is_already_active() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo");
     state.repos[0].feedback.missing_on_disk = true;
@@ -537,7 +538,7 @@ fn open_repo_uses_builtin_default_history_mode_without_saved_preferences() {
 fn open_repo_persists_resolved_history_mode_and_keeps_it_sticky() {
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
 
     let dir = tempfile::tempdir().expect("tempdir");
     let repo_path = dir.path().join("repo");
@@ -599,11 +600,199 @@ fn open_repo_persists_resolved_history_mode_and_keeps_it_sticky() {
 
     let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
     let id_alloc = AtomicU64::new(1);
-    let mut state = AppState::default();
+    let mut state = AppState::test_default();
     reduce(&mut repos, &id_alloc, &mut state, Msg::OpenRepo(repo_path));
 
     assert_eq!(
         state.repos[0].history_state.history_scope,
         LogScope::AllBranches
+    );
+}
+
+fn drop_folder(
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    id_alloc: &AtomicU64,
+    state: &mut AppState,
+    path: &str,
+) -> (RepoId, Vec<Effect>) {
+    let effects = reduce(
+        repos,
+        id_alloc,
+        state,
+        Msg::OpenRepoFromExternalDrop(PathBuf::from(path)),
+    );
+    let repo_id = state.active_repo.expect("dropped tab becomes active");
+    (repo_id, effects)
+}
+
+fn fail_drop_as_not_a_repository(
+    repos: &mut FxHashMap<RepoId, Arc<dyn GitRepository>>,
+    id_alloc: &AtomicU64,
+    state: &mut AppState,
+    repo_id: RepoId,
+) {
+    let spec = state
+        .repos
+        .iter()
+        .find(|repo| repo.id == repo_id)
+        .expect("dropped tab")
+        .spec
+        .clone();
+    reduce(
+        repos,
+        id_alloc,
+        state,
+        Msg::Internal(crate::msg::InternalMsg::RepoOpenedErr {
+            repo_id,
+            spec,
+            error: Error::new(ErrorKind::NotARepository),
+        }),
+    );
+}
+
+fn cancels_loads_of(effects: &[Effect], repo_id: RepoId) -> bool {
+    effects.iter().any(
+        |effect| matches!(effect, Effect::CancelRepoLoads { repo_id: id, .. } if *id == repo_id),
+    )
+}
+
+fn open_is_loading(state: &AppState, repo_id: RepoId) -> bool {
+    state
+        .repos
+        .iter()
+        .find(|repo| repo.id == repo_id)
+        .is_some_and(|repo| repo.open.is_loading())
+}
+
+// Dropping several folders opens them one after another. Each later tab must
+// leave the earlier ones validating, or they stay unchecked until clicked.
+#[test]
+fn second_drop_keeps_the_first_drops_validation_running() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+
+    let (first, _) = drop_folder(&mut repos, &id_alloc, &mut state, "/tmp/drop-a");
+    let (second, effects) = drop_folder(&mut repos, &id_alloc, &mut state, "/tmp/drop-b");
+
+    assert_ne!(first, second);
+    assert!(!cancels_loads_of(&effects, first));
+    assert!(open_is_loading(&state, first));
+    assert!(
+        effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::OpenRepo { repo_id, .. } if *repo_id == second))
+    );
+}
+
+#[test]
+fn switching_tabs_keeps_a_pending_drop_validation_running() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+
+    let existing = open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo1");
+    let (dropped, _) = drop_folder(&mut repos, &id_alloc, &mut state, "/tmp/drop-a");
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::SetActiveRepo { repo_id: existing },
+    );
+    assert_eq!(state.active_repo, Some(existing));
+    assert!(!cancels_loads_of(&effects, dropped));
+    assert!(open_is_loading(&state, dropped));
+
+    // An ordinary tab is still cancelled when switched away from.
+    let effects = reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::SetActiveRepo { repo_id: dropped },
+    );
+    assert!(cancels_loads_of(&effects, existing));
+}
+
+#[test]
+fn failed_drops_fall_back_past_each_other_to_the_pre_drop_tab() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let session_dir = tempfile::tempdir().expect("session tempdir");
+    let _session_file_override = crate::session::push_test_session_file_path_override(Some(
+        session_dir.path().join("session.json"),
+    ));
+
+    let original_active = open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo1");
+    let adjacent_repo = open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo2");
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::SetActiveRepo {
+            repo_id: original_active,
+        },
+    );
+    let dropped = ["/tmp/drop-a", "/tmp/drop-b", "/tmp/drop-c"]
+        .map(|path| drop_folder(&mut repos, &id_alloc, &mut state, path).0);
+
+    for repo_id in dropped {
+        fail_drop_as_not_a_repository(&mut repos, &id_alloc, &mut state, repo_id);
+    }
+
+    assert_eq!(state.repos.len(), 2);
+    assert_eq!(state.active_repo, Some(original_active));
+    assert_ne!(state.active_repo, Some(adjacent_repo));
+    assert_eq!(
+        state
+            .notifications
+            .iter()
+            .filter(|notification| notification.kind == AppNotificationKind::Warning)
+            .count(),
+        3,
+        "each failed folder reports on its own"
+    );
+}
+
+#[test]
+fn last_drop_failing_selects_the_previous_valid_drop() {
+    let mut repos: FxHashMap<RepoId, Arc<dyn GitRepository>> = FxHashMap::default();
+    let id_alloc = AtomicU64::new(1);
+    let mut state = AppState::test_default();
+    let session_dir = tempfile::tempdir().expect("session tempdir");
+    let _session_file_override = crate::session::push_test_session_file_path_override(Some(
+        session_dir.path().join("session.json"),
+    ));
+
+    open_repo_ready(&mut repos, &id_alloc, &mut state, "/tmp/repo1");
+    let (valid, _) = drop_folder(&mut repos, &id_alloc, &mut state, "/tmp/drop-valid");
+    let (invalid, _) = drop_folder(&mut repos, &id_alloc, &mut state, "/tmp/drop-invalid");
+    let spec = state
+        .repos
+        .iter()
+        .find(|repo| repo.id == valid)
+        .expect("valid drop tab")
+        .spec
+        .clone();
+    reduce(
+        &mut repos,
+        &id_alloc,
+        &mut state,
+        Msg::Internal(crate::msg::InternalMsg::RepoOpenedOk {
+            preferences: None,
+            repo_id: valid,
+            spec,
+            repo: Arc::new(DummyRepo::new("/tmp/drop-valid")),
+        }),
+    );
+    fail_drop_as_not_a_repository(&mut repos, &id_alloc, &mut state, invalid);
+
+    assert_eq!(state.active_repo, Some(valid));
+    assert!(
+        state
+            .repos
+            .iter()
+            .find(|repo| repo.id == valid)
+            .is_some_and(|repo| !repo.is_provisional_external_drop_open())
     );
 }

@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn set_active_repo_sync_uses_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo1 = RepoState::new_opening(
             RepoId(1),
@@ -184,7 +184,7 @@ mod tests {
 
     #[test]
     fn reorder_repo_tabs_sync_uses_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo1 = RepoState::new_opening(
             RepoId(1),
@@ -221,7 +221,7 @@ mod tests {
 
     #[test]
     fn select_diff_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo = RepoState::new_opening(
             RepoId(1),
@@ -234,10 +234,7 @@ mod tests {
         state.repos.push(repo);
         state.active_repo = Some(RepoId(1));
 
-        let target = DiffTarget::WorkingTree {
-            path: PathBuf::from("src/lib.rs"),
-            area: DiffArea::Staged,
-        };
+        let target = DiffTarget::working_tree(PathBuf::from("src/lib.rs"), DiffArea::Staged);
 
         with_select_diff_sync(&mut state, RepoId(1), target.clone(), |state, effects| {
             assert!(matches!(
@@ -259,7 +256,7 @@ mod tests {
 
     #[test]
     fn stage_path_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo = RepoState::new_opening(
             RepoId(1),
@@ -285,7 +282,7 @@ mod tests {
 
     #[test]
     fn stage_paths_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo = RepoState::new_opening(
             RepoId(1),
@@ -316,7 +313,7 @@ mod tests {
 
     #[test]
     fn unstage_path_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo = RepoState::new_opening(
             RepoId(1),
@@ -342,7 +339,7 @@ mod tests {
 
     #[test]
     fn unstage_paths_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
 
         let mut repo = RepoState::new_opening(
             RepoId(1),
@@ -373,7 +370,7 @@ mod tests {
 
     #[test]
     fn conflict_set_region_choice_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let path = add_conflict_repo(&mut state, &[ConflictRegionResolution::Unresolved]);
         let before_rev = state.repos[0].conflict_state.conflict_rev;
 
@@ -394,7 +391,7 @@ mod tests {
 
     #[test]
     fn conflict_reset_resolutions_sync_uses_inline_reducer_path() {
-        let mut state = AppState::default();
+        let mut state = AppState::test_default();
         let path = add_conflict_repo(
             &mut state,
             &[
@@ -420,4 +417,13 @@ mod tests {
         );
         assert_eq!(state.repos[0].conflict_state.conflict_rev, before_rev + 1);
     }
+}
+
+/// Native setup, excluding fixture creation and watcher teardown.
+pub fn watcher_startup(
+    root: &std::path::Path,
+    backend: &dyn gitcomet_core::services::GitBackend,
+    cancel_during_setup: bool,
+) -> (std::time::Duration, usize, bool) {
+    crate::store::watcher_startup_for_bench(root, backend, cancel_during_setup)
 }

@@ -2,9 +2,7 @@ use super::*;
 
 #[test]
 fn status_separates_staged_and_unstaged() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -39,9 +37,7 @@ fn status_separates_staged_and_unstaged() {
 
 #[test]
 fn repeated_status_on_same_repo_instance_reuses_staged_state_and_invalidates_on_index_change() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -97,9 +93,7 @@ fn repeated_status_on_same_repo_instance_reuses_staged_state_and_invalidates_on_
 
 #[test]
 fn status_does_not_rewrite_index_when_only_worktree_stat_is_stale() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -134,9 +128,7 @@ fn status_does_not_rewrite_index_when_only_worktree_stat_is_stale() {
 
 #[test]
 fn repeated_status_does_not_rewrite_index_when_cached_staged_state_is_reused() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -175,9 +167,7 @@ fn repeated_status_does_not_rewrite_index_when_cached_staged_state_is_reused() {
 
 #[test]
 fn repeated_status_on_same_repo_instance_invalidates_when_head_moves_without_index_change() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -218,9 +208,7 @@ fn repeated_status_on_same_repo_instance_invalidates_when_head_moves_without_ind
 
 #[test]
 fn status_lists_untracked_files_in_directories() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -250,9 +238,7 @@ fn status_lists_untracked_files_in_directories() {
 
 #[test]
 fn status_ignores_nested_target_directories_with_target_slash_pattern() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -297,9 +283,7 @@ fn status_ignores_nested_target_directories_with_target_slash_pattern() {
 
 #[test]
 fn diff_unified_works_for_staged_and_unstaged() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -321,29 +305,27 @@ fn diff_unified_works_for_staged_and_unstaged() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert!(unstaged.contains("@@"));
 
     run_git(repo, &["add", "a.txt"]);
 
     let staged = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap();
     assert!(staged.contains("@@"));
 }
 
 #[test]
 fn diff_working_tree_unstaged_ignores_crlf_only_line_ending_changes() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -365,10 +347,7 @@ fn diff_working_tree_unstaged_ignores_crlf_only_line_ending_changes() {
 
     let backend = GixBackend;
     let opened = backend.open(repo).unwrap();
-    let target = DiffTarget::WorkingTree {
-        path: PathBuf::from("a.txt"),
-        area: DiffArea::Unstaged,
-    };
+    let target = DiffTarget::working_tree(PathBuf::from("a.txt"), DiffArea::Unstaged);
 
     let unified = opened.diff_unified(&target).unwrap();
     assert!(
@@ -385,9 +364,7 @@ fn diff_working_tree_unstaged_ignores_crlf_only_line_ending_changes() {
 
 #[test]
 fn diff_file_text_reports_old_and_new_for_working_tree_and_commits() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -409,10 +386,10 @@ fn diff_file_text_reports_old_and_new_for_working_tree_and_commits() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("file diff for unstaged changes");
     assert_eq!(unstaged.path, PathBuf::from("a.txt"));
@@ -421,10 +398,10 @@ fn diff_file_text_reports_old_and_new_for_working_tree_and_commits() {
     run_git(repo, &["add", "a.txt"]);
 
     let staged = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("file diff for staged changes");
     assert_file_diff_text_sources(&staged, Some("one\n"), Some("one\ntwo\n"));
@@ -443,10 +420,10 @@ fn diff_file_text_reports_old_and_new_for_working_tree_and_commits() {
     let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
 
     let commit = opened
-        .diff_file_text(&DiffTarget::Commit {
-            commit_id: gitcomet_core::domain::CommitId(head.into()),
-            path: Some(PathBuf::from("a.txt")),
-        })
+        .diff_file_text(&DiffTarget::commit(
+            gitcomet_core::domain::CommitId(head.into()),
+            PathBuf::from("a.txt"),
+        ))
         .unwrap()
         .expect("file diff for commit");
     assert_file_diff_text_sources(&commit, Some("one\n"), Some("one\ntwo\n"));
@@ -454,9 +431,7 @@ fn diff_file_text_reports_old_and_new_for_working_tree_and_commits() {
 
 #[test]
 fn diff_file_text_unstaged_uses_git_normalized_worktree_content() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -478,10 +453,10 @@ fn diff_file_text_unstaged_uses_git_normalized_worktree_content() {
     let backend = GixBackend;
     let opened = backend.open(repo).unwrap();
     let diff = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("file diff for unstaged crlf-only change");
 
@@ -517,10 +492,10 @@ fn diff_file_text_root_commit_has_no_parent_side() {
     let backend = GixBackend;
     let opened = backend.open(repo).unwrap();
     let commit = opened
-        .diff_file_text(&DiffTarget::Commit {
-            commit_id: gitcomet_core::domain::CommitId(head.into()),
-            path: Some(PathBuf::from("a.txt")),
-        })
+        .diff_file_text(&DiffTarget::commit(
+            gitcomet_core::domain::CommitId(head.into()),
+            PathBuf::from("a.txt"),
+        ))
         .unwrap()
         .expect("file diff for root commit");
     assert_file_diff_text_sources(&commit, None, Some("one\n"));
@@ -528,9 +503,7 @@ fn diff_file_text_root_commit_has_no_parent_side() {
 
 #[test]
 fn diff_file_text_staged_add_and_delete_report_missing_sides() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -555,20 +528,20 @@ fn diff_file_text_staged_add_and_delete_report_missing_sides() {
     let opened = backend.open(repo).unwrap();
 
     let added = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("b.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("b.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("file diff for staged added file");
     assert_eq!(added.path, PathBuf::from("b.txt"));
     assert_file_diff_text_sources(&added, None, Some("new\n"));
 
     let deleted = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("file diff for staged deleted file");
     assert_eq!(deleted.path, PathBuf::from("a.txt"));
@@ -577,9 +550,7 @@ fn diff_file_text_staged_add_and_delete_report_missing_sides() {
 
 #[test]
 fn diff_preview_text_file_commit_added_file_returns_new_side_blob_path() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -600,27 +571,22 @@ fn diff_preview_text_file_commit_added_file_returns_new_side_blob_path() {
     let commit_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
     let preview_path = opened
         .diff_preview_text_file(
-            &DiffTarget::Commit {
-                commit_id,
-                path: Some(PathBuf::from("docs/added.txt")),
-            },
+            &DiffTarget::commit(commit_id, PathBuf::from("docs/added.txt")),
             DiffPreviewTextSide::New,
         )
         .unwrap()
         .expect("preview text file for committed added file");
 
-    assert!(preview_path.is_file());
+    assert!(preview_path.path.is_file());
     assert_eq!(
-        fs::read_to_string(&preview_path).expect("read committed added preview text file"),
+        fs::read_to_string(&preview_path.path).expect("read committed added preview text file"),
         "one\ntwo"
     );
 }
 
 #[test]
 fn diff_preview_text_file_commit_deleted_file_returns_old_side_blob_path() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -646,27 +612,22 @@ fn diff_preview_text_file_commit_deleted_file_returns_old_side_blob_path() {
     let commit_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
     let preview_path = opened
         .diff_preview_text_file(
-            &DiffTarget::Commit {
-                commit_id,
-                path: Some(PathBuf::from("docs/delete-me.txt")),
-            },
+            &DiffTarget::commit(commit_id, PathBuf::from("docs/delete-me.txt")),
             DiffPreviewTextSide::Old,
         )
         .unwrap()
         .expect("preview text file for committed deleted file");
 
-    assert!(preview_path.is_file());
+    assert!(preview_path.path.is_file());
     assert_eq!(
-        fs::read_to_string(&preview_path).expect("read committed deleted preview text file"),
+        fs::read_to_string(&preview_path.path).expect("read committed deleted preview text file"),
         "one\ntwo"
     );
 }
 
 #[test]
 fn diff_preview_text_file_staged_deleted_file_returns_head_blob_path() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -687,27 +648,22 @@ fn diff_preview_text_file_staged_deleted_file_returns_head_blob_path() {
     let opened = backend.open(repo).unwrap();
     let preview_path = opened
         .diff_preview_text_file(
-            &DiffTarget::WorkingTree {
-                path: PathBuf::from("a.txt"),
-                area: DiffArea::Staged,
-            },
+            &DiffTarget::working_tree(PathBuf::from("a.txt"), DiffArea::Staged),
             DiffPreviewTextSide::Old,
         )
         .unwrap()
         .expect("preview text file for staged deleted file");
 
-    assert!(preview_path.is_file());
+    assert!(preview_path.path.is_file());
     assert_eq!(
-        fs::read_to_string(&preview_path).expect("read staged deleted preview text file"),
+        fs::read_to_string(&preview_path.path).expect("read staged deleted preview text file"),
         "one\n"
     );
 }
 
 #[test]
 fn diff_file_text_returns_none_for_directories() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -718,20 +674,20 @@ fn diff_file_text_returns_none_for_directories() {
     let opened = backend.open(repo).unwrap();
 
     let result = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("dir"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("dir"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
 
     assert!(result.is_none());
 
     run_git(repo, &["add", "dir/a.txt"]);
     let staged_result = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("dir"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("dir"),
+            DiffArea::Staged,
+        ))
         .unwrap();
 
     assert!(staged_result.is_none());
@@ -739,9 +695,7 @@ fn diff_file_text_returns_none_for_directories() {
 
 #[test]
 fn diff_file_image_reports_old_and_new_for_working_tree_and_commits() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -766,10 +720,10 @@ fn diff_file_image_reports_old_and_new_for_working_tree_and_commits() {
     let opened = backend.open(repo).unwrap();
 
     let unstaged = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: PathBuf::from("img.png"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(
+            PathBuf::from("img.png"),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("image diff for unstaged changes");
     assert_eq!(unstaged.path, PathBuf::from("img.png"));
@@ -779,10 +733,10 @@ fn diff_file_image_reports_old_and_new_for_working_tree_and_commits() {
     run_git(repo, &["add", "img.png"]);
 
     let staged = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: PathBuf::from("img.png"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(
+            PathBuf::from("img.png"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("image diff for staged changes");
     assert_eq!(staged.old.as_deref(), Some(old_png.as_slice()));
@@ -802,10 +756,10 @@ fn diff_file_image_reports_old_and_new_for_working_tree_and_commits() {
     let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
 
     let commit = opened
-        .diff_file_image(&DiffTarget::Commit {
-            commit_id: gitcomet_core::domain::CommitId(head.into()),
-            path: Some(PathBuf::from("img.png")),
-        })
+        .diff_file_image(&DiffTarget::commit(
+            gitcomet_core::domain::CommitId(head.into()),
+            PathBuf::from("img.png"),
+        ))
         .unwrap()
         .expect("image diff for commit");
     assert_eq!(commit.old.as_deref(), Some(old_png.as_slice()));
@@ -814,9 +768,7 @@ fn diff_file_image_reports_old_and_new_for_working_tree_and_commits() {
 
 #[test]
 fn diff_file_image_returns_none_for_directories() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -827,30 +779,85 @@ fn diff_file_image_returns_none_for_directories() {
     let opened = backend.open(repo).unwrap();
 
     let result = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: PathBuf::from("dir"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(
+            PathBuf::from("dir"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
 
     assert!(result.is_none());
 
     run_git(repo, &["add", "dir/a.png"]);
     let staged_result = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: PathBuf::from("dir"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(
+            PathBuf::from("dir"),
+            DiffArea::Staged,
+        ))
         .unwrap();
 
     assert!(staged_result.is_none());
 }
 
 #[test]
-fn gitlink_added_and_unstaged_modified_reports_expected_status_and_diff() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
+fn gitlink_supplement_handles_literal_paths_dirty_children_and_staged_removal() {
+    let _ = ensure_isolated_git_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    let name = "child [literal] é";
+    let nested = repo.join(name);
+    std::fs::create_dir(&nested).unwrap();
+    for path in [repo, nested.as_path()] {
+        run_git(path, &["init", "-q"]);
+        run_git(path, &["config", "user.email", "you@example.com"]);
+        run_git(path, &["config", "user.name", "You"]);
+        run_git(path, &["config", "commit.gpgsign", "false"]);
     }
+    write(&nested, "file.txt", "base\n");
+    run_git(&nested, &["add", "."]);
+    run_git(&nested, &["commit", "-qm", "child"]);
+    // Retain .gitmodules through deletion so supplementation is also exercised
+    // when the removed gitlink no longer appears in the index.
+    write(
+        repo,
+        ".gitmodules",
+        format!("[submodule \"child\"]\n path = {name}\n url = ../child\n"),
+    );
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-qm", "parent"]);
+    let opened = GixBackend.open(repo).unwrap();
+    assert!(opened.status().unwrap().unstaged.is_empty());
+    for file in ["file.txt", "untracked.txt"] {
+        write(&nested, file, "dirty\n");
+        let status = opened.status().unwrap();
+        assert!(
+            status
+                .unstaged
+                .iter()
+                .any(|entry| entry.path == Path::new(name))
+        );
+        assert!(
+            opened
+                .worktree_status()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path == Path::new(name))
+        );
+        if file == "file.txt" {
+            run_git(&nested, &["checkout", "--", "file.txt"]);
+        }
+    }
+    run_git(repo, &["rm", "--cached", "--", name]);
+    for entries in [
+        opened.status().unwrap().staged.to_vec(),
+        opened.staged_status().unwrap(),
+    ] {
+        assert!(entries.iter().any(|entry| entry.path == Path::new(name) && entry.kind == FileStatusKind::Deleted));
+    }
+}
+
+#[test]
+fn gitlink_added_and_unstaged_modified_reports_expected_status_and_diff() {
+    let _ = ensure_isolated_git_test_env();
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
@@ -903,10 +910,10 @@ fn gitlink_added_and_unstaged_modified_reports_expected_status_and_diff() {
     );
 
     let diff = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("chess3"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("chess3"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert!(
         diff.contains("Subproject commit"),
@@ -914,10 +921,10 @@ fn gitlink_added_and_unstaged_modified_reports_expected_status_and_diff() {
     );
 
     let file_text = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("chess3"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("chess3"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert!(
         file_text.is_none(),
@@ -927,9 +934,7 @@ fn gitlink_added_and_unstaged_modified_reports_expected_status_and_diff() {
 
 #[test]
 fn committed_gitlink_unstaged_modified_reports_modified_status_and_diff() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
@@ -979,10 +984,10 @@ fn committed_gitlink_unstaged_modified_reports_modified_status_and_diff() {
     );
 
     let diff = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: PathBuf::from("chess3"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(
+            PathBuf::from("chess3"),
+            DiffArea::Unstaged,
+        ))
         .unwrap();
     assert!(
         diff.contains("Subproject commit"),
@@ -992,9 +997,7 @@ fn committed_gitlink_unstaged_modified_reports_modified_status_and_diff() {
 
 #[test]
 fn status_cache_invalidates_when_gitlink_appears_on_same_repo_instance() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
 
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
@@ -1055,42 +1058,8 @@ fn status_cache_invalidates_when_gitlink_appears_on_same_repo_instance() {
 }
 
 #[test]
-fn diff_file_commit_target_without_path_returns_none() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
-    let repo = dir.path();
-
-    run_git(repo, &["init"]);
-    run_git(repo, &["config", "user.email", "you@example.com"]);
-    run_git(repo, &["config", "user.name", "You"]);
-    run_git(repo, &["config", "commit.gpgsign", "false"]);
-
-    write(repo, "a.txt", "one\n");
-    run_git(repo, &["add", "a.txt"]);
-    run_git(
-        repo,
-        &["-c", "commit.gpgsign=false", "commit", "-m", "init"],
-    );
-
-    let head = run_git_output(repo, &["rev-parse", "HEAD"]);
-    let target = DiffTarget::Commit {
-        commit_id: gitcomet_core::domain::CommitId(head.into()),
-        path: None,
-    };
-
-    let backend = GixBackend;
-    let opened = backend.open(repo).unwrap();
-    assert!(opened.diff_file_text(&target).unwrap().is_none());
-    assert!(opened.diff_file_image(&target).unwrap().is_none());
-}
-
-#[test]
 fn diff_unified_outside_repository_path_returns_structured_git_error() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let outside = dir.path().join("outside.txt");
@@ -1111,10 +1080,7 @@ fn diff_unified_outside_repository_path_returns_structured_git_error() {
     let backend = GixBackend;
     let opened = backend.open(&repo).unwrap();
     let err = opened
-        .diff_unified(&DiffTarget::WorkingTree {
-            path: outside,
-            area: DiffArea::Unstaged,
-        })
+        .diff_unified(&DiffTarget::working_tree(outside, DiffArea::Unstaged))
         .expect_err("expected diff_unified to fail for outside path");
     assert_git_failure(&err, "git diff", GitFailureId::CommandFailed);
     let ErrorKind::Git(failure) = err.kind() else {
@@ -1125,9 +1091,7 @@ fn diff_unified_outside_repository_path_returns_structured_git_error() {
 
 #[test]
 fn diff_parsed_outside_repository_path_returns_structured_git_error() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let outside = dir.path().join("outside.txt");
@@ -1148,10 +1112,7 @@ fn diff_parsed_outside_repository_path_returns_structured_git_error() {
     let backend = GixBackend;
     let opened = backend.open(&repo).unwrap();
     let err = opened
-        .diff_parsed(&DiffTarget::WorkingTree {
-            path: outside,
-            area: DiffArea::Unstaged,
-        })
+        .diff_parsed(&DiffTarget::working_tree(outside, DiffArea::Unstaged))
         .expect_err("expected diff_parsed to fail for outside path");
     assert_git_failure(&err, "git diff", GitFailureId::CommandFailed);
     let ErrorKind::Git(failure) = err.kind() else {
@@ -1162,9 +1123,7 @@ fn diff_parsed_outside_repository_path_returns_structured_git_error() {
 
 #[test]
 fn diff_parsed_merge_commit_uses_first_parent() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1201,10 +1160,7 @@ fn diff_parsed_merge_commit_uses_first_parent() {
     let opened = backend.open(repo).unwrap();
     let merge_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
     let diff = opened
-        .diff_parsed(&DiffTarget::Commit {
-            commit_id: merge_id,
-            path: Some(PathBuf::from("shared.txt")),
-        })
+        .diff_parsed(&DiffTarget::commit(merge_id, PathBuf::from("shared.txt")))
         .expect("parse merge commit diff against its first parent");
 
     assert!(
@@ -1223,9 +1179,7 @@ fn diff_parsed_merge_commit_uses_first_parent() {
 
 #[test]
 fn diff_parsed_commit_rename_preserves_rename_headers_and_hunks() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1258,11 +1212,9 @@ fn diff_parsed_commit_rename_preserves_rename_headers_and_hunks() {
     let backend = GixBackend;
     let opened = backend.open(repo).unwrap();
     let commit_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
+    let parent_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD~1"]).into());
     let diff = opened
-        .diff_parsed(&DiffTarget::Commit {
-            commit_id,
-            path: None,
-        })
+        .diff_parsed(&DiffTarget::commit_range(parent_id, Some(commit_id), None))
         .expect("parse rename commit diff");
 
     assert!(
@@ -1291,9 +1243,7 @@ fn diff_parsed_commit_rename_preserves_rename_headers_and_hunks() {
 
 #[test]
 fn diff_parsed_commit_added_file_matches_git_show_output() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1313,10 +1263,10 @@ fn diff_parsed_commit_added_file_matches_git_show_output() {
     let opened = backend.open(repo).unwrap();
     let commit_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
     let diff = opened
-        .diff_parsed(&DiffTarget::Commit {
-            commit_id: commit_id.clone(),
-            path: Some(PathBuf::from("docs/added.txt")),
-        })
+        .diff_parsed(&DiffTarget::commit(
+            commit_id.clone(),
+            PathBuf::from("docs/added.txt"),
+        ))
         .expect("parse added file commit diff");
     let expected = run_git_output(
         repo,
@@ -1352,10 +1302,96 @@ fn diff_parsed_commit_added_file_matches_git_show_output() {
 }
 
 #[test]
-fn diff_parsed_commit_deleted_file_matches_git_show_output() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
+fn diff_parsed_commit_added_binary_file_falls_back_to_git_diff() {
+    let _ = ensure_isolated_git_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "you@example.com"]);
+    run_git(repo, &["config", "user.name", "You"]);
+    run_git(repo, &["config", "commit.gpgsign", "false"]);
+
+    write(repo, "docs/logo.bin", vec![0_u8, 159, 146, 150, 0, 255]);
+    run_git(repo, &["add", "docs/logo.bin"]);
+    run_git(
+        repo,
+        &["-c", "commit.gpgsign=false", "commit", "-m", "add binary"],
+    );
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).unwrap();
+    let diff = opened
+        .diff_parsed(&DiffTarget::commit(
+            CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into()),
+            PathBuf::from("docs/logo.bin"),
+        ))
+        .expect("a binary blob must render through git diff");
+    assert!(
+        diff.lines
+            .iter()
+            .any(|line| line.text.as_ref().starts_with("Binary files ")),
+        "{:?}",
+        diff.lines
+    );
+}
+
+#[test]
+fn diff_parsed_commit_added_file_truncates_at_the_unified_line_limit() {
+    let _ = ensure_isolated_git_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "you@example.com"]);
+    run_git(repo, &["config", "user.name", "You"]);
+    run_git(repo, &["config", "commit.gpgsign", "false"]);
+
+    let oversized_lines = vec![b'\n'; Diff::MAX_UNIFIED_LINES + 1];
+    write(repo, "docs/too-many-lines.txt", oversized_lines);
+    run_git(repo, &["add", "docs/too-many-lines.txt"]);
+    run_git(
+        repo,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "add large file",
+        ],
+    );
+
+    let backend = GixBackend;
+    let opened = backend.open(repo).unwrap();
+    let target = DiffTarget::commit(
+        CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into()),
+        PathBuf::from("docs/too-many-lines.txt"),
+    );
+
+    // Too large for the synthetic fast path: `git diff` renders it truncated.
+    for diff in [
+        opened.diff_parsed(&target).expect("regular"),
+        opened
+            .diff_parsed_cancellable(&target, &CancellationToken::new())
+            .expect("cancellable"),
+    ] {
+        assert_eq!(diff.lines.len(), Diff::MAX_UNIFIED_LINES + 1);
+        let notice = diff.lines.last().expect("notice row");
+        assert_eq!(notice.kind, DiffLineKind::Header);
+        assert!(
+            notice
+                .text
+                .as_ref()
+                .starts_with(Diff::TRUNCATION_NOTICE_PREFIX),
+            "{:?}",
+            notice.text.as_ref()
+        );
     }
+}
+
+#[test]
+fn diff_parsed_commit_deleted_file_matches_git_show_output() {
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1380,10 +1416,10 @@ fn diff_parsed_commit_deleted_file_matches_git_show_output() {
     let opened = backend.open(repo).unwrap();
     let commit_id = CommitId(run_git_output(repo, &["rev-parse", "HEAD"]).into());
     let diff = opened
-        .diff_parsed(&DiffTarget::Commit {
-            commit_id: commit_id.clone(),
-            path: Some(PathBuf::from("docs/delete-me.txt")),
-        })
+        .diff_parsed(&DiffTarget::commit(
+            commit_id.clone(),
+            PathBuf::from("docs/delete-me.txt"),
+        ))
         .expect("parse deleted file commit diff");
     let expected = run_git_output(
         repo,
@@ -1420,9 +1456,7 @@ fn diff_parsed_commit_deleted_file_matches_git_show_output() {
 
 #[test]
 fn diff_working_tree_with_absolute_file_path_reads_current_file() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1445,19 +1479,16 @@ fn diff_working_tree_with_absolute_file_path_reads_current_file() {
     let opened = backend.open(repo).unwrap();
 
     let text = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: absolute.clone(),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            absolute.clone(),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("text diff for absolute path");
     assert_file_diff_text_sources(&text, Some("one\n"), Some("one\ntwo\n"));
 
     let image = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: absolute,
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(absolute, DiffArea::Unstaged))
         .unwrap()
         .expect("image diff for absolute path");
     assert_eq!(image.old.as_deref(), Some("one\n".as_bytes()));
@@ -1467,9 +1498,7 @@ fn diff_working_tree_with_absolute_file_path_reads_current_file() {
 #[cfg(unix)]
 #[test]
 fn diff_working_tree_with_absolute_file_path_through_symlinked_repo_reads_current_file() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let repo_alias = dir.path().join("repo-alias");
@@ -1495,19 +1524,16 @@ fn diff_working_tree_with_absolute_file_path_through_symlinked_repo_reads_curren
     let opened = backend.open(&repo).unwrap();
 
     let text = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: absolute.clone(),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            absolute.clone(),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("text diff for symlinked absolute path");
     assert_file_diff_text_sources(&text, Some("one\n"), Some("one\ntwo\n"));
 
     let image = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: absolute,
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(absolute, DiffArea::Unstaged))
         .unwrap()
         .expect("image diff for symlinked absolute path");
     assert_eq!(image.old.as_deref(), Some("one\n".as_bytes()));
@@ -1516,9 +1542,7 @@ fn diff_working_tree_with_absolute_file_path_through_symlinked_repo_reads_curren
 
 #[test]
 fn staged_diff_for_unmerged_conflict_prefers_ours_for_text_and_image() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
     setup_both_modified_text_conflict(repo, "a.txt", "ours\n", "theirs\n");
@@ -1527,19 +1551,19 @@ fn staged_diff_for_unmerged_conflict_prefers_ours_for_text_and_image() {
     let opened = backend.open(repo).unwrap();
 
     let text = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("staged text diff for conflict");
     assert_file_diff_text_sources(&text, Some("ours\n"), Some("ours\n"));
 
     let image = opened
-        .diff_file_image(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Staged,
-        })
+        .diff_file_image(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Staged,
+        ))
         .unwrap()
         .expect("staged image diff for conflict");
     assert_eq!(image.old.as_deref(), Some("ours\n".as_bytes()));
@@ -1548,9 +1572,7 @@ fn staged_diff_for_unmerged_conflict_prefers_ours_for_text_and_image() {
 
 #[test]
 fn diff_commit_with_unknown_revision_and_outside_conflict_path_are_handled() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path().join("repo");
     let outside = dir.path().join("outside.txt");
@@ -1570,10 +1592,10 @@ fn diff_commit_with_unknown_revision_and_outside_conflict_path_are_handled() {
 
     let backend = GixBackend;
     let opened = backend.open(&repo).unwrap();
-    let unknown_target = DiffTarget::Commit {
-        commit_id: gitcomet_core::domain::CommitId("not-a-real-revision".into()),
-        path: Some(PathBuf::from("a.txt")),
-    };
+    let unknown_target = DiffTarget::commit(
+        gitcomet_core::domain::CommitId("not-a-real-revision".into()),
+        PathBuf::from("a.txt"),
+    );
 
     let text = opened
         .diff_file_text(&unknown_target)
@@ -1599,9 +1621,7 @@ fn diff_commit_with_unknown_revision_and_outside_conflict_path_are_handled() {
 
 #[test]
 fn diff_file_text_uses_ours_and_theirs_for_conflicted_paths() {
-    if !require_git_shell_for_status_integration_tests() {
-        return;
-    }
+    let _ = ensure_isolated_git_test_env();
     let dir = tempfile::tempdir().unwrap();
     let repo = dir.path();
 
@@ -1647,10 +1667,10 @@ fn diff_file_text_uses_ours_and_theirs_for_conflicted_paths() {
     );
 
     let diff = opened
-        .diff_file_text(&DiffTarget::WorkingTree {
-            path: PathBuf::from("a.txt"),
-            area: DiffArea::Unstaged,
-        })
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("a.txt"),
+            DiffArea::Unstaged,
+        ))
         .unwrap()
         .expect("file diff for conflicted changes");
     assert_file_diff_text_sources(&diff, Some("ours\n"), Some("theirs\n"));
@@ -1665,4 +1685,77 @@ fn diff_file_text_uses_ours_and_theirs_for_conflicted_paths() {
     assert_eq!(session.unsolved_count(), 1);
     assert_eq!(session.regions[0].ours, "ours\n");
     assert_eq!(session.regions[0].theirs, "theirs\n");
+}
+
+#[cfg(unix)]
+fn init_symlink_repo(repo: &Path) {
+    run_git(repo, &["init"]);
+    run_git(repo, &["config", "user.email", "you@example.com"]);
+    run_git(repo, &["config", "user.name", "You"]);
+    run_git(repo, &["config", "commit.gpgsign", "false"]);
+    write(repo, "a.txt", "alpha\n");
+    write(repo, "b.txt", "beta\n");
+    symlink("a.txt", repo.join("link")).unwrap();
+    run_git(repo, &["add", "."]);
+    run_git(repo, &["commit", "-m", "init"]);
+}
+
+#[cfg(unix)]
+fn repoint_symlink(repo: &Path, target: &str) {
+    fs::remove_file(repo.join("link")).unwrap();
+    symlink(target, repo.join("link")).unwrap();
+}
+
+/// The worktree side of a symlink is its link text, as git stores it. Reading
+/// through the link would diff the target's bytes against the link text and,
+/// for git-annex locked files, show the annexed object instead of the key.
+#[cfg(unix)]
+#[test]
+fn diff_file_text_for_symlink_uses_link_text_not_target_bytes() {
+    let _ = ensure_isolated_git_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_symlink_repo(repo);
+    repoint_symlink(repo, "b.txt");
+
+    let opened = GixBackend.open(repo).unwrap();
+    let target = DiffTarget::working_tree(PathBuf::from("link"), DiffArea::Unstaged);
+    let text = opened
+        .diff_file_text(&target)
+        .unwrap()
+        .expect("text diff for a symlink");
+    assert_file_diff_text_sources(&text, Some("a.txt"), Some("b.txt"));
+
+    let preview = opened
+        .diff_preview_text_file(&target, gitcomet_core::domain::DiffPreviewTextSide::New)
+        .unwrap()
+        .expect("preview path for a symlink");
+    assert_eq!(fs::read_to_string(preview.path).unwrap(), "b.txt");
+
+    let image = opened
+        .diff_file_image(&target)
+        .unwrap()
+        .expect("image diff for a symlink");
+    assert_eq!(image.old.as_deref(), Some("a.txt".as_bytes()));
+    assert_eq!(image.new, None, "link text is never an image");
+}
+
+#[cfg(unix)]
+#[test]
+fn diff_file_text_for_dangling_symlink_reports_link_text() {
+    let _ = ensure_isolated_git_test_env();
+    let dir = tempfile::tempdir().unwrap();
+    let repo = dir.path();
+    init_symlink_repo(repo);
+    repoint_symlink(repo, "missing.txt");
+
+    let opened = GixBackend.open(repo).unwrap();
+    let text = opened
+        .diff_file_text(&DiffTarget::working_tree(
+            PathBuf::from("link"),
+            DiffArea::Unstaged,
+        ))
+        .unwrap()
+        .expect("text diff for a dangling symlink");
+    assert_file_diff_text_sources(&text, Some("a.txt"), Some("missing.txt"));
 }

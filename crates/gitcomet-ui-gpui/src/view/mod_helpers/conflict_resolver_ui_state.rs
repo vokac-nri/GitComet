@@ -81,6 +81,8 @@ pub(crate) type LoadableImagePreview = Loadable<Option<ConflictPreviewImage>>;
 pub(crate) struct ConflictResolverMarkdownPreviewState {
     pub(crate) source_hash: Option<u64>,
     pub(crate) documents: ThreeWaySides<LoadableMarkdownDoc>,
+    /// What each rendered column keeps between frames.
+    pub(in crate::view) columns: ThreeWaySides<ConflictMarkdownColumn>,
 }
 
 impl Default for ConflictResolverMarkdownPreviewState {
@@ -92,6 +94,7 @@ impl Default for ConflictResolverMarkdownPreviewState {
                 ours: Loadable::NotLoaded,
                 theirs: Loadable::NotLoaded,
             },
+            columns: ThreeWaySides::default(),
         }
     }
 }
@@ -99,6 +102,24 @@ impl Default for ConflictResolverMarkdownPreviewState {
 impl ConflictResolverMarkdownPreviewState {
     pub(crate) fn document(&self, side: ThreeWayColumn) -> &LoadableMarkdownDoc {
         &self.documents[side]
+    }
+}
+
+/// A rendered conflict column's state between frames, as the file preview
+/// keeps its own.
+#[derive(Clone, Default)]
+pub(in crate::view) struct ConflictMarkdownColumn {
+    pub(in crate::view) blocks: crate::view::rows::MarkdownDocumentBlockCache,
+    pub(in crate::view) layout: crate::view::rows::MarkdownDocumentLayoutCache,
+    pub(in crate::view) block_scrolls: crate::view::rows::MarkdownDocumentBlockScrolls,
+    /// A row the search wants brought into view in this column.
+    pub(in crate::view) reveal: crate::view::rows::MarkdownPreviewRevealRequest,
+}
+
+impl std::fmt::Debug for ConflictMarkdownColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConflictMarkdownColumn")
+            .finish_non_exhaustive()
     }
 }
 
@@ -332,6 +353,10 @@ pub(crate) struct ConflictResolverUiState {
     pub(crate) binary_side_sizes: [Option<usize>; 3],
     /// The resolver strategy for the current conflict (set during sync).
     pub(crate) strategy: Option<gitcomet_core::conflict_session::ConflictResolverStrategy>,
+    /// A pending conversion belongs only to this loaded conflict.
+    pub(crate) output_save_format: Option<gitcomet_core::text_format::TextFormat>,
+    /// The encoding written in this session, after consuming a save choice.
+    pub(crate) output_saved_format: Option<gitcomet_core::text_format::SideTextFormat>,
     /// The conflict kind for the current file (set during sync).
     pub(crate) conflict_kind: Option<gitcomet_core::domain::FileConflictKind>,
     /// Last autosolve trace summary shown in resolver UI.
@@ -348,6 +373,9 @@ pub(crate) struct ConflictResolverUiState {
     /// state-side session changes (e.g. hide-resolved, bulk picks, autosolve)
     /// that don't change the underlying file content.
     pub(crate) conflict_rev: u64,
+    /// Local revision of the source-row projections, including context folds
+    /// that change without updating the store's conflict revision.
+    pub(crate) visible_projection_rev: u64,
     /// Sequence token for debounced resolved-output outline recompute tasks.
     pub(crate) resolver_pending_recompute_seq: u64,
     /// Resolved-output outline metadata (provenance, conflict markers, source index).
@@ -409,11 +437,14 @@ impl Default for ConflictResolverUiState {
             is_binary_conflict: false,
             binary_side_sizes: [None; 3],
             strategy: None,
+            output_save_format: None,
+            output_saved_format: None,
             conflict_kind: None,
             last_autosolve_summary: None,
             open_summary_counts: None,
             open_summary_announced: false,
             conflict_rev: 0,
+            visible_projection_rev: 0,
             resolver_pending_recompute_seq: 0,
             resolved_outline: ResolvedOutlineData::default(),
             resolved_outline_gutter_rows: Vec::new(),
@@ -1669,6 +1700,7 @@ impl ConflictResolverUiState {
                 s.three_way_visible_projection = three_way_visible_projection;
             }
         }
+        self.visible_projection_rev = self.visible_projection_rev.wrapping_add(1);
         self.three_way_visible_state_ready = true;
         self.refresh_three_way_horizontal_measure_rows();
         self.rebuild_minimap_bands();
@@ -1723,6 +1755,7 @@ impl ConflictResolverUiState {
                 );
             }
         }
+        self.visible_projection_rev = self.visible_projection_rev.wrapping_add(1);
         self.debug_assert_rendering_mode_invariants();
         self.refresh_two_way_horizontal_measure_rows();
     }
