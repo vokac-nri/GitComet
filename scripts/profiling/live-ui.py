@@ -460,9 +460,17 @@ SCENARIOS = ("startup", "idle", "idle-minimized", "idle-hidden-terminal", "two-w
 
 # ---------------------------------------------------------------- one run
 
-def survey_id():
-    match = re.search(r'SurveyLink \{\s*id: Cow::Borrowed\("([^"]+)"\)', SURVEY_SOURCE.read_text(encoding="utf-8"))
-    return match.group(1) if match else "unknown"
+def survey_id(source=None):
+    """The identity's survey id, or None when it defines no survey to prompt for."""
+    text = SURVEY_SOURCE.read_text(encoding="utf-8") if source is None else source
+    match = re.search(r'SurveyLink \{\s*id: Cow::Borrowed\("([^"]+)"\)', text)
+    return match.group(1) if match else None
+
+
+def survey_session():
+    """Marks the identity's survey answered, so its toast cannot animate through a run."""
+    survey = survey_id()
+    return {"survey_prompt": {"survey_id": survey, "opened_at_unix_seconds": 1}} if survey else {}
 
 
 def gpu_cache_environment(output, cold):
@@ -523,7 +531,7 @@ def seed_profile(output, repository, window_size=WINDOW_SIZE, session_overrides=
         "history_tag_fetch_mode": "disabled", "check_for_updates_on_startup": False,
         # Only this disposable profile contacts the loopback HTTP fixtures.
         "allowed_remote_protocols": ["http", "https", "ssh", "git", "file"],
-        "survey_prompt": {"survey_id": survey_id(), "opened_at_unix_seconds": 1},
+        **survey_session(),
         **(session_overrides or {}),
     }), encoding="utf-8")
     gitconfig = output / "gitconfig"

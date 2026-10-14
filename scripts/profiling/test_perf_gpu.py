@@ -101,7 +101,10 @@ class GpuTests(unittest.TestCase):
 
     def test_profiles_mark_the_current_survey_answered(self):
         # A stale id lets the survey toast animate through every measured run.
-        self.assertTrue(live.survey_id().startswith("gitcomet_user_survey_"))
+        source = 'survey: Some(SurveyLink {\n    id: Cow::Borrowed("gitcomet_user_survey_2026_04"),'
+        self.assertEqual(live.survey_id(source), "gitcomet_user_survey_2026_04")
+        # An identity with no survey has no toast, so the profile names none.
+        self.assertIsNone(live.survey_id("survey: None,"))
 
     def test_device_counters_and_process_counters_are_not_combined(self):
         device = perf_gpu.parse_device('2026/10/04 14:00:03.100, 0, GPU-test, "NVIDIA, test", 90, 12, 500, 8192, [N/A], 32, 1700, 5005, P0')
