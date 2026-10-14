@@ -70,6 +70,20 @@ run in CI, and `rust.yml` gates its clippy (library targets) with `-D warnings`.
 | `--features benchmarks` code | Built only by `benchmark-targets.yml`. A missing field in `rows/benchmarks/` will not surface in a normal build. |
 | `#[cfg(target_os = "macos")]` code | The macOS menu bar (`app/menus.rs`) only compiles on macOS. A Windows or Linux build will not catch an unused parameter or a removed item there. |
 
+This fork also runs less CI than upstream, on purpose:
+
+- **Native tests** run on `ubuntu22-x64`, `macos15-arm64` and `windows-x64` only, and **benchmark
+  targets** compile on `ubuntu22-x64` only. Upstream's Linux and Windows ARM, macOS 26, macOS
+  Intel and Fedora lanes are removed. The Fedora lane was the only one with `git-annex`, so the
+  annex integration tests now skip in CI. Upstream syncs that touch these matrices will
+  conflict; keep the trimmed list.
+- **Package deployment** (`deploy-*.yml`, `deployment-ci.yml`) and the weekly `perf.yml` are
+  disabled in the repo's Actions settings, not deleted, so syncs still merge cleanly. They publish
+  to upstream-owned channels with secrets this fork does not have.
+- **`release-manual-main.yml` does not work here as-is.** It only runs from `main`, chains into
+  the disabled deploy workflows, and `build-release-artifacts.yml` fails without upstream's Azure
+  Windows-signing secrets.
+
 So if you touch the crash log, benchmark-gated code, or macOS-only code, **you are the only gate**
 (or CI on the right OS is). Run locally:
 
